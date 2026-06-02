@@ -35,6 +35,11 @@
 //#define Ki  0.02f  // Интегральный коэффициент
 //#define Kd  0.15f  // Дифференциальный коэффициент
 
+// Глобальный флаг: идет ли сейчас процедура сброса давления (хоуминга)
+extern volatile bool is_homing;
+
+// Прототип функции запуска хоуминга
+void start_pressure_homing(void);
 // 3. Объявляем глобальные переменные через extern (чтобы не было дубликатов)
 extern volatile float setpoint_kPa;
 extern volatile float pressure1_kPa;

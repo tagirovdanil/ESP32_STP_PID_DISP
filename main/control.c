@@ -24,7 +24,7 @@ static bool nyrok_done = false;
 extern TFT_t dev;
 extern FontxFile fx16[2];
 extern bool is_calibrating;
-
+volatile bool is_homing = false;
 static float filtered_rate = 0.0f;
 
 TaskHandle_t pid_task_handle = NULL; // Хэндл для контроля запущенной ПИД-задачи
@@ -34,6 +34,13 @@ bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num);
 // Глобальная переменная текущего абсолютного положения вентиля (в шагах)
 int32_t current_valve_position = 0; 
 
+void start_pressure_homing(void) {
+    if (!is_homing) {
+        ESP_LOGW("CONTROL", "Запущен принудительный сброс давления (Homing)!");
+        is_homing = true;
+    }
+}
+
 // Служебная функция аппаратного сброса драйвера после аварии упора
 static void reset_motor_driver(void) {
     gpio_set_level(PIN_ENABLE, 1); // Активируем вход Enable для сброса ошибки
@@ -41,8 +48,6 @@ static void reset_motor_driver(void) {
     gpio_set_level(PIN_ENABLE, 0); // Отпускаем, мотор снова активен
     vTaskDelay(pdMS_TO_TICKS(100)); // Даем драйверу прийти в себя
 }
-
-
 
 void calibrate_valve_home(void) {
     ESP_LOGI("HOMING", "Ожидание стабилизации питания мотора...");
@@ -74,7 +79,7 @@ void calibrate_valve_home(void) {
     gpio_set_level(PIN_DIR, dir_close);
 
     uint32_t total_steps_done = 0;
-    const uint32_t MAX_SAFETY_STEPS = 80000; // Лимит 10 оборотов
+    const uint32_t MAX_SAFETY_STEPS = 100000; // Лимит 10 оборотов
     uint32_t alarm_confirm_counter = 0;
 
     // СВЕРХЧИСТЫЙ ЦИКЛ: Процессор занят ТОЛЬКО генерацией импульсов
@@ -83,7 +88,7 @@ void calibrate_valve_home(void) {
         // Защита от наводок (дебаунс)
         if (gpio_get_level(PIN_ALARM) != 0) {
             alarm_confirm_counter++;
-            if (alarm_confirm_counter >= 15) {
+            if (alarm_confirm_counter >= 5) {
                 break; // Физический упор найден!
             }
         } else {
@@ -92,9 +97,9 @@ void calibrate_valve_home(void) {
 
         // САМА ГЕНЕРАЦИЯ ИМПУЛЬСА
         gpio_set_level(PIN_STEP, 1);
-        esp_rom_delay_us(10); 
+        esp_rom_delay_us(20); 
         gpio_set_level(PIN_STEP, 0);
-        esp_rom_delay_us(240); // 4000 Гц монолитного хода
+        esp_rom_delay_us(200); // 4000 Гц монолитного хода
 
         total_steps_done++; 
 
@@ -144,10 +149,6 @@ void calibrate_valve_home(void) {
     //lcdFillScreen(&dev, BLACK); 
 }
 
-
-
-
-
 void init_servo(void) {
     // 1. Конфигурируем аппаратный Таймер 0 для Сервопривода (50 Гц, 14 бит)
     ledc_timer_config_t ledc_timer = {
@@ -172,8 +173,6 @@ void init_servo(void) {
     ledc_channel_config(&ledc_channel);
 }
 
-
-
 // Функция установки угла сервопривода (0 - 180 градусов)
 void set_servo_angle(float angle) {
     if (angle < 0.0f) angle = 0.0f;
@@ -189,7 +188,6 @@ void set_servo_angle(float angle) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     // ==========================================================================
 }
-
 
 // Функция перемещения иглы в абсолютную координату руками (без ШИМ)
 void move_valve_absolute(int32_t target_position, uint32_t speed_us) {
@@ -258,106 +256,354 @@ float Kp;
 float Ki;
 float Kd;
 
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
 void pid_regulator_task(void *pvParameters) {
     float integral = 0.0f;
     float previous_error = 0.0f;
     int32_t target_position = 0;
+    uint32_t stuck_counter_pos = 0;
+    uint32_t stuck_counter_neg = 0;
 
-    dt = 0.02f; // Шаг ПИД 20 мс
+    dt = 0.02f;
 
-    // Коэффициенты для ручного координатного метода
-    Kp = 120.0f;   
-    Ki = 0.3f;     
-    Kd = 35.0f;    
+    Kp = 80.0f;
+    Ki = 40.0f;   // можно увеличить до 80 для более быстрого сброса/набора
+    Kd = 5.0f;
 
-    set_servo_angle(90.0f); 
+    float derivative_filtered = 0.0f;
+
+    // RAMP
+    float final_setpoint = 0.0f;      // конечная цель
+    float ramp_setpoint = 0.0f;       // текущая уставка для ПИД
+    bool ramp_active = false;         // идёт ли движение к цели
+
+    // Серво
+    enum ServoState { NEUTRAL, CHARGING, VENTING };
+    enum ServoState servo_state = NEUTRAL;
+
+    static float prev_error_cross = 0.0f;   // для сброса интеграла при переходе через 0
+
+    // Пороги для финального режима (после ramp)
+    const float FINAL_CHARGE_ON_THRESHOLD  = 0.5f;
+    const float FINAL_CHARGE_OFF_THRESHOLD = 0.1f;
+    const float VENT_ON_THRESHOLD          = -10.0f;
+    const float VENT_OFF_THRESHOLD         = -0.5f;
+
+    set_servo_angle(90.0f);
     previous_pressure = pressure1_kPa;
     filtered_rate = 0.0f;
-    nyrok_done = false;
 
-    ESP_LOGI("PID", "Ручной координатный ПИД-регулятор без аппаратного ШИМ запущен.");
-    
+    ESP_LOGI("PID", "ПИД-регулятор (единая версия) запущен.");
+
     while (1) {
         if (is_calibrating) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        float current_pressure = pressure1_kPa;
-        float error = setpoint_kPa - current_pressure;
+        // ======================= СБРОС ДАВЛЕНИЯ (HOMING) =======================
+        if (is_homing) {
+            ESP_LOGW("PID", "Штатный сброс давления...");
+            set_servo_angle(0.0f);
+            servo_state = VENTING;
 
-        // Фильтрация скорости натекания
+            int32_t chunk_target = current_valve_position;
+            const int32_t STEP_CHUNK = 2000;
+            while (current_valve_position < 100000) {
+                chunk_target += STEP_CHUNK;
+                if (chunk_target > 100000) chunk_target = 100000;
+                move_valve_absolute(chunk_target, 190);
+                vTaskDelay(1);
+            }
+
+            while (pressure1_kPa > 0.2f) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            chunk_target = current_valve_position;
+            while (current_valve_position > 0) {
+                chunk_target -= STEP_CHUNK;
+                if (chunk_target < 0) chunk_target = 0;
+                move_valve_absolute(chunk_target, 190);
+                vTaskDelay(1);
+            }
+
+            set_servo_angle(90.0f);
+            servo_state = NEUTRAL;
+            final_setpoint = 0.0f;
+            ramp_setpoint = 0.0f;
+            ramp_active = false;
+            setpoint_kPa = 0.0f;
+            integral = 0.0f;
+            previous_error = 0.0f;
+            derivative_filtered = 0.0f;
+            stuck_counter_pos = 0;
+            stuck_counter_neg = 0;
+            prev_error_cross = 0.0f;
+            is_homing = false;
+            ESP_LOGI("PID", "Сброс завершён.");
+            continue;
+        }
+
+        // ======================= НОВАЯ УСТАВКА =======================
+        if (setpoint_kPa != final_setpoint && setpoint_kPa > 0.01f) {
+            final_setpoint = setpoint_kPa;
+            ramp_setpoint = pressure1_kPa;   // начинаем ramp с текущего давления
+            ramp_active = true;
+
+            // Полный сброс ПИД
+            integral = 0.0f;
+            derivative_filtered = 0.0f;
+            previous_error = 0.0f;
+            stuck_counter_pos = 0;
+            stuck_counter_neg = 0;
+
+            if (final_setpoint > pressure1_kPa) {
+                // Набор давления
+                servo_state = CHARGING;
+                set_servo_angle(180.0f);
+                target_position = 0;   // клапан закрыт, ПИД сам откроет
+                ESP_LOGI("PID", "Старт набора до %.1f кПа", final_setpoint);
+            } else {
+                // Сброс давления
+                servo_state = NEUTRAL;
+                set_servo_angle(90.0f);
+                target_position = 40000;   // широко открываем клапан для быстрого сброса
+                ESP_LOGI("PID", "Старт сброса до %.1f кПа, клапан открыт", final_setpoint);
+            }
+        }
+        if (setpoint_kPa < 0.01f) {
+            final_setpoint = 0.0f;
+            ramp_active = false;
+        }
+
+        // ======================= ОБНОВЛЕНИЕ RAMP-УСТАВКИ =======================
+        if (ramp_active && final_setpoint > 0.01f) {
+            float error_ramp = final_setpoint - ramp_setpoint;
+            if (fabsf(error_ramp) < 0.01f) {
+                ramp_setpoint = final_setpoint;
+                ramp_active = false;   // достигли цели
+                ESP_LOGI("PID", "Ramp завершён.");
+            } else {
+                float speed_kPa_s;
+                if (ramp_setpoint > final_setpoint) {
+                    // Идём ВНИЗ (сброс)
+                    float distance = ramp_setpoint - final_setpoint;  // сколько ещё сбрасывать
+                    if (distance > 20.0f) {
+                        speed_kPa_s = 20.0f;   // быстрое снижение
+                    } else if (distance > 2.0f) {
+                        speed_kPa_s = 5.0f;    // умеренное
+                    } else {
+                        speed_kPa_s = 1.0f;    // точное
+                    }
+                } else {
+                    // Идём ВВЕРХ (набор) – профиль с процентами
+                    float percent_done = 100.0f * ramp_setpoint / final_setpoint;
+                    if (percent_done < 80.0f) {
+                        speed_kPa_s = 0.1f * final_setpoint;
+                    } else if (percent_done < 90.0f) {
+                        speed_kPa_s = 0.025f * final_setpoint;
+                    } else if (percent_done < 95.0f) {
+                        speed_kPa_s = 5.0f;
+                    } else {
+                        speed_kPa_s = 1.0f;
+                    }
+                }
+                float step = speed_kPa_s * dt;
+                if (step > fabsf(error_ramp)) step = fabsf(error_ramp);
+                ramp_setpoint += (error_ramp > 0 ? step : -step);
+            }
+        }
+
+        // ======================= ИЗМЕРЕНИЯ =======================
+        float current_pressure = pressure1_kPa;
+        float error = ramp_setpoint - current_pressure;   // ошибка для ПИД
+
         float raw_rate = (current_pressure - previous_pressure) / dt;
         previous_pressure = current_pressure;
-        filtered_rate = (0.80f * filtered_rate) + (0.20f * raw_rate);
+        filtered_rate = 0.8f * filtered_rate + 0.2f * raw_rate;
 
-        // Стандартная ПИД-математика
-        integral += error * dt;
-        if (integral > 150.0f)  integral = 150.0f;
-        if (integral < -150.0f) integral = -150.0f;
+        // ======================= НЕЛИНЕЙНЫЕ КОЭФФИЦИЕНТЫ =======================
+        float abs_error = fabsf(error);
+        float Kp_eff, Ki_eff;
+        if (abs_error > 50.0f) {
+            Kp_eff = Kp;
+            Ki_eff = Ki;
+        } else if (abs_error < 2.0f) {
+            if (error > 0) {
+                Kp_eff = Kp * 0.5f;
+                Ki_eff = Ki * 0.7f;
+            } else {
+                Kp_eff = Kp * 0.8f;
+                Ki_eff = Ki * 0.7f;
+            }
+        } else {
+            float ratio = (abs_error - 2.0f) / 48.0f;
+            Kp_eff = Kp * (0.5f + 0.5f * ratio);
+            Ki_eff = Ki * (0.7f + 0.3f * ratio);
+        }
 
-        float derivative = (error - previous_error) / dt;
+        // ======================= ПИД-ВЫЧИСЛЕНИЯ =======================
+        float derivative_raw = (error - previous_error) / dt;
         previous_error = error;
+        derivative_filtered = 0.7f * derivative_filtered + 0.3f * derivative_raw;
 
-        float output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+        // Сброс интеграла при смене знака ошибки
+        if ((error > 0 && prev_error_cross < 0) || (error < 0 && prev_error_cross > 0)) {
+            integral = 0.0f;
+        }
 
-        // ==========================================================================
-        // РАСПРЕДЕЛЕНИЕ СИГНАЛОВ ПО ЗОНАМ
-        // ==========================================================================
-        if (fabsf(error) <= 3.0f) {
-            set_servo_angle(90.0f); // Мертвая зона -> Нейтраль
-            target_position = 0;    // Вкрутить иглу строго в ноль
-            nyrok_done = false;
-        } 
-        else if (error > 3.0f) {
-            // НАГНЕТАНИЕ
-            nyrok_done = false;
+        float output = Kp_eff * error + Ki_eff * integral + Kd * derivative_filtered;
+        int32_t target_raw = (int32_t)output;
 
-            if (current_pressure >= 300.0f) {
-                set_servo_angle(90.0f); // Ваше правило: отсекаем внешнюю магистраль
-            } else {
-                set_servo_angle(180.0f); // Качаем из линии питания
+        // ======================= ANTI-WINDUP =======================
+        if (target_raw > 80000) target_raw = 80000;
+        if (target_raw < 0) target_raw = 0;
+
+        bool at_limit = (target_raw == 80000 && error > 0) ||
+                        (target_raw == 0 && error < 0);
+        if (!at_limit) {
+            integral += error * dt;
+            if (integral > 800.0f)  integral = 800.0f;
+            if (integral < -800.0f) integral = -800.0f;
+        } else {
+            integral *= 0.995f;
+        }
+
+        // ======================= УПРАВЛЕНИЕ СЕРВОЙ =======================
+        if (ramp_active) {
+            // RAMP-фаза: серва НЕ МЕНЯЕТСЯ, кроме аварийного перелёта >50 кПа
+            if (error < -50.0f && servo_state != VENTING) {
+                servo_state = VENTING;
+                set_servo_angle(0.0f);
+                target_position = 80000;
+                integral = 0.0f;
+                ESP_LOGI("PID", "Аварийный сброс в ramp!");
             }
+        } else {
+            // ФИНАЛЬНАЯ фаза (удержание точной уставки)
+            switch (servo_state) {
+                case NEUTRAL:
+                    if (error > FINAL_CHARGE_ON_THRESHOLD) {
+                        servo_state = CHARGING;
+                        set_servo_angle(180.0f);
+                        ESP_LOGI("PID", "Серво: ЗАРЯДКА");
+                    } else if (error < VENT_ON_THRESHOLD) {
+                        servo_state = VENTING;
+                        set_servo_angle(0.0f);
+                        target_position = 80000;
+                        integral = 0.0f;
+                        ESP_LOGI("PID", "Серво: СБРОС");
+                    }
+                    break;
 
-            if (error < 15.0f || output < 0.0f) {
-                target_position = 0; // Упреждающее закрытие
-            } else {
-                target_position = (int32_t)output;
+                case CHARGING:
+                    if (error <= FINAL_CHARGE_OFF_THRESHOLD) {
+                        servo_state = NEUTRAL;
+                        set_servo_angle(90.0f);
+                        ESP_LOGI("PID", "Серво: НЕЙТРАЛЬ (перекрытие)");
+                    } else if (error < VENT_ON_THRESHOLD) {
+                        servo_state = VENTING;
+                        set_servo_angle(0.0f);
+                        target_position = 80000;
+                        integral = 0.0f;
+                        ESP_LOGI("PID", "Серво: СБРОС из зарядки");
+                    }
+                    break;
+
+                case VENTING:
+                    if (error > VENT_OFF_THRESHOLD) {
+                        servo_state = NEUTRAL;
+                        set_servo_angle(90.0f);
+                        ESP_LOGI("PID", "Серво: НЕЙТРАЛЬ после сброса");
+                    }
+                    break;
             }
-        } 
-        else if (error < -3.0f) {
-            // СБРОС (ПЕРЕЛЕТ)
-            if (!nyrok_done) {
-                set_servo_angle(0.0f);          // Нырок в атмосферу для разгрузки трубки
-                target_position = 0;            
-                vTaskDelay(pdMS_TO_TICKS(100)); // Сдуваем паразитную трубку 100 мс
-                set_servo_angle(90.0f);         // Серву в нейтраль
-                nyrok_done = true;              
-            } 
-            else {
-                set_servo_angle(90.0f); // Трубка пустая, серва в нейтрали
+        }
 
-                float sbrois_derivative = -derivative;
-                float sbrois_output = (Kp * fabsf(error)) + (Kd * sbrois_derivative);
-
-                if (error > -15.0f || sbrois_output < 0.0f) {
-                    target_position = 0; // Близко к цели сверху -> упреждающее закрытие
-                } else {
-                    target_position = (int32_t)sbrois_output;
-                    if (target_position > 15000) target_position = 15000; // Ограничение порции сброса
+        // ======================= ЦЕЛЕВАЯ ПОЗИЦИЯ КЛАПАНА =======================
+        if (fabsf(error) <= 0.01f) {
+            // Мёртвая зона – цель достигнута
+            target_position = 0;
+            integral = 0.0f;
+            derivative_filtered = 0.0f;
+            stuck_counter_pos = 0;
+            stuck_counter_neg = 0;
+        } else {
+            if (servo_state == VENTING) {
+                target_position = 80000;   // полный сброс
+            } else if (ramp_active && servo_state == NEUTRAL) {
+                // Режим сброса в ramp: клапан открыт пропорционально ошибке
+                float open = Kp_eff * fabsf(error) + Ki_eff * integral;
+                int32_t raw = (int32_t)open;
+                if (raw < 5000) raw = 5000;   // минимальное открытие, чтобы давление падало
+                if (raw > 40000) raw = 40000; // максимальное при сбросе
+                target_position = raw;
+            } else {
+                // Обычное управление (ramp CHARGING или финальный режим)
+                target_position = target_raw;
+                if (!ramp_active && servo_state == NEUTRAL && target_position > 15000) {
+                    target_position = 15000;   // в финальной нейтрали не открываемся слишком сильно
                 }
             }
         }
 
-        // ПЕРЕМЕЩАЕМ ВАЛ СТРОГО ПО ИМПУЛЬСАМ РУКАМИ. Пауза 190 мкс = 5000 Гц стабильного хода
-        move_valve_absolute(target_position, 190);
+        // ======================= ДОЖИМ (только в финальной нейтрали) =======================
+        if (!ramp_active && servo_state == NEUTRAL) {
+            if (error > 0.01f && error < 0.5f) {
+                stuck_counter_pos++;
+                if (stuck_counter_pos > 25) {   // 0.5 секунды
+                    target_position += 50;
+                    if (target_position > 15000) target_position = 15000;
+                    stuck_counter_pos = 0;
+                }
+            } else {
+                stuck_counter_pos = 0;
+            }
 
-        printf("PID_LOOP: Pres: %.1f | Err: %.1f | CurPos: %ld | TagPos: %ld\n", 
-                 current_pressure, error, (long int)current_valve_position, (long int)target_position);
+            if (error < -0.01f && error > -0.5f) {
+                stuck_counter_neg++;
+                if (stuck_counter_neg > 25) {
+                    target_position -= 50;
+                    if (target_position < 0) target_position = 0;
+                    stuck_counter_neg = 0;
+                }
+            } else {
+                stuck_counter_neg = 0;
+            }
+        }
 
-        vTaskDelay(pdMS_TO_TICKS(20)); // Шаг 20 мс
+        // ======================= ОГРАНИЧЕНИЕ ШАГА =======================
+        const int32_t MAX_STEP = 3000;
+        int32_t step = target_position - current_valve_position;
+        if (step > MAX_STEP) {
+            target_position = current_valve_position + MAX_STEP;
+        } else if (step < -MAX_STEP) {
+            target_position = current_valve_position - MAX_STEP;
+        }
+
+        move_valve_absolute(target_position, 20);
+
+        printf("PID_LOOP: Pres: %.3f | Final: %.1f | Ramp: %.1f | Err: %.3f | Servo: %c | Cur: %ld | Tgt: %ld\n",
+               current_pressure, final_setpoint, ramp_setpoint, error,
+               (servo_state == NEUTRAL ? 'N' : (servo_state == CHARGING ? 'C' : 'V')),
+               (long int)current_valve_position, (long int)target_position);
+
+        prev_error_cross = error;
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
+
+
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
 void init_pid_regulator(void) {
@@ -404,10 +650,10 @@ void init_pid_regulator(void) {
         gpio_set_level(PIN_DIR, false); // false - ОТКРЫТИЕ иглы вверх
         esp_rom_delay_us(50);
 
-        ESP_LOGI("PURGE", "Выкручивание иглы строго на 50000 шагов руками...");
+        ESP_LOGI("PURGE", "Выкручивание иглы строго на 100000 шагов руками...");
         current_valve_position = 0; 
 
-        // Цикл на ОТКРЫТИЕ: Выдаем строго 50 000 физических импульсов на частоте 4000 Гц
+        // Цикл на ОТКРЫТИЕ: Выдаем строго 100 000 физических импульсов на частоте 4000 Гц
         for (int32_t i = 0; i < 100000; i++) {
             gpio_set_level(PIN_STEP, 1);
             esp_rom_delay_us(10); 
@@ -434,12 +680,12 @@ void init_pid_regulator(void) {
         gpio_set_level(PIN_DIR, true); // true - ЗАКРЫТИЕ (вкручиваем обратно к седлу)
         esp_rom_delay_us(50);
 
-        // Делаем ровно 50 000 шагов назад, возвращая вал в исходную точку
+        // Делаем ровно 100 000 шагов назад, возвращая вал в исходную точку
         for (int32_t i = 0; i < 100000; i++) {
             gpio_set_level(PIN_STEP, 1);
             esp_rom_delay_us(10); 
             gpio_set_level(PIN_STEP, 0);
-            esp_rom_delay_us(20); // Скорость 4000 Гц
+            esp_rom_delay_us(20); // быстрая скорость
 
             current_valve_position--; // Уменьшаем координату строго до нуля!
         }
@@ -453,7 +699,7 @@ void init_pid_regulator(void) {
     else {
         ESP_LOGI("PURGE", "В системе чисто. Профилактическое обнуление сенсора...");
         vTaskDelay(pdMS_TO_TICKS(500));
-        //performAdvancedZeroCalibration(0.0f, 1);
+        //performAdvancedZeroCalibration(0.0f, 1); //пока не надо
         
         current_valve_position = 0;
     }
