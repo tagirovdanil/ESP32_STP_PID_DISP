@@ -269,11 +269,11 @@ void pid_regulator_task(void *pvParameters) {
     uint32_t stuck_counter_pos = 0;
     uint32_t stuck_counter_neg = 0;
 
-    dt = 0.02f;
+    dt = 0.03f;
 
-    Kp = 80.0f;
-    Ki = 40.0f;   // можно 80
-    Kd = 5.0f;
+    Kp = 40.0f;
+    Ki = 25.0f;   // после настройки перерегулирования
+    Kd = 10.0f;
 
     float derivative_filtered = 0.0f;
 
@@ -282,25 +282,24 @@ void pid_regulator_task(void *pvParameters) {
     float ramp_setpoint = 0.0f;
     bool ramp_active = false;
 
-    // Серво
+    // Серво (ваши углы)
     enum ServoState { NEUTRAL, CHARGING, VENTING };
     enum ServoState servo_state = NEUTRAL;
 
     static float prev_error_cross = 0.0f;
 
-    const float FINAL_CHARGE_ON_THRESHOLD  = 0.5f;
-    const float FINAL_CHARGE_OFF_THRESHOLD = 0.1f;
-    const float VENT_ON_THRESHOLD          = -2.0f;
-    const float VENT_OFF_THRESHOLD         = -0.2f;
+    const float FINAL_CHARGE_ON_THRESHOLD  = 0.05f;
+    const float FINAL_CHARGE_OFF_THRESHOLD = 0.01f;
+    const float VENT_ON_THRESHOLD          = -0.05f;
+    const float VENT_OFF_THRESHOLD         = -0.01f;
 
-    // Переменная для накопления интеграла при сбросе
     float vent_integral = 0.0f;
 
     set_servo_angle(90.0f);
     previous_pressure = pressure1_kPa;
     filtered_rate = 0.0f;
 
-    ESP_LOGI("PID", "Усиленный сброс с адаптивным ramp.");
+    ESP_LOGI("PID", "Ускоренный сброс + ramp.");
 
     while (1) {
         if (is_calibrating) {
@@ -308,11 +307,7 @@ void pid_regulator_task(void *pvParameters) {
             continue;
         }
 
-        // ---------- HOMING ----------
-        if (is_homing) {
-            // ... без изменений
-        }
-
+   
         // ---------- НОВАЯ УСТАВКА ----------
         if (setpoint_kPa != final_setpoint && setpoint_kPa > 0.01f) {
             final_setpoint = setpoint_kPa;
@@ -342,7 +337,7 @@ void pid_regulator_task(void *pvParameters) {
             ramp_active = false;
         }
 
-        // ---------- RAMP (адаптивный при сбросе) ----------
+        // ---------- RAMP (ускоренный для сброса) ----------
         if (ramp_active && final_setpoint > 0.01f) {
             float error_ramp = final_setpoint - ramp_setpoint;
             if (fabsf(error_ramp) < 0.01f) {
@@ -352,20 +347,30 @@ void pid_regulator_task(void *pvParameters) {
             } else {
                 float distance = fabsf(ramp_setpoint - final_setpoint);
                 float speed_kPa_s;
-                if (distance > 0.1f * final_setpoint) {
-                    speed_kPa_s = 0.1f * final_setpoint;
-                } else if (distance > 0.025f * final_setpoint) {
-                    speed_kPa_s = 0.025f * final_setpoint;
-                } else if (distance > 5.0f) {
-                    speed_kPa_s = 5.0f;
+
+                if (ramp_setpoint > final_setpoint) {
+                    // Сброс: абсолютные скорости
+                    if (distance > 50.0f)      speed_kPa_s = 100.0f;
+                    else if (distance > 10.0f) speed_kPa_s = 10.0f;
+                    else if (distance > 5.0f)  speed_kPa_s = 0.2f;
+                    else if (distance > 2.0f)  speed_kPa_s = 0.05f;
+                    else                       speed_kPa_s = 0.01f;
                 } else {
-                    speed_kPa_s = 1.0f;
+                    // Набор: процент от уставки (как раньше)
+                    if (distance > 0.1f * final_setpoint) {
+                        speed_kPa_s = 0.1f * final_setpoint;
+                    } else if (distance > 0.02f * final_setpoint) {
+                        speed_kPa_s = 0.02f * final_setpoint;
+                    } else if (distance > 2.0f) {
+                        speed_kPa_s = 2.0f;
+                    } else {
+                        speed_kPa_s = 1.0f;
+                    }
                 }
 
-                // Если сбрасываем и давление ещё высоко, не даём ramp обгонять реальное давление более чем на 20 кПа
+                // Адаптация: не даём ramp сильно обгонять давление
                 if (servo_state == VENTING && ramp_setpoint < pressure1_kPa - 20.0f) {
-                    // Притормаживаем ramp: цель не должна быть намного ниже текущего давления
-                    speed_kPa_s = 0.0f;   // фактически останавливаем, пока давление не упадёт
+                    speed_kPa_s = 0.0f;
                 }
 
                 float step = speed_kPa_s * dt;
@@ -382,33 +387,40 @@ void pid_regulator_task(void *pvParameters) {
         previous_pressure = current_pressure;
         filtered_rate = 0.8f * filtered_rate + 0.2f * raw_rate;
 
-        // ---------- УПРАВЛЕНИЕ КЛАПАНОМ ----------
-        if (servo_state == VENTING) {
-            // --- СБРОС ---
-            if (error < -1.0f) {
-                // Сильное превышение: открываем широко
-                float abs_err = fabsf(error);
-                // Усиленный коэффициент + интегральная часть для увеличения открытия со временем
-                float proportional = 600.0f * abs_err;   // было 300, теперь 600
-                vent_integral += abs_err * dt * 200.0f;  // накопление, если долго не падает
-                if (vent_integral > 40000.0f) vent_integral = 40000.0f;
-                float total_open = proportional + vent_integral;
-                int32_t raw = (int32_t)total_open;
-                if (raw < 20000) raw = 20000;   // минимум 20000 при ошибке >1 кПа
-                if (raw > 80000) raw = 80000;
-                target_position = raw;
-            } else if (error < -0.5f) {
-                // Небольшое превышение: приоткрываем немного
-                target_position = 10000;
-                vent_integral = 0.0f;
-            } else {
-                // Ошибка маленькая или положительная: закрываем
-                target_position = 0;
-                vent_integral = 0.0f;
-            }
-        } else {
-            // --- НАБОР или НЕЙТРАЛЬ ---
-            // Сброс вент-интеграла
+        // ---------- УПРАВЛЕНИЕ КЛАПАНОМ (усиленный сброс) ----------
+            if (servo_state == VENTING) {
+                        if (error < -50.0f) {
+                            target_position = 80000;
+                        } else if (error < -10.0f) {
+                            float abs_err = fabsf(error);
+                            float proportional = 1500.0f * abs_err;
+                            vent_integral += abs_err * dt * 500.0f;
+                            if (vent_integral > 40000.0f) vent_integral = 40000.0f;
+                            int32_t raw = (int32_t)(proportional + vent_integral);
+                            if (raw < 40000) raw = 40000;
+                            if (raw > 80000) raw = 80000;
+                            target_position = raw;
+                        } else if (error < -2.0f) {
+                            float abs_err = fabsf(error);
+                            // Добавлен интегральный рост, чтобы клапан постепенно открывался шире
+                            float proportional = 600.0f * abs_err;
+                            vent_integral += abs_err * dt * 150.0f;   // медленное накопление
+                            if (vent_integral > 30000.0f) vent_integral = 30000.0f;
+                            int32_t raw = (int32_t)(proportional + vent_integral);
+                            if (raw < 30000) raw = 30000;   // минимум 30000 шагов для начала
+                            if (raw > 80000) raw = 80000;
+                            target_position = raw;
+                        } else if (error < -0.2f) {
+                            // Небольшой перелёт – умеренное открытие
+                            target_position = 15000;
+                            vent_integral = 0.0f;
+                        } else {
+                            // Ошибка в пределах -0.2 .. 0 – закрываем клапан
+                            target_position = 0;
+                            vent_integral = 0.0f;
+                        }
+                    } else {
+            // Набор / нейтраль – обычный ПИД
             vent_integral = 0.0f;
 
             float abs_error = fabsf(error);
@@ -449,16 +461,8 @@ void pid_regulator_task(void *pvParameters) {
         }
 
         // ---------- СЕРВОУПРАВЛЕНИЕ ----------
-        if (ramp_active) {
-            if (servo_state == VENTING && current_pressure <= final_setpoint + 5.0f) {
-                servo_state = NEUTRAL;
-                set_servo_angle(90.0f);
-                integral = 0.0f;
-                derivative_filtered = 0.0f;
-                vent_integral = 0.0f;
-                ESP_LOGI("PID", "Сброс: НЕЙТРАЛЬ (давление %.1f)", current_pressure);
-            }
-        } else {
+        if (!ramp_active) {
+            // Финальный режим: управление через конечный автомат без принудительных переходов
             switch (servo_state) {
                 case NEUTRAL:
                     if (error > FINAL_CHARGE_ON_THRESHOLD) {
@@ -480,51 +484,37 @@ void pid_regulator_task(void *pvParameters) {
                     }
                     break;
             }
-        }
+}
 
         // ---------- ОГРАНИЧЕНИЯ В НЕЙТРАЛИ ----------
-        if (!ramp_active && servo_state == NEUTRAL && target_position > 15000) {
-            target_position = 15000;
-        }
-
-        // ---------- ДОЖИМ (финал) ----------
-        if (!ramp_active && servo_state == NEUTRAL) {
-            if (error > 0.01f && error < 0.5f) {
+        if (servo_state == NEUTRAL && !ramp_active) {
+            if (target_position > 15000) target_position = 15000;
+            if (error > 0.01f && error < 0.1f) {
                 stuck_counter_pos++;
-                if (stuck_counter_pos > 25) {
-                    target_position += 50;
-                    if (target_position > 15000) target_position = 15000;
-                    stuck_counter_pos = 0;
-                }
-            } else stuck_counter_pos = 0;
-
-            if (error < -0.01f && error > -0.5f) {
+                if (stuck_counter_pos > 25) { target_position += 50; if (target_position>15000) target_position=15000; stuck_counter_pos=0; }
+            } else stuck_counter_pos=0;
+            if (error < -0.01f && error > -0.1f) {
                 stuck_counter_neg++;
-                if (stuck_counter_neg > 25) {
-                    target_position -= 50;
-                    if (target_position < 0) target_position = 0;
-                    stuck_counter_neg = 0;
-                }
-            } else stuck_counter_neg = 0;
+                if (stuck_counter_neg > 25) { target_position -= 50; if (target_position<0) target_position=0; stuck_counter_neg=0; }
+            } else stuck_counter_neg=0;
         }
 
         // ---------- ОГРАНИЧЕНИЕ ШАГА ----------
-        const int32_t MAX_STEP = 3000;
+        const int32_t MAX_STEP = 1000;   // увеличено для быстрого движения
         int32_t step = target_position - current_valve_position;
         if (step > MAX_STEP) target_position = current_valve_position + MAX_STEP;
         else if (step < -MAX_STEP) target_position = current_valve_position - MAX_STEP;
 
         move_valve_absolute(target_position, 20);
 
-        printf("PID_LOOP: Pres: %.3f | Final: %.1f | Ramp: %.1f | Err: %.3f | Servo: %c | Cur: %ld | Tgt: %ld\n",
-               current_pressure, final_setpoint, ramp_setpoint, error,
-               (servo_state == NEUTRAL ? 'N' : (servo_state == CHARGING ? 'C' : 'V')),
-               (long int)current_valve_position, (long int)target_position);
+        printf("PID: Pres=%.2f kPa | Final=%.1f | Ramp=%.1f | Err=%.2f | Rate=%.2f kPa/s | Pos=%ld\n",
+               current_pressure, final_setpoint, ramp_setpoint, error, filtered_rate, (long int)current_valve_position);
 
         prev_error_cross = error;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
+
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
