@@ -272,7 +272,7 @@ void pid_regulator_task(void *pvParameters) {
     dt = 0.03f;
 
     Kp = 40.0f;
-    Ki = 25.0f;   // после настройки перерегулирования
+    Ki = 25.0f;
     Kd = 10.0f;
 
     float derivative_filtered = 0.0f;
@@ -282,7 +282,7 @@ void pid_regulator_task(void *pvParameters) {
     float ramp_setpoint = 0.0f;
     bool ramp_active = false;
 
-    // Серво (ваши углы)
+    // Серво
     enum ServoState { NEUTRAL, CHARGING, VENTING };
     enum ServoState servo_state = NEUTRAL;
 
@@ -293,13 +293,14 @@ void pid_regulator_task(void *pvParameters) {
     const float VENT_ON_THRESHOLD          = -0.05f;
     const float VENT_OFF_THRESHOLD         = -0.01f;
 
+    // Интегратор для режима VENTING (непрерывный)
     float vent_integral = 0.0f;
 
     set_servo_angle(90.0f);
     previous_pressure = pressure1_kPa;
     filtered_rate = 0.0f;
 
-    ESP_LOGI("PID", "Ускоренный сброс + ramp.");
+    ESP_LOGI("PID", "Непрерывный ПИД-сброс (без ступенек).");
 
     while (1) {
         if (is_calibrating) {
@@ -307,7 +308,6 @@ void pid_regulator_task(void *pvParameters) {
             continue;
         }
 
-   
         // ---------- НОВАЯ УСТАВКА ----------
         if (setpoint_kPa != final_setpoint && setpoint_kPa > 0.01f) {
             final_setpoint = setpoint_kPa;
@@ -337,7 +337,7 @@ void pid_regulator_task(void *pvParameters) {
             ramp_active = false;
         }
 
-        // ---------- RAMP (ускоренный для сброса) ----------
+        // ---------- RAMP (ваши настройки) ----------
         if (ramp_active && final_setpoint > 0.01f) {
             float error_ramp = final_setpoint - ramp_setpoint;
             if (fabsf(error_ramp) < 0.01f) {
@@ -349,14 +349,12 @@ void pid_regulator_task(void *pvParameters) {
                 float speed_kPa_s;
 
                 if (ramp_setpoint > final_setpoint) {
-                    // Сброс: абсолютные скорости
                     if (distance > 50.0f)      speed_kPa_s = 100.0f;
                     else if (distance > 10.0f) speed_kPa_s = 10.0f;
                     else if (distance > 5.0f)  speed_kPa_s = 0.2f;
                     else if (distance > 2.0f)  speed_kPa_s = 0.05f;
                     else                       speed_kPa_s = 0.01f;
                 } else {
-                    // Набор: процент от уставки (как раньше)
                     if (distance > 0.1f * final_setpoint) {
                         speed_kPa_s = 0.1f * final_setpoint;
                     } else if (distance > 0.02f * final_setpoint) {
@@ -368,7 +366,6 @@ void pid_regulator_task(void *pvParameters) {
                     }
                 }
 
-                // Адаптация: не даём ramp сильно обгонять давление
                 if (servo_state == VENTING && ramp_setpoint < pressure1_kPa - 20.0f) {
                     speed_kPa_s = 0.0f;
                 }
@@ -387,58 +384,52 @@ void pid_regulator_task(void *pvParameters) {
         previous_pressure = current_pressure;
         filtered_rate = 0.8f * filtered_rate + 0.2f * raw_rate;
 
-        // ---------- УПРАВЛЕНИЕ КЛАПАНОМ (усиленный сброс) ----------
-            if (servo_state == VENTING) {
-                        if (error < -50.0f) {
-                            target_position = 80000;
-                        } else if (error < -10.0f) {
-                            float abs_err = fabsf(error);
-                            float proportional = 1500.0f * abs_err;
-                            vent_integral += abs_err * dt * 500.0f;
-                            if (vent_integral > 40000.0f) vent_integral = 40000.0f;
-                            int32_t raw = (int32_t)(proportional + vent_integral);
-                            if (raw < 40000) raw = 40000;
-                            if (raw > 80000) raw = 80000;
-                            target_position = raw;
-                        } else if (error < -2.0f) {
-                            float abs_err = fabsf(error);
-                            // Добавлен интегральный рост, чтобы клапан постепенно открывался шире
-                            float proportional = 600.0f * abs_err;
-                            vent_integral += abs_err * dt * 150.0f;   // медленное накопление
-                            if (vent_integral > 30000.0f) vent_integral = 30000.0f;
-                            int32_t raw = (int32_t)(proportional + vent_integral);
-                            if (raw < 30000) raw = 30000;   // минимум 30000 шагов для начала
-                            if (raw > 80000) raw = 80000;
-                            target_position = raw;
-                        } else if (error < -0.2f) {
-                            // Небольшой перелёт – умеренное открытие
-                            target_position = 15000;
-                            vent_integral = 0.0f;
-                        } else {
-                            // Ошибка в пределах -0.2 .. 0 – закрываем клапан
-                            target_position = 0;
-                            vent_integral = 0.0f;
-                        }
-                    } else {
-            // Набор / нейтраль – обычный ПИД
-            vent_integral = 0.0f;
+        // ---------- НЕЛИНЕЙНЫЕ КОЭФФИЦИЕНТЫ (общие для всех режимов) ----------
+        float abs_error = fabsf(error);
+        float Kp_eff, Ki_eff;
+        if (abs_error > 50.0f) {
+            Kp_eff = Kp; Ki_eff = Ki;
+        } else if (abs_error < 2.0f) {
+            if (error > 0) { Kp_eff = Kp * 0.5f; Ki_eff = Ki * 0.7f; }
+            else          { Kp_eff = Kp * 0.8f; Ki_eff = Ki * 0.7f; }
+        } else {
+            float ratio = (abs_error - 2.0f) / 48.0f;
+            Kp_eff = Kp * (0.5f + 0.5f * ratio);
+            Ki_eff = Ki * (0.7f + 0.3f * ratio);
+        }
 
-            float abs_error = fabsf(error);
-            float Kp_eff, Ki_eff;
-            if (abs_error > 50.0f) {
-                Kp_eff = Kp; Ki_eff = Ki;
-            } else if (abs_error < 2.0f) {
-                if (error > 0) { Kp_eff = Kp * 0.5f; Ki_eff = Ki * 0.7f; }
-                else          { Kp_eff = Kp * 0.8f; Ki_eff = Ki * 0.7f; }
+        // Производная (общая)
+        float derivative_raw = (error - previous_error) / dt;
+        derivative_filtered = 0.7f * derivative_filtered + 0.3f * derivative_raw;
+
+        // ---------- НЕПРЕРЫВНОЕ УПРАВЛЕНИЕ КЛАПАНОМ ----------
+        if (servo_state == VENTING) {
+            // Симметричный ПИД для сброса: отрицательная ошибка -> положительное открытие
+            if (error < -0.01f) {
+                // Пропорциональная часть от модуля ошибки
+                float proportional = Kp_eff * fabsf(error);
+                // Интегральная часть: накапливаем отрицательную ошибку, потом берём модуль
+                vent_integral += error * dt;   // error отрицателен, vent_integral уходит в минус
+                // Анти-виндовка: если выход уже на максимуме и ошибка всё ещё отрицательная, останавливаем интеграл
+                float raw_output = proportional + Ki_eff * (-vent_integral) + Kd * derivative_filtered;
+                if (raw_output >= 80000.0f && error < 0) {
+                    // Не даём интегралу расти дальше
+                    vent_integral -= error * dt;   // отменяем последнее приращение
+                }
+                float output_vent = proportional + Ki_eff * (-vent_integral) + Kd * derivative_filtered;
+                if (output_vent > 80000.0f) output_vent = 80000.0f;
+                if (output_vent < 0.0f) output_vent = 0.0f;
+                target_position = (int32_t)output_vent;
             } else {
-                float ratio = (abs_error - 2.0f) / 48.0f;
-                Kp_eff = Kp * (0.5f + 0.5f * ratio);
-                Ki_eff = Ki * (0.7f + 0.3f * ratio);
+                // Ошибка почти нулевая или положительная – закрываем клапан
+                target_position = 0;
+                vent_integral = 0.0f;
             }
+        } else {
+            // Набор / нейтраль – обычный ПИД
+            vent_integral = 0.0f;   // сбрасываем интегратор сброса
 
-            float derivative_raw = (error - previous_error) / dt;
-            derivative_filtered = 0.7f * derivative_filtered + 0.3f * derivative_raw;
-
+            // Сброс интеграла при смене знака ошибки
             if ((error > 0 && prev_error_cross < 0) || (error < 0 && prev_error_cross > 0)) {
                 integral = 0.0f;
             }
@@ -448,6 +439,7 @@ void pid_regulator_task(void *pvParameters) {
             if (target_raw > 80000) target_raw = 80000;
             if (target_raw < 0) target_raw = 0;
 
+            // Anti-windup
             bool at_limit = (target_raw == 80000 && error > 0) || (target_raw == 0 && error < 0);
             if (!at_limit) {
                 integral += error * dt;
@@ -460,9 +452,8 @@ void pid_regulator_task(void *pvParameters) {
             target_position = target_raw;
         }
 
-        // ---------- СЕРВОУПРАВЛЕНИЕ ----------
+        // ---------- СЕРВОУПРАВЛЕНИЕ (финальный автомат) ----------
         if (!ramp_active) {
-            // Финальный режим: управление через конечный автомат без принудительных переходов
             switch (servo_state) {
                 case NEUTRAL:
                     if (error > FINAL_CHARGE_ON_THRESHOLD) {
@@ -481,12 +472,13 @@ void pid_regulator_task(void *pvParameters) {
                 case VENTING:
                     if (error > VENT_OFF_THRESHOLD) {
                         servo_state = NEUTRAL; set_servo_angle(90.0f);
+                        vent_integral = 0.0f;
                     }
                     break;
             }
-}
+        }
 
-        // ---------- ОГРАНИЧЕНИЯ В НЕЙТРАЛИ ----------
+        // ---------- ОГРАНИЧЕНИЯ В НЕЙТРАЛИ (дожим) ----------
         if (servo_state == NEUTRAL && !ramp_active) {
             if (target_position > 15000) target_position = 15000;
             if (error > 0.01f && error < 0.1f) {
@@ -500,7 +492,7 @@ void pid_regulator_task(void *pvParameters) {
         }
 
         // ---------- ОГРАНИЧЕНИЕ ШАГА ----------
-        const int32_t MAX_STEP = 1000;   // увеличено для быстрого движения
+        const int32_t MAX_STEP = 1000;
         int32_t step = target_position - current_valve_position;
         if (step > MAX_STEP) target_position = current_valve_position + MAX_STEP;
         else if (step < -MAX_STEP) target_position = current_valve_position - MAX_STEP;
@@ -514,6 +506,7 @@ void pid_regulator_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
+
 
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
