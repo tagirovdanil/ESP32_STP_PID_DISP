@@ -1,10 +1,10 @@
-#ifndef CONTROL_H
-#define CONTROL_H
+#pragma once
 
 #include <stdbool.h> 
 #include "esp_rom_sys.h"
 #include "driver/uart.h"
 #include "stdbool.h"
+
 
 // 1 Настройки периферии (Серво и Шаговик)
 #define PIN_SERVO       21  // Пин управления RC серво
@@ -27,33 +27,26 @@
 #define SERVO_MIN_US    1000 // 0 градусов
 #define SERVO_MAX_US    2000 // 180 градусов
 
-// ==========================================================================
-//   КОЭФФИЦИЕНТЫ ПИД И ТАЙМИНГИ (ЧЕРЕЗ DEFINE — ПАМЯТЬ НЕ ВЫДЕЛЯЕТСЯ)
-// ==========================================================================
-//#define dt  0.1f   // Период расчета ПИД-регулятора (100 мс)
-//#define Kp  0.8f   // Пропорциональный коэффициент
-//#define Ki  0.02f  // Интегральный коэффициент
-//#define Kd  0.15f  // Дифференциальный коэффициент
 
 // Глобальный флаг: идет ли сейчас процедура сброса давления (хоуминга)
-extern volatile bool is_homing;
+
 
 // Прототип функции запуска хоуминга
-void start_pressure_homing(void);
+
 // 3. Объявляем глобальные переменные через extern (чтобы не было дубликатов)
 extern volatile float setpoint_kPa;
 extern volatile float pressure1_kPa;
 
+extern volatile bool is_homing;
+extern volatile bool is_calibrating;             
+extern volatile int32_t current_valve_position;
+extern volatile bool is_homing;
+
 // 4. Прототипы функций
 void set_servo_angle(float angle);
-void move_stepper(int steps, int speed_ms, bool direction);
-void init_pid_regulator(void);
+void move_stepper(int steps, int speed_us, bool direction);
+void move_valve_absolute(int32_t target_position, uint32_t speed_us);
+void start_pressure_homing(void);
+void hardware_setup_and_calibrate(void);
 void update_setpoint(float new_setpoint);
 void init_servo(void);
-
-
-
-
-
-
-#endif // CONTROL_H

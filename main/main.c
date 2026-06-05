@@ -12,11 +12,13 @@
 // 2. Ваши собственные модули (интерфейсы управления)
 #include "st7789.h"           // Для работы с дисплеем TTGO
 #include "pressure_sensor.h"  // Для работы с датчиком давления и калибровкой
-#include "control.h"          // Для работы с ПИД-регулятором, сервой и шаговиком
+#include "config.h"          // Для работы с ПИД-регулятором, сервой и шаговиком
+#include "pressure_regulator.h"
 
 #define USB_UART_PORT       UART_NUM_0
 #define USB_BUF_SIZE        256
 
+extern volatile void calibrate_valve_home(void);
 
 static const char *TAG = "MAIN_APP";
 
@@ -38,6 +40,32 @@ static const char *TAG = "MAIN_APP";
                 data[len] = '\0'; // Гарантируем корректный нуль-терминатор для работы со строками
                 char *str = (char *)data;
 
+                // Обработка команды "idle"
+            if (strstr(str, "idle") || strstr(str, "IDLE")) {
+                regulator_request_state(REG_STATE_IDLE);
+                const char *msg = "\r\n>> Switched to IDLE\r\n";
+                uart_write_bytes(USB_UART_PORT, msg, strlen(msg));
+                continue;
+            }
+
+            // Обработка команды "abort" (то же, что idle)
+            if (strstr(str, "abort") || strstr(str, "ABORT")) {
+                regulator_request_state(REG_STATE_IDLE);
+                const char *msg = "\r\n>> Aborted, switched to IDLE\r\n";
+                uart_write_bytes(USB_UART_PORT, msg, strlen(msg));
+                continue;
+            }
+
+            // Команда "home" – принудительный сброс давления
+            if (strstr(str, "home") || strstr(str, "HOME")) {
+                calibrate_valve_home();
+                //start_pressure_homing();  // это уже есть
+                // или regulator_request_state(REG_STATE_HOMING);
+                const char *msg = "\r\n>> Homing started\r\n";
+                uart_write_bytes(USB_UART_PORT, msg, strlen(msg));
+                continue;
+            }
+                
                 // ==========================================================================
                 // ОБРАБОТКА КОМАНДЫ "RESET"
                 // ==========================================================================
@@ -86,11 +114,13 @@ static const char *TAG = "MAIN_APP";
 
 
 void app_main(void) {
+    
     LCD_init(); 
-    pressure_sensor_init(); 
-    init_pid_regulator();
-    //char screen_buffer[32];
     pressure_ui_and_usb_init(&dev);
+    pressure_sensor_init(); 
+    hardware_setup_and_calibrate();   // пины, серво, хоминг, продувка
+    regulator_start_task();           // запуск задачи ПИД
+    
 
     while(1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

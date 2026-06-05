@@ -7,8 +7,9 @@
 #include "fontx.h"
 #include "driver/gpio.h"
 #include "esp_spiffs.h"
-#include "control.h"  
+#include "config.h"  
 #include <math.h>
+#include "pressure_regulator.h"
 
 static const char *TAG = "SENSOR_MODULE";
 // Служебные переменные для расчета кПа/сек
@@ -24,8 +25,6 @@ bool frameStarted1 = false;
 uint32_t sum_err = 0;
 uint32_t lastPressureTime = 0;
 
-// Реализация глобальной переменной флага калибровки
-bool is_calibrating = false; 
 
 extern void usb_uart_rx_task(void *pvParameters); 
 
@@ -277,6 +276,7 @@ static void processIncomingData(void) {
 extern void usb_uart_rx_task(void *pvParameters); 
 
 void pressure_ui_and_usb_init(TFT_t *p_dev) {
+
     // ==========================================================================
     // ИНИЦИАЛИЗАЦИЯ ДРАЙВЕРА USB UART (UART_NUM_0) ДЛЯ ПРИЕМА КОМАНД С ПК
     // ==========================================================================
@@ -324,4 +324,8 @@ void pressure_ui_and_usb_init(TFT_t *p_dev) {
     // Запускаем задачу обновления экрана автоматически!
     // Выделяем ей 3072 байт стека и приоритет 3 (чуть ниже, чем у UART)
     xTaskCreate(display_update_task, "display_update_task", 3072, NULL, 3, NULL);
+}
+
+void regulator_start_task(void) {
+    xTaskCreate(pid_regulator_task, "regulator", 4096, NULL, 5, NULL);
 }
