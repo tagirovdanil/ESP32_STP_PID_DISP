@@ -6,13 +6,21 @@
 #include "stdbool.h"
 
 
-// 1 Настройки периферии (Серво и Шаговик)
+// 1 Настройки периферии (Серво и Шаговик) эта схема Андрея
+#define PIN_SERVO       2  // Пин управления RC серво
+#define PIN_STEP        21  // Пин шага драйвера Nema17
+#define PIN_DIR         17  // Пин направления драйвера Nema17
+#define PIN_ENABLE      32   // Выход сброса ошибки (на EN+ мотора) -> БЕЗОПАСНО
+#define PIN_ALARM       33  // Вход аварии (на AL+ мотора) -> ОЧЕНЬ ВАЖНО!
+
+/*
+// 1 Настройки периферии (Серво и Шаговик) это моя схема
 #define PIN_SERVO       21  // Пин управления RC серво
 #define PIN_STEP        12  // Пин шага драйвера Nema17
 #define PIN_DIR         13  // Пин направления драйвера Nema17
 #define PIN_ENABLE      2   // Выход сброса ошибки (на EN+ мотора) -> БЕЗОПАСНО
 #define PIN_ALARM       15  // Вход аварии (на AL+ мотора) -> ОЧЕНЬ ВАЖНО!
-
+*/
 
 
 // 2 Настройки ШИМ для Серво (14-битное разрешение)
@@ -21,7 +29,7 @@
 #define LEDC_CHANNEL    LEDC_CHANNEL_0
 #define STEP_LEDC_TIMER     LEDC_TIMER_1
 #define STEP_LEDC_CHANNEL   LEDC_CHANNEL_1
-#define MAX_VALVE_STEPS 80000 // Лимит безопасности: 10 оборотов (3600 градусов)
+#define MAX_VALVE_STEPS 10000 // Лимит безопасности: 10 оборотов (3600 градусов)
 #define VALVE_MAX_SPEED_HZ  10000 
 
 #define SERVO_MIN_US    1000 // 0 градусов
@@ -50,3 +58,4 @@ void start_pressure_homing(void);
 void hardware_setup_and_calibrate(void);
 void update_setpoint(float new_setpoint);
 void init_servo(void);
+void calibrate_valve_home(void);

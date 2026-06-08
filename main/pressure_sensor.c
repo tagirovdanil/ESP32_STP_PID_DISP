@@ -24,7 +24,7 @@ uint8_t rxIndex1 = 0;
 bool frameStarted1 = false;
 uint32_t sum_err = 0;
 uint32_t lastPressureTime = 0;
-
+extern TaskHandle_t display_task_handle;
 
 extern void usb_uart_rx_task(void *pvParameters); 
 
@@ -299,7 +299,7 @@ void pressure_ui_and_usb_init(TFT_t *p_dev) {
     // ==========================================================================
 
     // Теперь создание задачи пройдет успешно и без ошибок драйвера!
-    xTaskCreate(usb_uart_rx_task, "usb_uart_rx_task", 3072, NULL, 4, NULL);
+    xTaskCreate(usb_uart_rx_task, "usb_uart_rx_task", 3072, NULL, 4, &display_task_handle);
 
     ESP_LOGI("INIT", "Все системы запущены.");
 

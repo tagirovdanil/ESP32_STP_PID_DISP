@@ -24,8 +24,9 @@ volatile bool is_calibrating = false;
 extern TFT_t dev;
 extern FontxFile fx16[2];
 
+extern TaskHandle_t display_task_handle;
 static void reset_motor_driver(void);
-volatile void calibrate_valve_home(void);
+void calibrate_valve_home(void);
 
 bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num);
 
@@ -36,7 +37,7 @@ volatile int32_t current_valve_position = 0;
     // 1. Инициализируем ШИМ только для Сервопривода (Таймер 0 / Канал 0)
     init_servo(); 
 
-    // 2. ИСПРАВЛЕНО: Конфигурируем ВСЕ ТРИ пина шаговика (STEP, DIR, ENABLE) как обычные выходы GPIO
+    // 2. Конфигурируем ВСЕ ТРИ пина шаговика (STEP, DIR, ENABLE) как обычные выходы GPIO
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PIN_STEP) | (1ULL << PIN_DIR) | (1ULL << PIN_ENABLE), // ТЕПЕРЬ PIN_STEP ТУТ!
         .mode = GPIO_MODE_OUTPUT,
@@ -56,18 +57,28 @@ volatile int32_t current_valve_position = 0;
     };
     gpio_config(&alarm_conf);
 
+  
     // Сбрасываем возможные старые ошибки драйвера при включении питания
-    reset_motor_driver();
+    //reset_motor_driver();
 
     // ВЫЗЫВАЕМ КАЛИБРОВКУ ХОМИНГА (Мотор плавно и честно найдет физический ноль своими импульсами)
     calibrate_valve_home();
     
+
+
     // ==========================================================================
     // ЖЕЛЕЗОБЕТОННАЯ СКОРОСТНАЯ РУЧНАЯ ПРОДУВКА ПО ШАГАМ (БЕЗ ШИМ)
     // ==========================================================================
     if (pressure1_kPa > 5.0f) {
         ESP_LOGW("PURGE", "Обнаружено остаточное давление: %.1f кПа. Запуск продувки...", pressure1_kPa);
         
+          // Приостанавливаем задачу дисплея, чтобы она не мешала SPI
+        
+        if (display_task_handle != NULL) {
+            vTaskSuspend(display_task_handle);
+        }
+
+
         // Ставим сервопривод строго в положение АТМОСФЕРЫ (0 градусов)
         set_servo_angle(0.0f); 
         vTaskDelay(pdMS_TO_TICKS(200)); // Даем серве честно переложиться
@@ -80,11 +91,11 @@ volatile int32_t current_valve_position = 0;
         current_valve_position = 0; 
 
         // Цикл на ОТКРЫТИЕ: Выдаем строго 100 000 физических импульсов на частоте 4000 Гц
-        for (int32_t i = 0; i < 100000; i++) {
+        for (int32_t i = 0; i < 10000; i++) {
             gpio_set_level(PIN_STEP, 1);
             esp_rom_delay_us(10); 
             gpio_set_level(PIN_STEP, 0);
-            esp_rom_delay_us(20);
+            esp_rom_delay_us(200);
             current_valve_position++;
 
             // Даём другим задачам поработать каждые 2000 шагов (~400 мс)
@@ -97,13 +108,14 @@ volatile int32_t current_valve_position = 0;
         
         // Ждем, пока воздух реально выйдет в атмосферу из объема 100 мл
         while (pressure1_kPa > 2.0f) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            
         }
         
         // В системе честная атмосфера. Вызываем калибровку нуля датчика
         ESP_LOGI("PURGE", "Атмосфера достигнута. Запуск аппаратного нуля датчика...");
         //performAdvancedZeroCalibration(0.0f, 1);
-        vTaskDelay(pdMS_TO_TICKS(500)); 
+        vTaskDelay(pdMS_TO_TICKS(200)); 
 
         // ВОЗВРАТ ИГЛЫ ОБРАТНО В ПОЛОЖЕНИЕ АБСОЛЮТНОГО НУЛЯ "0"!
         ESP_LOGI("PURGE", "Возврат иглы обратно в положение абсолютного нуля (0 шагов)...");
@@ -111,21 +123,25 @@ volatile int32_t current_valve_position = 0;
         esp_rom_delay_us(50);
 
         // Делаем ровно 100 000 шагов назад, возвращая вал в исходную точку
-        for (int32_t i = 0; i < 100000; i++) {
+        for (int32_t i = 0; i < 10000; i++) {
             gpio_set_level(PIN_STEP, 1);
             esp_rom_delay_us(10); 
             gpio_set_level(PIN_STEP, 0);
-            esp_rom_delay_us(20);
+            esp_rom_delay_us(200);
             current_valve_position--;
 
             if (i % 2000 == 0) {
-                //vTaskDelay(1);
+                vTaskDelay(1);
+                ESP_LOGI("PURGE", "давление в сенсоре...", pressure1_kPa);
             }
         }
 
         // Финальная отсечка сервопривода в безопасную нейтраль
         set_servo_angle(90.0f); 
-        vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(200));
+            if (display_task_handle != NULL) {
+            vTaskResume(display_task_handle);
+        }
         
         ESP_LOGI("PURGE", "Игла успешно вернулась в ноль. Координата в памяти: %ld", current_valve_position);
     } 
@@ -136,9 +152,8 @@ volatile int32_t current_valve_position = 0;
         
         current_valve_position = 0;
     }
+   
 }
-
-
 
 
 void update_setpoint(float new_setpoint) {
@@ -175,10 +190,7 @@ void calibrate_valve_home(void) {
     lcdDrawFinish(&dev); // Рисуем заставку ОДИН РАЗ [INDEX]
 
     // Сбрасываем стартовую ошибку драйвера мотора
-    gpio_set_level(PIN_ENABLE, 1); 
-    vTaskDelay(pdMS_TO_TICKS(50));  
-    gpio_set_level(PIN_ENABLE, 0); 
-    vTaskDelay(pdMS_TO_TICKS(100)); 
+    reset_motor_driver();
 
     ESP_LOGI("HOMING", "Текущий уровень на пине ALARM перед стартом: %d", gpio_get_level(PIN_ALARM));
 
@@ -187,48 +199,48 @@ void calibrate_valve_home(void) {
     gpio_set_level(PIN_DIR, dir_close);
 
     uint32_t total_steps_done = 0;
-    const uint32_t MAX_SAFETY_STEPS = 120000; // Лимит 10 оборотов
+    const uint32_t MAX_SAFETY_STEPS = 12000; // Лимит 12 оборотов
     uint32_t alarm_confirm_counter = 0;
 
     // СВЕРХЧИСТЫЙ ЦИКЛ: Процессор занят ТОЛЬКО генерацией импульсов
-    while (1) {
-        
-        // Защита от наводок (дебаунс)
-        if (gpio_get_level(PIN_ALARM) != 0) {
-            alarm_confirm_counter++;
-            if (alarm_confirm_counter >= 1) {
-                break; // Физический упор найден!
+        while (1) {
+            
+            // Защита от наводок (дебаунс)
+            if (gpio_get_level(PIN_ALARM) != 0) {
+                alarm_confirm_counter++;
+                if (alarm_confirm_counter >= 10) {
+                    break; // Физический упор найден!
+                }
+            } else {
+                alarm_confirm_counter = 0; // Сброс помехи
             }
-        } else {
-            alarm_confirm_counter = 0; // Сброс помехи
+
+            // САМА ГЕНЕРАЦИЯ ИМПУЛЬСА
+            gpio_set_level(PIN_STEP, 1);
+            esp_rom_delay_us(20); 
+            gpio_set_level(PIN_STEP, 0);
+            esp_rom_delay_us(500); // 4000 Гц монолитного хода
+
+            total_steps_done++; 
+
+            // Чтобы не срабатывал сторожевой таймер (Watchdog) процессора, 
+            // мы даем микро-отдых системе раз в 4000 шагов (это раз в 1 секунду) всего на 1 тик.
+            // На слух это будет едва заметный мягкий переход, а не жесткое заикание каждые 100 мс!
+            if (total_steps_done % 100 == 0) { 
+                vTaskDelay(1); 
+                ESP_LOGI("HOMING", "Шагов сделано: %lu", total_steps_done);
+            }
+
+            // Защита по лимиту шагов
+            if (total_steps_done >= MAX_SAFETY_STEPS) {
+                ESP_LOGE("HOMING", "ОШИБКА: Физический упор не найден за %lu шагов!", MAX_SAFETY_STEPS);
+                is_calibrating = false;
+                return;
+            }
         }
-
-        // САМА ГЕНЕРАЦИЯ ИМПУЛЬСА
-        gpio_set_level(PIN_STEP, 1);
-        esp_rom_delay_us(20); 
-        gpio_set_level(PIN_STEP, 0);
-        esp_rom_delay_us(100); // 4000 Гц монолитного хода
-
-        total_steps_done++; 
-
-        // Чтобы не срабатывал сторожевой таймер (Watchdog) процессора, 
-        // мы даем микро-отдых системе раз в 4000 шагов (это раз в 1 секунду) всего на 1 тик.
-        // На слух это будет едва заметный мягкий переход, а не жесткое заикание каждые 100 мс!
-        if (total_steps_done % 1000 == 0) { 
-            vTaskDelay(1); 
-            ESP_LOGI("HOMING", "Шагов сделано: %lu", total_steps_done);
-        }
-
-        // Защита по лимиту шагов
-        if (total_steps_done >= MAX_SAFETY_STEPS) {
-            ESP_LOGE("HOMING", "ОШИБКА: Физический упор не найден за %lu шагов!", MAX_SAFETY_STEPS);
-            is_calibrating = false;
-            return;
-        }
-    }
 
     // Сюда попадем, когда вал жестко коснулся упора
-    float final_turns = (float)total_steps_done / 8000.0f;
+    float final_turns = (float)total_steps_done / 800.0f;
     ESP_LOGI("HOMING", "Физический упор найден! Всего честных шагов: %lu (Оборотов: %.2f)", total_steps_done, final_turns);
 
     // Выводим финальный результат на экран ОДИН РАЗ после остановки вала
@@ -244,11 +256,7 @@ void calibrate_valve_home(void) {
     lcdDrawFinish(&dev);
 
     lcdSetFontDirection(&dev, DIRECTION270);
-    // Сбрасываем ошибку заклинивания на моторе
-    gpio_set_level(PIN_ENABLE, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));  
-    gpio_set_level(PIN_ENABLE, 0);  
-    vTaskDelay(pdMS_TO_TICKS(100)); 
+    reset_motor_driver();
 
     current_valve_position = 0; 
     is_calibrating = false; // Возвращаем управление экраном основному циклу main.c

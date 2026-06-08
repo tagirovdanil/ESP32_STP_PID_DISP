@@ -23,7 +23,7 @@
 extern TFT_t dev;
 extern FontxFile fx16[2];
 
-
+extern TaskHandle_t display_task_handle;
 
 TaskHandle_t pid_task_handle = NULL; // Хэндл для контроля запущенной ПИД-задачи
 
@@ -340,50 +340,48 @@ void pid_regulator_task(void *pvParameters) {
     float filtered_rate = 0.0f;
     int32_t target_position = 0;
 
+    // Таймер для периодического логирования
+    uint32_t last_log_time_ms = 0;
+    const uint32_t LOG_PERIOD_MS = 500;
+
     while (1) {
-                if (requested_reg_state != REG_STATE_IDLE && requested_reg_state != reg.state) {
-            // Пришла команда извне
+        // Обработка запрошенного состояния
+        if (requested_reg_state != REG_STATE_IDLE && requested_reg_state != reg.state) {
             if (requested_reg_state == REG_STATE_HOMING) {
-                // Запускаем homing
                 is_homing = true;
             } else {
-                // Переходим в указанное состояние
                 reg.state = requested_reg_state;
-                // Если это IDLE – сбросим всё
                 if (requested_reg_state == REG_STATE_IDLE) {
                     reg.ramp.final_setpoint = 0.0f;
                     reg.ramp.ramp_setpoint = 0.0f;
                     reg.ramp.ramp_active = false;
                     setpoint_kPa = 0.0f;
-                    // сброс интеграторов
                     reg.pid.integral = 0.0f;
                     reg.pid.vent_integral = 0.0f;
                     reg.pid.prev_error = 0.0f;
                     reg.pid.derivative_filtered = 0.0f;
                     reg.stuck_counter_pos = 0;
                     reg.stuck_counter_neg = 0;
-                    // серво в нейтраль и клапан закрыт
                     if (reg.servo_state != SERVO_NEUTRAL) {
                         set_servo_angle(90.0f);
                         reg.servo_state = SERVO_NEUTRAL;
                     }
-                    // позиция клапана будет установлена в 0 в кейсе IDLE
                 }
             }
             requested_reg_state = REG_STATE_IDLE; // сбросим запрос
         }
-                
+
         if (is_calibrating) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        // -------------------- Обработка команды HOMING --------------------
+        // Обработка команды HOMING
         if (is_homing) {
             reg.state = REG_STATE_HOMING;
         }
 
-        // -------------------- Новая уставка --------------------
+        // Новая уставка
         if (setpoint_kPa != reg.ramp.final_setpoint && setpoint_kPa > 0.01f) {
             reg.ramp.final_setpoint = setpoint_kPa;
             reg.ramp.ramp_setpoint = pressure1_kPa;
@@ -407,10 +405,9 @@ void pid_regulator_task(void *pvParameters) {
             }
         }
 
-        // -------------------- Главный автомат состояний --------------------
+        // Главный автомат состояний
         switch (reg.state) {
             case REG_STATE_IDLE: {
-                // Полное бездействие
                 if (reg.servo_state != SERVO_NEUTRAL) {
                     set_servo_angle(90.0f);
                     reg.servo_state = SERVO_NEUTRAL;
@@ -419,7 +416,6 @@ void pid_regulator_task(void *pvParameters) {
                 if (current_valve_position != 0) {
                     move_valve_absolute(0, 20);
                 }
-                // сброс накоплений
                 reg.pid.integral = 0.0f;
                 reg.pid.vent_integral = 0.0f;
                 reg.pid.derivative_filtered = 0.0f;
@@ -429,13 +425,15 @@ void pid_regulator_task(void *pvParameters) {
                 previous_pressure = pressure1_kPa;
                 filtered_rate = 0.0f;
 
-                printf("PID: Idle | Pres=%.2f kPa | Pos=%ld\n", pressure1_kPa, (long int)current_valve_position);
+                if (esp_timer_get_time() / 1000 - last_log_time_ms > LOG_PERIOD_MS) {
+                    ESP_LOGI("PID", "Idle | Pres=%.2f kPa | Pos=%ld", pressure1_kPa, (long int)current_valve_position);
+                    last_log_time_ms = esp_timer_get_time() / 1000;
+                }
                 vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
             }
 
             case REG_STATE_HOLD: {
-                // Полная остановка без сброса параметров
                 if (reg.servo_state != SERVO_NEUTRAL) {
                     set_servo_angle(90.0f);
                     reg.servo_state = SERVO_NEUTRAL;
@@ -444,14 +442,15 @@ void pid_regulator_task(void *pvParameters) {
                 if (current_valve_position != 0) {
                     move_valve_absolute(0, 20);
                 }
-                // Не сбрасываем интеграторы и ramp!
-                printf("PID: Hold | Pres=%.2f kPa | Pos=%ld\n", pressure1_kPa, (long int)current_valve_position);
+                if (esp_timer_get_time() / 1000 - last_log_time_ms > LOG_PERIOD_MS) {
+                    ESP_LOGI("PID", "Hold | Pres=%.2f kPa | Pos=%ld", pressure1_kPa, (long int)current_valve_position);
+                    last_log_time_ms = esp_timer_get_time() / 1000;
+                }
                 vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
             }
 
             case REG_STATE_HOMING: {
-                // Штатный сброс давления (как в оригинале)
                 ESP_LOGW("PID", "Homing: сброс давления...");
                 set_servo_angle(0.0f);
                 reg.servo_state = SERVO_VENTING;
@@ -497,11 +496,10 @@ void pid_regulator_task(void *pvParameters) {
 
             case REG_STATE_RAMPING:
             case REG_STATE_HOLDING:
-                // Основной рабочий блок – расчёты выполняются ниже
                 break;
         }
 
-        // -------------------- Обновление ramp (только в RAMPING) --------------------
+        // Обновление ramp (только в RAMPING)
         if (reg.state == REG_STATE_RAMPING) {
             update_ramp(&reg, pressure1_kPa);
             if (!reg.ramp.ramp_active) {
@@ -510,7 +508,7 @@ void pid_regulator_task(void *pvParameters) {
             }
         }
 
-        // -------------------- Измерения --------------------
+        // Измерения
         float current_pressure = pressure1_kPa;
         float error = reg.ramp.ramp_setpoint - current_pressure;
 
@@ -523,7 +521,7 @@ void pid_regulator_task(void *pvParameters) {
         reg.pid.derivative_filtered = reg.pid.derivative_alpha * reg.pid.derivative_filtered +
                                       (1.0f - reg.pid.derivative_alpha) * derivative;
 
-        // -------------------- ПИД-вычисления --------------------
+        // ПИД-вычисления
         bool is_venting = (reg.servo_state == SERVO_VENTING);
         float output = calculate_pid(&reg.pid, error, reg.pid.derivative_filtered, is_venting);
         int32_t target_raw = (int32_t)output;
@@ -533,25 +531,30 @@ void pid_regulator_task(void *pvParameters) {
 
         target_position = target_raw;
 
-        // -------------------- Серво-автомат (только в HOLDING) --------------------
+        // Серво-автомат (только в HOLDING)
         if (reg.state == REG_STATE_HOLDING) {
             update_servo_state(&reg, error);
         }
 
-        // -------------------- Дожим в нейтрали (только в HOLDING) --------------------
+        // Дожим в нейтрали (только в HOLDING)
         if (reg.state == REG_STATE_HOLDING && reg.servo_state == SERVO_NEUTRAL) {
             apply_neutral_dwell(&reg, error, &target_position);
         }
 
-        // -------------------- Ограничение шага и движение --------------------
+        // Ограничение шага и движение
         int32_t step = target_position - current_valve_position;
         if (step > reg.max_step) target_position = current_valve_position + reg.max_step;
         else if (step < -reg.max_step) target_position = current_valve_position - reg.max_step;
 
         move_valve_absolute(target_position, 20);
 
-        printf("PID: Pres=%.2f kPa | Final=%.1f | Ramp=%.1f | Err=%.2f | Rate=%.2f kPa/s | State=%d | Pos=%ld\n",
-               current_pressure, reg.ramp.final_setpoint, reg.ramp.ramp_setpoint, error, filtered_rate, reg.state, (long int)current_valve_position);
+        // Логирование раз в 500 мс
+        uint32_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - last_log_time_ms >= LOG_PERIOD_MS) {
+            ESP_LOGI("PID", "Pres=%.2f kPa | Final=%.1f | Ramp=%.1f | Err=%.2f | Rate=%.2f kPa/s | State=%d | Pos=%ld",
+                     current_pressure, reg.ramp.final_setpoint, reg.ramp.ramp_setpoint, error, filtered_rate, reg.state, (long int)current_valve_position);
+            last_log_time_ms = now_ms;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
