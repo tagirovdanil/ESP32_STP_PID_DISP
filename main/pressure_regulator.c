@@ -1,39 +1,45 @@
 #include <stdio.h>
+#include <string.h>        // memset
+#include <stdlib.h>        // labs
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "esp_spiffs.h"
 #include "esp_timer.h"
-#include "driver/ledc.h" // Драйвер ШИМ для Сервопривода
-#include "esp_log.h"
+#include "driver/ledc.h"   // Драйвер ШИМ для сервопривода
 #include <math.h>
 #include "stdbool.h"
 #include "driver/uart.h"
 
 #include "pressure_regulator.h"
-#include "st7789.h" 
+#include "st7789.h"
 #include "fontx.h"
-#include "config.h"  
+#include "config.h"
 
-//static const char *TAG = "control_APP";
-// Инициализация аппаратного ШИМ для Серво
-
-
+// ============================================================================
+//  Внешние объекты/глобалы (определены в config.c / st7789.c)
+// ============================================================================
 extern TFT_t dev;
 extern FontxFile fx16[2];
-
 extern TaskHandle_t display_task_handle;
 
-TaskHandle_t pid_task_handle = NULL; // Хэндл для контроля запущенной ПИД-задачи
+// «нет запроса» по умолчанию; команды idle/abort/home кладут сюда своё значение
+volatile RegulatorState requested_reg_state = REG_STATE_NONE;
 
-bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num);
+// Пауза между импульсами шага в РЕГУЛЯТОРЕ (мкс). Период импульса ≈ 10 + это.
+// ВАЖНО: было 20 (~33 кГц) — NEMA17 со старта столько не тянет и стоит на месте,
+// хотя программа считает шаги. Хоминг работает на 500 (~1.9 кГц), reset на 190
+// (~5 кГц). 400 -> ~2.4 кГц — заведомо в рабочем диапазоне. Если хочешь быстрее,
+// уменьшай это число постепенно и смотри, чтобы мотор не срывался в свист.
+#define VALVE_STEP_US   400
 
-volatile RegulatorState requested_reg_state = REG_STATE_IDLE;
+// ============================================================================
+//  ПУБЛИЧНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПРИВОДОВ (используются и из config.c)
+// ============================================================================
 
-
-// Глобальная переменная текущего абсолютного положения вентиля (в шагах)
-
+// Принудительный физический сброс давления (команда reset). Выставляет флаг,
+// сам сброс делает задача регулятора в ветке REG_STATE_HOMING.
 void start_pressure_homing(void) {
     if (!is_homing) {
         ESP_LOGW("CONTROL", "Запущен принудительный сброс давления (Homing)!");
@@ -41,519 +47,363 @@ void start_pressure_homing(void) {
     }
 }
 
+// Запрос смены состояния извне (из обработчика команд).
 void regulator_request_state(RegulatorState new_state) {
     requested_reg_state = new_state;
 }
 
-
-// Функция установки угла сервопривода (0 - 180 градусов)
+// Угол сервопривода 0..180 -> ШИМ. 0 = сброс, 90 = нейтраль, 180 = подача.
 void set_servo_angle(float angle) {
-    if (angle < 0.0f) angle = 0.0f;
+    if (angle < 0.0f)   angle = 0.0f;
     if (angle > 180.0f) angle = 180.0f;
 
-    uint32_t us = SERVO_MIN_US + (uint32_t)((angle / 180.0f) * (SERVO_MAX_US - SERVO_MIN_US));
-    uint32_t duty = (us * 16383) / 20000;
-    
-    // ==========================================================================
-    // ИСПРАВЛЕНИЕ: Физически отправляем ШИМ-сигнал на ногу сервопривода
-    // ==========================================================================
+    uint32_t us   = SERVO_MIN_US + (uint32_t)((angle / 180.0f) * (SERVO_MAX_US - SERVO_MIN_US));
+    uint32_t duty = (us * 16383) / 20000;   // 14-битный ШИМ, период 20000 мкс (50 Гц)
+
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    // ==========================================================================
 }
 
-// Функция перемещения иглы в абсолютную координату руками (без ШИМ)
+// Перемещение иглы в абсолютную координату (в шагах), руками, без аппаратного ШИМ.
+// speed_us — пауза между импульсами (чем меньше, тем быстрее).
 void move_valve_absolute(int32_t target_position, uint32_t speed_us) {
-    // Защита от выхода за механические рамки резьбы
-    if (target_position < 0) target_position = 0;
+    if (target_position < 0)               target_position = 0;
     if (target_position > MAX_VALVE_STEPS) target_position = MAX_VALVE_STEPS;
+    if (current_valve_position == target_position) return;
 
-    if (current_valve_position == target_position) return; // Мы уже на месте
-
-    // Вычисляем, сколько шагов нужно сделать физически
     int32_t steps_to_move = labs(target_position - current_valve_position);
-
-    // Определяем направление
-    bool dir = (target_position > current_valve_position) ? false : true; // false - открыть, true - закрыть
+    bool    dir = (target_position > current_valve_position) ? false : true; // false=открыть, true=закрыть
     gpio_set_level(PIN_DIR, dir);
-    esp_rom_delay_us(5); // Короткая пауза для фиксации пина направления
+    esp_rom_delay_us(5);
 
-    // Выдаем строго посчитанное количество импульсов
     for (int32_t i = 0; i < steps_to_move; i++) {
         gpio_set_level(PIN_STEP, 1);
-        esp_rom_delay_us(10); 
+        esp_rom_delay_us(10);
         gpio_set_level(PIN_STEP, 0);
-        esp_rom_delay_us(speed_us); // Пауза скорости (например, 190 мкс для 5000 Гц)
-
-        // Изменяем абсолютную координату в памяти строго на 1 шаг
-        if (dir == false) {
-            current_valve_position++;
-        } else {
-            current_valve_position--;
-        }
+        esp_rom_delay_us(speed_us);
+        if (dir == false) current_valve_position++;
+        else              current_valve_position--;
     }
 }
 
-// Функция генерации шагов для Nema17
+// Генерация N шагов в заданном направлении (с программными концевиками).
 void move_stepper(int steps, int speed_us, bool direction) {
     gpio_set_level(PIN_DIR, direction);
-    
     for (int i = 0; i < steps; i++) {
-        // Программные концевики: не даем ПИДу сломать вентиль!
-        if (direction == true && current_valve_position >= MAX_VALVE_STEPS) {
-            break; // Вентиль открыт на все 10 оборотов, дальше крутить нельзя
-        }
-        if (direction == false && current_valve_position <= 0) {
-            break; // Вентиль полностью закрыт, уперлись в ноль, дальше давить нельзя
-        }
-
-        // Выдаем ОДИН честный импульс
+        if (direction == true  && current_valve_position >= MAX_VALVE_STEPS) break;
+        if (direction == false && current_valve_position <= 0)               break;
         gpio_set_level(PIN_STEP, 1);
-        esp_rom_delay_us(10); 
+        esp_rom_delay_us(10);
         gpio_set_level(PIN_STEP, 0);
-        
-        // Пауза скорости (например, 125 мкс для быстрого движения)
-        esp_rom_delay_us(speed_us); 
-
-        // ИЗМЕНЯЕМ АБСОЛЮТНУЮ КООРДИНАТУ В ПАМЯТИ НА +1 ИЛИ -1
-        if (direction == true) {
-            current_valve_position++; // Считаем шаги вперед (открытие)
-        } else {
-            current_valve_position--; // Считаем шаги назад (закрытие)
-        }
+        esp_rom_delay_us(speed_us);
+        if (direction == true) current_valve_position++;
+        else                   current_valve_position--;
     }
 }
 
-
+// ============================================================================
+//  ИНИЦИАЛИЗАЦИЯ РЕГУЛЯТОРА
+//  Все коэффициенты ФИКСИРОВАННЫЕ — настраиваются один раз. Значения ниже —
+//  стартовые/безопасные, под конкретное железо их нужно подобрать (см. подсказки).
+// ============================================================================
 void regulator_init(PressureRegulator* reg, float dt) {
     memset(reg, 0, sizeof(*reg));
-    
-    // PID
-    reg->pid.Kp = 40.0f;
-    reg->pid.Ki = 25.0f;
-    reg->pid.Kd = 10.0f;
-    reg->pid.dt = dt;
-    reg->pid.derivative_alpha = 0.7f;   // было 0.7/0.3
-    reg->pid.kp_scale_high = 1.0f;
-    reg->pid.kp_scale_low  = 0.5f;
-    reg->pid.ki_scale_high = 1.0f;
-    reg->pid.ki_scale_low  = 0.7f;
-    reg->pid.integral_max = 800.0f;
-    reg->pid.integral_min = -800.0f;
-    
-    // пороги (твои)
-    reg->final_charge_on_th  = 0.05f;
-    reg->final_charge_off_th = 0.01f;
-    reg->vent_on_th          = -0.05f;
-    reg->vent_off_th         = -0.01f;
-    
-    // ограничения
-    reg->max_neutral_pos = 15000;
-    reg->max_step = 1000;
-    
-    // начальное положение сервы
-    reg->state = REG_STATE_IDLE; // стартуем в плоожении ни чего не далаю. 
-    reg->servo_state = SERVO_NEUTRAL;
-    reg->prev_state = REG_STATE_IDLE;
+
+    reg->state           = REG_STATE_IDLE;
+    reg->servo_state     = SERVO_NEUTRAL;
+    reg->dt              = dt;
+    reg->active_setpoint = 0.0f;
+
+    // --- измерение скорости ---
+    reg->rate_filter_alpha = 0.8f;   // сильное сглаживание: dP/dt очень шумная
+
+    // --- ВНУТРЕННИЙ PI по скорости (дальняя зона) ---
+    // Выход — открытие иглы в шагах. Подбирать так:
+    //   1) задать постоянную желаемую скорость (например 20 кПа/с) на тесте,
+    //   2) поднимать rate_ki, пока контур уверенно выходит на эту скорость,
+    //   3) rate_kp добавить чуть-чуть для гашения отклонений (но не до дрожания).
+    reg->rate_kp           = 30.0f;
+    reg->rate_ki           = 60.0f;
+    reg->rate_integral     = 0.0f;
+    reg->rate_integral_max = 200.0f; // ~ valve_max / rate_ki, чтобы один I мог открыть иглу полностью
+
+    // --- порог «дошли» / ползучая скорость у цели ---
+    // Макс. дрожание датчика в покое (по логам ~0.2 кПа). Двойная роль:
+    //  - |error| ниже этого значения -> считаем, что ДОШЛИ: серво в нейтраль, держим;
+    //  - в полосе error 0..2 это же значение = желаемая скорость подхода (ползём медленно).
+    // Больше -> раньше останавливаемся (меньше перелёт, грубее точность); меньше -> точнее.
+    reg->sensor_noise_delta = 0.22f;
+
+    // --- лимиты привода (в шагах) ---
+    reg->valve_max      = MAX_VALVE_STEPS; // полный ход иглы
+    // ВАЖНО (подобрать под железо!): открытие, ниже которого игла физически не
+    // пропускает газ (мёртвый ход / cracking). По логам поток начинался ~4500 и
+    // держался вниз до ~3600 -> ставим floor около нижней границы потока. Регулятор
+    // никогда не опускает иглу ниже floor во время работы, поэтому уходит мёртвое
+    // время ~3 с на старте и тонкая зона реально может дать поток.
+    reg->valve_flow_floor = 3600 * 0.9; // на всякий случай умножил на 0.9, чтоб наверняка 0 был
+    // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
+    // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
+    // слю ~2400 шаг/с, полный ход ~4 с). Если игла открывается слишком медленно —
+    // увеличивай вместе с контролем времени тика.
+    reg->max_step       = 60;
 }
 
-void update_ramp(PressureRegulator* reg, float current_pressure) {
-    RampController* r = &reg->ramp;
-    if (!r->ramp_active || r->final_setpoint < 0.01f) return;
-    
-    float error_ramp = r->final_setpoint - r->ramp_setpoint;
-    if (fabsf(error_ramp) < 0.01f) {
-        r->ramp_setpoint = r->final_setpoint;
-        r->ramp_active = false;
-        return;
-    }
-    
-    float distance = fabsf(r->ramp_setpoint - r->final_setpoint);
-    float speed_kPa_s;
-    
-    if (r->ramp_setpoint > r->final_setpoint) {
-        // Сброс
-        if (distance > 50.0f)      speed_kPa_s = 100.0f;
-        else if (distance > 10.0f) speed_kPa_s = 10.0f;
-        else if (distance > 5.0f)  speed_kPa_s = 0.2f;
-        else if (distance > 2.0f)  speed_kPa_s = 0.05f;
-        else                       speed_kPa_s = 0.01f;
-    } else {
-        // Набор
-        if (distance > 0.1f * r->final_setpoint) {
-            speed_kPa_s = 0.1f * r->final_setpoint;
-        } else if (distance > 0.02f * r->final_setpoint) {
-            speed_kPa_s = 0.02f * r->final_setpoint;
-        } else if (distance > 2.0f) {
-            speed_kPa_s = 2.0f;
-        } else {
-            speed_kPa_s = 1.0f;
-        }
-    }
-    
-    // Адаптация: не даём ramp сильно обгонять давление при сбросе
-    if (reg->servo_state == SERVO_VENTING && r->ramp_setpoint < current_pressure - 20.0f) {
-        speed_kPa_s = 0.0f;
-    }
-    
-    float step = speed_kPa_s * reg->pid.dt;
-    if (step > distance) step = distance;
-    r->ramp_setpoint += (error_ramp > 0 ? step : -step);
+// ============================================================================
+//  ВНЕШНИЙ СЛОЙ: таблица «ошибка по давлению -> желаемая скорость dP/dt»
+//  Знак результата = направление (плюс — набирать, минус — стравливать).
+//  Это профиль приближения: далеко быстро, ближе медленнее. Полосы дискретные
+//  (как ты задумал); при желании потом легко заменить на непрерывную k*error.
+//  В полосе 0..2 кПа скорость = near_rate (передаём sensor_noise_delta): у цели
+//  ползём со скоростью на уровне шума датчика. Отдельной FINE-фазы больше нет.
+// ============================================================================
+static float desired_rate_from_error(float error, float near_rate) {
+    float e = fabsf(error);
+    float rate;
+    if      (e > 500.0f) rate = 100.0f;
+    else if (e > 250.0f) rate = 50.0f;
+    else if (e >  80.0f) rate = 20.0f;
+    else if (e >  30.0f) rate = 10.0f;
+    else if (e >   8.0f) rate = 3.0f;
+    else if (e >   2.0f) rate = 1.0f;        // полоса 2..8 кПа
+    else                 rate = near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
+    return (error >= 0.0f) ? rate : -rate;
 }
 
-float calculate_pid(PIDController* pid, float error, float derivative, bool is_venting) {
-    float abs_err = fabsf(error);
-    
-    // Нелинейные коэффициенты
-    float kp_eff, ki_eff;
-    if (abs_err > 50.0f) {
-        kp_eff = pid->Kp * pid->kp_scale_high;
-        ki_eff = pid->Ki * pid->ki_scale_high;
-    } else if (abs_err < 2.0f) {
-        kp_eff = pid->Kp * pid->kp_scale_low;
-        ki_eff = pid->Ki * pid->ki_scale_low;
-    } else {
-        float ratio = (abs_err - 2.0f) / 48.0f;
-        kp_eff = pid->Kp * (pid->kp_scale_low + (pid->kp_scale_high - pid->kp_scale_low) * ratio);
-        ki_eff = pid->Ki * (pid->ki_scale_low + (pid->ki_scale_high - pid->ki_scale_low) * ratio);
-    }
-    
-    if (is_venting) {
-        // Сброс: работаем с модулем ошибки и отдельным интегратором
-        if (error < -0.01f) {
-            float proportional = kp_eff * abs_err;
-            pid->vent_integral += error * pid->dt;
-            // Anti-windup: если выход на максимуме, останавливаем накопление
-            float raw_output = proportional + ki_eff * (-pid->vent_integral) + pid->Kd * derivative;
-            if (raw_output > 80000.0f && error < 0) {
-                pid->vent_integral -= error * pid->dt; // откат
-            }
-            float output = proportional + ki_eff * (-pid->vent_integral) + pid->Kd * derivative;
-            if (output > 80000.0f) output = 80000.0f;
-            if (output < 0.0f) output = 0.0f;
-            return output;
-        } else {
-            pid->vent_integral = 0.0f;
-            return 0.0f;
-        }
-    } else {
-        // Обычный режим (набор / нейтраль)
-        if ((error > 0 && pid->prev_error_cross < 0) || (error < 0 && pid->prev_error_cross > 0)) {
-            pid->integral = 0.0f;
-        }
-        pid->prev_error_cross = error;
-        
-        float output = kp_eff * error + ki_eff * pid->integral + pid->Kd * derivative;
-        
-        // Anti-windup с back-calculation
-        if (output > 80000.0f) {
-            if (error > 0) pid->integral -= (output - 80000.0f) / ki_eff * 0.1f;
-            output = 80000.0f;
-        } else if (output < -80000.0f) {
-            if (error < 0) pid->integral -= (output + 80000.0f) / ki_eff * 0.1f;
-            output = -80000.0f;
-        }
-        
-        if (output < 0.0f) output = 0.0f;
-        
-        // Накапливаем интеграл (только если не в насыщении)
-        if ((output < 80000.0f || error <= 0) && (output > 0.0f || error >= 0)) {
-            pid->integral += error * pid->dt;
-            if (pid->integral > pid->integral_max) pid->integral = pid->integral_max;
-            if (pid->integral < pid->integral_min) pid->integral = pid->integral_min;
-        }
-        
-        return output;
+// Ставит серво в нужное положение, но только если оно изменилось
+// (чтобы не дёргать ШИМ каждый тик).
+static void apply_servo(PressureRegulator* reg, ServoState s) {
+    if (reg->servo_state == s) return;
+    reg->servo_state = s;
+    switch (s) {
+        case SERVO_CHARGING: set_servo_angle(0.0f); break;
+        case SERVO_VENTING:  set_servo_angle(180.0f);   break;
+        case SERVO_NEUTRAL:  set_servo_angle(90.0f);  break;
     }
 }
 
-void update_servo_state(PressureRegulator* reg, float error) {
-    if (reg->ramp.ramp_active) return;  // в ramp не трогаем
-    
-    switch (reg->servo_state) {
-        case SERVO_NEUTRAL:
-            if (error > reg->final_charge_on_th) {
-                reg->servo_state = SERVO_CHARGING;
-                set_servo_angle(180.0f);
-            } else if (error < reg->vent_on_th) {
-                reg->servo_state = SERVO_VENTING;
-                set_servo_angle(0.0f);
-                reg->pid.integral = 0.0f;
-            }
-            break;
-        case SERVO_CHARGING:
-            if (error <= reg->final_charge_off_th) {
-                reg->servo_state = SERVO_NEUTRAL;
-                set_servo_angle(90.0f);
-            } else if (error < reg->vent_on_th) {
-                reg->servo_state = SERVO_VENTING;
-                set_servo_angle(0.0f);
-                reg->pid.integral = 0.0f;
-            }
-            break;
-        case SERVO_VENTING:
-            if (error > reg->vent_off_th) {
-                reg->servo_state = SERVO_NEUTRAL;
-                set_servo_angle(90.0f);
-                reg->pid.vent_integral = 0.0f;
-            }
-            break;
-    }
+// Обнуляет интегратор контура скорости и состояние холда (при новой цели / сбросе).
+static void reset_controllers(PressureRegulator* reg) {
+    reg->rate_integral = 0.0f;
+    reg->holding       = false;
 }
-
-void apply_neutral_dwell(PressureRegulator* reg, float error, int32_t* target) {
-    if (*target > reg->max_neutral_pos) *target = reg->max_neutral_pos;
-    
-    if (error > 0.01f && error < 0.1f) {
-        reg->stuck_counter_pos++;
-        if (reg->stuck_counter_pos > 25) {
-            *target += 50;
-            if (*target > reg->max_neutral_pos) *target = reg->max_neutral_pos;
-            reg->stuck_counter_pos = 0;
-        }
-    } else {
-        reg->stuck_counter_pos = 0;
-    }
-    
-    if (error < -0.01f && error > -0.1f) {
-        reg->stuck_counter_neg++;
-        if (reg->stuck_counter_neg > 25) {
-            *target -= 50;
-            if (*target < 0) *target = 0;
-            reg->stuck_counter_neg = 0;
-        }
-    } else {
-        reg->stuck_counter_neg = 0;
-    }
-}
-
-
-//############################################################################################################
-//############################################################################################################
-//############################################################################################################
-
+                                                      //и только потом ждать минимально необходимую скорость (которая должна быть больше чем sensor_noise_delta)
+// ============================================================================
+//  ГЛАВНАЯ ЗАДАЧА РЕГУЛЯТОРА
+// ============================================================================
 void pid_regulator_task(void *pvParameters) {
     PressureRegulator reg;
-    regulator_init(&reg, 0.03f);
+    regulator_init(&reg, 0.02f);
 
-    float previous_pressure = pressure1_kPa;
-    float filtered_rate = 0.0f;
-    int32_t target_position = 0;
+    reg.prev_pressure    = pressure1_kPa;
+    reg.last_pressure_us = esp_timer_get_time();
 
-    // Таймер для периодического логирования
-    uint32_t last_log_time_ms = 0;
+    uint64_t last_us      = esp_timer_get_time();
+    uint32_t last_log_ms  = 0;
     const uint32_t LOG_PERIOD_MS = 500;
 
     while (1) {
-        // Обработка запрошенного состояния
-        if (requested_reg_state != REG_STATE_IDLE && requested_reg_state != reg.state) {
-            if (requested_reg_state == REG_STATE_HOMING) {
-                is_homing = true;
-            } else {
-                reg.state = requested_reg_state;
-                if (requested_reg_state == REG_STATE_IDLE) {
-                    reg.ramp.final_setpoint = 0.0f;
-                    reg.ramp.ramp_setpoint = 0.0f;
-                    reg.ramp.ramp_active = false;
-                    setpoint_kPa = 0.0f;
-                    reg.pid.integral = 0.0f;
-                    reg.pid.vent_integral = 0.0f;
-                    reg.pid.prev_error = 0.0f;
-                    reg.pid.derivative_filtered = 0.0f;
-                    reg.stuck_counter_pos = 0;
-                    reg.stuck_counter_neg = 0;
-                    if (reg.servo_state != SERVO_NEUTRAL) {
-                        set_servo_angle(90.0f);
-                        reg.servo_state = SERVO_NEUTRAL;
-                    }
-                }
-            }
-            requested_reg_state = REG_STATE_IDLE; // сбросим запрос
+
+        // -------- 0. Реальный шаг цикла dt (точная скорость + честные I-члены) --------
+        uint64_t now_us = esp_timer_get_time();
+        float dt = (float)(now_us - last_us) / 1000000.0f;
+        last_us = now_us;
+        if (dt < 0.005f) dt = 0.005f;   // защита от слишком малого/большого dt
+        if (dt > 0.1f)   dt = 0.1f;
+        reg.dt = dt;
+
+        // -------- 1. Обработка внешних запросов (idle/abort, homing) --------
+        RegulatorState req = requested_reg_state;
+        if (req == REG_STATE_IDLE) {
+            reg.state = REG_STATE_IDLE;
+            setpoint_kPa        = 0.0f;
+            reg.active_setpoint = 0.0f;
+            reset_controllers(&reg);
+            requested_reg_state = REG_STATE_NONE;
+        } else if (req == REG_STATE_HOMING) {
+            is_homing = true;
+            requested_reg_state = REG_STATE_NONE;
         }
 
+        // -------- 2. Пока идёт калибровка экрана/нуля — не трогаем привод --------
         if (is_calibrating) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        // Обработка команды HOMING
-        if (is_homing) {
-            reg.state = REG_STATE_HOMING;
+        // -------- 3. Запрос физического сброса давления --------
+        if (is_homing) reg.state = REG_STATE_HOMING;
+
+        // -------- 4. Появилась новая уставка -> переходим в активное регулирование --------
+        if (setpoint_kPa != reg.active_setpoint && reg.state != REG_STATE_HOMING) {
+            reg.active_setpoint = setpoint_kPa;
+            reset_controllers(&reg);
+            reg.state = REG_STATE_RUNNING;
+            // Микро-фикс: стартуем иглу сразу с valve_flow_floor (край потока), а не
+            // ползём от 0 через мёртвый ход. Если уже выше floor (меняем уставку на
+            // ходу) — не опускаем.
+            if (current_valve_position < reg.valve_flow_floor)
+                move_valve_absolute(reg.valve_flow_floor, VALVE_STEP_US);
         }
 
-        // Новая уставка
-        if (setpoint_kPa != reg.ramp.final_setpoint && setpoint_kPa > 0.01f) {
-            reg.ramp.final_setpoint = setpoint_kPa;
-            reg.ramp.ramp_setpoint = pressure1_kPa;
-            reg.ramp.ramp_active = true;
-            reg.state = REG_STATE_RAMPING;
-
-            reg.pid.integral = 0.0f;
-            reg.pid.vent_integral = 0.0f;
-            reg.pid.prev_error = 0.0f;
-            reg.pid.prev_error_cross = 0.0f;
-            reg.stuck_counter_pos = 0;
-            reg.stuck_counter_neg = 0;
-            target_position = 0;
-
-            if (setpoint_kPa > pressure1_kPa) {
-                reg.servo_state = SERVO_CHARGING;
-                set_servo_angle(180.0f);
-            } else {
-                reg.servo_state = SERVO_VENTING;
-                set_servo_angle(0.0f);
-            }
+        // -------- 5. Измерения: давление и его (отфильтрованная) скорость --------
+        // ВАЖНО: датчик обновляет pressure1_kPa лишь раз в ~50 мс, а цикл крутится
+        // быстрее. Если делить на dt цикла каждый тик, то на тиках, где отсчёт ещё не
+        // обновился, получаем (P-P)/dt = 0, а на следующем — двойной скачок (через
+        // раз rate=0). Поэтому скорость пересчитываем ТОЛЬКО когда пришёл свежий
+        // отсчёт (значение реально изменилось), и по реальному времени с прошлого.
+        float pressure = pressure1_kPa;
+        if (pressure != reg.prev_pressure) {
+            float dt_p = (float)(now_us - reg.last_pressure_us) / 1000000.0f;
+            if (dt_p < 0.001f) dt_p = 0.001f;
+            float raw_rate = (pressure - reg.prev_pressure) / dt_p;   // кПа/с по свежему отсчёту
+            reg.filtered_rate = reg.rate_filter_alpha * reg.filtered_rate
+                              + (1.0f - reg.rate_filter_alpha) * raw_rate;
+            reg.prev_pressure    = pressure;
+            reg.last_pressure_us = now_us;
         }
+        // если отсчёт не обновился — держим прежнюю filtered_rate (без ложных нулей)
 
-        // Главный автомат состояний
+        float error = reg.active_setpoint - pressure;              // + надо набирать, - стравливать
+
+        // ======================= АВТОМАТ СОСТОЯНИЙ =======================
         switch (reg.state) {
+
+            // ---------- ПОКОЙ ----------
             case REG_STATE_IDLE: {
-                if (reg.servo_state != SERVO_NEUTRAL) {
-                    set_servo_angle(90.0f);
-                    reg.servo_state = SERVO_NEUTRAL;
-                }
-                target_position = 0;
-                if (current_valve_position != 0) {
-                    move_valve_absolute(0, 20);
-                }
-                reg.pid.integral = 0.0f;
-                reg.pid.vent_integral = 0.0f;
-                reg.pid.derivative_filtered = 0.0f;
-                reg.pid.prev_error = 0.0f;
-                reg.stuck_counter_pos = 0;
-                reg.stuck_counter_neg = 0;
-                previous_pressure = pressure1_kPa;
-                filtered_rate = 0.0f;
-
-                if (esp_timer_get_time() / 1000 - last_log_time_ms > LOG_PERIOD_MS) {
-                    ESP_LOGI("PID", "Idle | Pres=%.2f kPa | Pos=%ld", pressure1_kPa, (long int)current_valve_position);
-                    last_log_time_ms = esp_timer_get_time() / 1000;
+                apply_servo(&reg, SERVO_NEUTRAL);
+                if (current_valve_position != 0) move_valve_absolute(0, VALVE_STEP_US);
+                reset_controllers(&reg);
+                if (esp_timer_get_time()/1000 - last_log_ms > LOG_PERIOD_MS) {
+                    ESP_LOGI("PID", "Idle | P=%.2f kPa | Pos=%ld",
+                             pressure, (long)current_valve_position);
+                    last_log_ms = esp_timer_get_time()/1000;
                 }
                 vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
             }
 
-            case REG_STATE_HOLD: {
-                if (reg.servo_state != SERVO_NEUTRAL) {
-                    set_servo_angle(90.0f);
-                    reg.servo_state = SERVO_NEUTRAL;
-                }
-                target_position = 0;
-                if (current_valve_position != 0) {
-                    move_valve_absolute(0, 20);
-                }
-                if (esp_timer_get_time() / 1000 - last_log_time_ms > LOG_PERIOD_MS) {
-                    ESP_LOGI("PID", "Hold | Pres=%.2f kPa | Pos=%ld", pressure1_kPa, (long int)current_valve_position);
-                    last_log_time_ms = esp_timer_get_time() / 1000;
-                }
-                vTaskDelay(pdMS_TO_TICKS(20));
-                continue;
-            }
-
+            // ---------- ФИЗИЧЕСКИЙ СБРОС ДАВЛЕНИЯ ----------
             case REG_STATE_HOMING: {
                 ESP_LOGW("PID", "Homing: сброс давления...");
-                set_servo_angle(0.0f);
-                reg.servo_state = SERVO_VENTING;
+                apply_servo(&reg, SERVO_VENTING);
 
-                int32_t chunk_target = current_valve_position;
+                // Открываем иглу большими кусками до упора
+                int32_t chunk = current_valve_position;
                 const int32_t STEP_CHUNK = 2000;
-                while (current_valve_position < 100000) {
-                    chunk_target += STEP_CHUNK;
-                    if (chunk_target > 100000) chunk_target = 100000;
-                    move_valve_absolute(chunk_target, 190);
+                while (current_valve_position < MAX_VALVE_STEPS) {
+                    chunk += STEP_CHUNK;
+                    if (chunk > MAX_VALVE_STEPS) chunk = MAX_VALVE_STEPS;
+                    move_valve_absolute(chunk, 190);
                     vTaskDelay(1);
                 }
-
-                while (pressure1_kPa > 0.2f) {
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                }
-
-                chunk_target = current_valve_position;
+                // Ждём, пока давление реально упадёт
+                while (pressure1_kPa > 0.2f) vTaskDelay(pdMS_TO_TICKS(10));
+                // Закрываем иглу обратно
+                chunk = current_valve_position;
                 while (current_valve_position > 0) {
-                    chunk_target -= STEP_CHUNK;
-                    if (chunk_target < 0) chunk_target = 0;
-                    move_valve_absolute(chunk_target, 190);
+                    chunk -= STEP_CHUNK;
+                    if (chunk < 0) chunk = 0;
+                    move_valve_absolute(chunk, 190);
                     vTaskDelay(1);
                 }
 
-                set_servo_angle(90.0f);
-                reg.servo_state = SERVO_NEUTRAL;
-                reg.ramp.final_setpoint = 0.0f;
-                reg.ramp.ramp_setpoint = 0.0f;
-                reg.ramp.ramp_active = false;
-                setpoint_kPa = 0.0f;
-                reg.pid.integral = 0.0f;
-                reg.pid.vent_integral = 0.0f;
-                reg.pid.prev_error = 0.0f;
-                reg.pid.derivative_filtered = 0.0f;
-                reg.stuck_counter_pos = 0;
-                reg.stuck_counter_neg = 0;
+                apply_servo(&reg, SERVO_NEUTRAL);
+                setpoint_kPa        = 0.0f;
+                reg.active_setpoint = 0.0f;
+                reset_controllers(&reg);
                 reg.state = REG_STATE_IDLE;
                 is_homing = false;
                 ESP_LOGI("PID", "Homing завершён.");
                 continue;
             }
 
-            case REG_STATE_RAMPING:
-            case REG_STATE_HOLDING:
-                break;
+            // ---------- АКТИВНОЕ РЕГУЛИРОВАНИЕ ----------
+            case REG_STATE_RUNNING:
+                break;  // основная логика ниже
+
+            default:
+                reg.state = REG_STATE_IDLE;
+                continue;
         }
 
-        // Обновление ramp (только в RAMPING)
-        if (reg.state == REG_STATE_RAMPING) {
-            update_ramp(&reg, pressure1_kPa);
-            if (!reg.ramp.ramp_active) {
-                reg.state = REG_STATE_HOLDING;
-                ESP_LOGI("PID", "Ramp завершён, переход в HOLDING");
+        // ======================= ЛОГИКА REG_STATE_RUNNING =======================
+        // Две фазы:
+        //  RATE — ПОДХОД: шаговиком (по скорости) по чуть-чуть подбираемся к цели.
+        //         Как только |error| <= sensor_noise_delta (вошли в полосу шума) —
+        //         ЗАПОМИНАЕМ позицию шаговика и уходим в HOLD НАВСЕГДА (из HOLD не
+        //         выходим, шаговик больше не трогаем).
+        //  HOLD — шаговик заморожен на hold_pos, тонкую доводку делает ТОЛЬКО СЕРВО
+        //         (bang-bang): упало ниже цели на delta -> набираем; выросло выше на
+        //         delta -> стравливаем; дошли РОВНО до цели (error пересёк 0) ->
+        //         нейтраль (изолируем).
+        int32_t target_valve = current_valve_position;   // по умолчанию — стоим
+        const char* zone;
+
+        if (!reg.holding) {
+            // ---- ФАЗА ПОДХОДА (RATE): рулим ШАГОВИКОМ по скорости ----
+            zone = "RATE";
+
+            if (fabsf(error) <= reg.sensor_noise_delta) {
+                // Подобрались к цели в пределах шума -> запоминаем позицию шаговика
+                // и уходим в HOLD навсегда. Серво НЕ трогаем — оно осталось в нужную
+                // сторону с фазы RATE и само доведёт до точной цели в ветке HOLD.
+                reg.holding  = true;
+                reg.hold_pos = current_valve_position;
+                target_valve = current_valve_position;   // фиксируем шаговик
+                ESP_LOGI("PID", "HOLD: запомнили pos=%ld, дальше доводит серво. P=%.2f",
+                         (long)reg.hold_pos, pressure);
+            } else {
+                float desired = desired_rate_from_error(error, reg.sensor_noise_delta); // знаковая желаемая скорость
+                apply_servo(&reg, (desired > 0) ? SERVO_CHARGING : SERVO_VENTING);
+
+                // реальная скорость «в сторону цели» (сравниваем по модулю желаемой)
+                float measured_toward = (desired > 0) ? reg.filtered_rate : -reg.filtered_rate;
+                float rate_err = fabsf(desired) - measured_toward;   // >0 — едем медленнее нужного
+
+                // внутренний PI: открытие иглы = floor + Kp*ошибка_скорости + Ki*интеграл.
+                reg.rate_integral += rate_err * dt;
+                if (reg.rate_integral < 0.0f)                  reg.rate_integral = 0.0f;
+                if (reg.rate_integral > reg.rate_integral_max) reg.rate_integral = reg.rate_integral_max;
+
+                float out = (float)reg.valve_flow_floor + reg.rate_kp * rate_err + reg.rate_ki * reg.rate_integral;
+                if (out < (float)reg.valve_flow_floor) out = (float)reg.valve_flow_floor;
+                if (out > (float)reg.valve_max)        out = (float)reg.valve_max;
+                target_valve = (int32_t)out;
+            }
+        } else {
+            // ---- ФАЗА ХОЛДА: шаговик ЗАМОРОЖЕН на hold_pos, рулит только СЕРВО ----
+            zone = "HOLD";
+            target_valve = reg.hold_pos;                  // шаговик не двигаем
+
+            switch (reg.servo_state) {
+                case SERVO_NEUTRAL:
+                    if (error >  reg.sensor_noise_delta)      apply_servo(&reg, SERVO_CHARGING); // упало -> набрать
+                    else if (error < -reg.sensor_noise_delta) apply_servo(&reg, SERVO_VENTING);  // выросло -> стравить
+                    break;
+                case SERVO_CHARGING:
+                    if (error <= 0.0f) apply_servo(&reg, SERVO_NEUTRAL);   // дошли РОВНО до цели -> стоп
+                    break;
+                case SERVO_VENTING:
+                    if (error >= 0.0f) apply_servo(&reg, SERVO_NEUTRAL);   // дошли РОВНО до цели -> стоп
+                    break;
             }
         }
 
-        // Измерения
-        float current_pressure = pressure1_kPa;
-        float error = reg.ramp.ramp_setpoint - current_pressure;
+        // -------- Ограничение скорости движения иглы и собственно перемещение --------
+        int32_t step = target_valve - current_valve_position;
+        if (step >  reg.max_step) target_valve = current_valve_position + reg.max_step;
+        if (step < -reg.max_step) target_valve = current_valve_position - reg.max_step;
+        move_valve_absolute(target_valve, VALVE_STEP_US);
 
-        float raw_rate = (current_pressure - previous_pressure) / reg.pid.dt;
-        previous_pressure = current_pressure;
-        filtered_rate = 0.8f * filtered_rate + 0.2f * raw_rate;
-
-        float derivative = (error - reg.pid.prev_error) / reg.pid.dt;
-        reg.pid.prev_error = error;
-        reg.pid.derivative_filtered = reg.pid.derivative_alpha * reg.pid.derivative_filtered +
-                                      (1.0f - reg.pid.derivative_alpha) * derivative;
-
-        // ПИД-вычисления
-        bool is_venting = (reg.servo_state == SERVO_VENTING);
-        float output = calculate_pid(&reg.pid, error, reg.pid.derivative_filtered, is_venting);
-        int32_t target_raw = (int32_t)output;
-
-        if (target_raw > 80000) target_raw = 80000;
-        if (target_raw < 0) target_raw = 0;
-
-        target_position = target_raw;
-
-        // Серво-автомат (только в HOLDING)
-        if (reg.state == REG_STATE_HOLDING) {
-            update_servo_state(&reg, error);
-        }
-
-        // Дожим в нейтрали (только в HOLDING)
-        if (reg.state == REG_STATE_HOLDING && reg.servo_state == SERVO_NEUTRAL) {
-            apply_neutral_dwell(&reg, error, &target_position);
-        }
-
-        // Ограничение шага и движение
-        int32_t step = target_position - current_valve_position;
-        if (step > reg.max_step) target_position = current_valve_position + reg.max_step;
-        else if (step < -reg.max_step) target_position = current_valve_position - reg.max_step;
-
-        move_valve_absolute(target_position, 20);
-
-        // Логирование раз в 500 мс
+        // -------- Периодический лог --------
         uint32_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - last_log_time_ms >= LOG_PERIOD_MS) {
-            ESP_LOGI("PID", "Pres=%.2f kPa | Final=%.1f | Ramp=%.1f | Err=%.2f | Rate=%.2f kPa/s | State=%d | Pos=%ld",
-                     current_pressure, reg.ramp.final_setpoint, reg.ramp.ramp_setpoint, error, filtered_rate, reg.state, (long int)current_valve_position);
-            last_log_time_ms = now_ms;
+        if (now_ms - last_log_ms >= LOG_PERIOD_MS) {
+            ESP_LOGI("PID",
+                "%s | P=%.2f set=%.1f err=%.2f rate=%.2f kPa/s | servo=%d pos=%ld",
+                zone, pressure, reg.active_setpoint, error, reg.filtered_rate,
+                reg.servo_state, (long)current_valve_position);
+            last_log_ms = now_ms;
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));

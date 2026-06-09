@@ -3,71 +3,87 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// ============================================================================
+//  КАСКАДНЫЙ РЕГУЛЯТОР ДАВЛЕНИЯ (rate-control + тонкая I-доводка)
+// ----------------------------------------------------------------------------
+//  Идея в двух словах:
+//
+//    ВНЕШНИЙ слой  : ошибка по давлению -> ЖЕЛАЕМАЯ СКОРОСТЬ dP/dt (таблица).
+//                    Далеко от цели хотим быстро, близко — медленно.
+//                    Это, по сути, профиль приближения ("умная рампа").
+//
+//    ВНУТРЕННИЙ PI : держит РЕАЛЬНУЮ скорость dP/dt равной желаемой,
+//                    выход = открытие иглы (шаги). Коэффициенты ФИКСИРОВАННЫЕ
+//                    (настраиваются один раз) — связь "игла->расход->скорость"
+//                    почти линейна по всему диапазону, поэтому адаптировать
+//                    коэффициенты не нужно: нелинейность объекта (расход слабеет
+//                    у цели) гасится самой обратной связью по скорости.
+//
+//    У ЦЕЛИ        : отдельной фазы нет — то же управление по скорости. В полосе
+//                    error 0..2 кПа желаемая скорость = sensor_noise_delta (ползём
+//                    на уровне шума датчика). Когда |error| <= sensor_noise_delta —
+//                    считаем, что дошли: серво в нейтраль, объём изолирован, держим.
+//
+//  Направление (накачка/сброс) задаёт серво (180/0 град), величину потока —
+//  игла (шаговик). Поэтому открытие иглы всегда >= 0, а знак берёт на себя серво.
+// ============================================================================
 
-
-// Структуры
-typedef struct {
-    float Kp, Ki, Kd;
-    float dt;
-    float integral;
-    float prev_error;
-    float derivative_filtered;
-    float derivative_alpha;
-    float kp_scale_high, kp_scale_low;
-    float ki_scale_high, ki_scale_low;
-    float integral_max, integral_min;
-    float prev_error_cross;
-    float vent_integral;      // интегратор для сброса
-} PIDController;
-
-typedef struct {
-    float final_setpoint;
-    float ramp_setpoint;
-    bool   ramp_active;
-} RampController;
-
+// Положение 3-позиционного серво-крана направления.
 typedef enum {
-    SERVO_NEUTRAL,
-    SERVO_CHARGING,
-    SERVO_VENTING
+    SERVO_NEUTRAL,   // 90 град — объём изолирован (держим)
+    SERVO_CHARGING,  // 180 град — подаём давление
+    SERVO_VENTING    // 0 град — стравливаем
 } ServoState;
 
+// Состояния автомата регулятора. Снаружи используется только REG_STATE_IDLE.
 typedef enum {
-    REG_STATE_IDLE,
-    REG_STATE_HOMING,
-    REG_STATE_RAMPING,
-    REG_STATE_HOLDING,
-    REG_STATE_HOLD
+    REG_STATE_NONE = 0, // «нет запроса» — служебное значение для requested_reg_state
+    REG_STATE_IDLE,     // ничего не делаем, серво в нейтрали, игла закрыта
+    REG_STATE_HOMING,   // принудительный физический сброс давления
+    REG_STATE_RUNNING   // активное регулирование (внутри: дальняя/тонкая зона)
 } RegulatorState;
 
 typedef struct {
-    PIDController pid;
-    RampController ramp;
-    RegulatorState state; 
-    RegulatorState prev_state;
-    ServoState servo_state;
-    
-    uint32_t stuck_counter_pos;
-    uint32_t stuck_counter_neg;
-    
-    float final_charge_on_th;
-    float final_charge_off_th;
-    float vent_on_th;
-    float vent_off_th;
-    
-    int32_t max_neutral_pos;
-    int32_t max_step;
+    // ---- общее ----
+    RegulatorState state;
+    ServoState     servo_state;     // текущее положение серво (чтобы дёргать его только при смене)
+    float          dt;              // реальный шаг цикла, сек (меряется по таймеру)
+    float          active_setpoint; // уставка, на которой сейчас работаем (для детекта смены цели)
+
+    // ---- измерение скорости (производная давления) ----
+    float    prev_pressure;         // давление на прошлом СВЕЖЕМ отсчёте датчика
+    uint64_t last_pressure_us;      // время прошлого свежего отсчёта (мкс) — для честного dP/dt
+    float    filtered_rate;         // отфильтрованная dP/dt, кПа/с
+    float    rate_filter_alpha;     // коэф. фильтра скорости (0..1, ближе к 1 = сильнее сглаживание)
+
+    // ---- ВНУТРЕННИЙ PI по скорости (дальняя зона) ----
+    float   rate_kp;                // реакция на отклонение скорости (шаги на кПа/с)
+    float   rate_ki;               // набор стационарного открытия (шаги на кПа/с * с)
+    float   rate_integral;          // интегратор внутреннего контура (только >= 0)
+    float   rate_integral_max;      // ограничение интегратора (anti-windup)
+
+    // ---- порог шума датчика / ползучая скорость у цели ----
+    float sensor_noise_delta;       // макс. дрожание датчика в покое (кПа). Двойная роль:
+                                    //  - порог ВЫХОДА из холда (|error| больше -> снова регулируем);
+                                    //  - в полосе error 0..2 = желаемая скорость подхода к цели.
+
+    // ---- состояние холда: шаговик заморожен на hold_pos, тонко доводит СЕРВО ----
+    bool    holding;                // true = фаза HOLD (шаговик не трогаем, рулит серво)
+    int32_t hold_pos;               // запомненная позиция шаговика (на ней вошли в полосу цели)
+
+    // ---- лимиты привода ----
+    int32_t valve_max;              // макс. открытие иглы (шаги)
+    int32_t valve_flow_floor;       // открытие, ниже которого игла НЕ пропускает газ (мёртвый ход)
+    int32_t max_step;               // макс. сдвиг иглы за один тик (плавность/защита)
 } PressureRegulator;
 
-
-extern volatile RegulatorState requested_reg_state;   // запрос извне
+// Запрос состояния извне (например команда idle/abort -> REG_STATE_IDLE).
+extern volatile RegulatorState requested_reg_state;
 void regulator_request_state(RegulatorState new_state);
 
-// Прототипы функций
+// Инициализация регулятора фиксированными коэффициентами.
 void regulator_init(PressureRegulator* reg, float dt);
-void update_ramp(PressureRegulator* reg, float current_pressure);
-float calculate_pid(PIDController* pid, float error, float derivative, bool is_venting);
-void update_servo_state(PressureRegulator* reg, float error);
-void apply_neutral_dwell(PressureRegulator* reg, float error, int32_t* target);
+
+// Главная задача регулятора (создаётся в regulator_start_task).
 void pid_regulator_task(void *pvParameters);
 void regulator_start_task(void);

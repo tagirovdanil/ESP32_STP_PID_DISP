@@ -32,8 +32,8 @@
 #define MAX_VALVE_STEPS 10000 // Лимит безопасности: 10 оборотов (3600 градусов)
 #define VALVE_MAX_SPEED_HZ  10000 
 
-#define SERVO_MIN_US    1000 // 0 градусов
-#define SERVO_MAX_US    2000 // 180 градусов
+#define SERVO_MIN_US    600 // 0 градусов
+#define SERVO_MAX_US    2400 // 180 градусов
 
 
 // Глобальный флаг: идет ли сейчас процедура сброса давления (хоуминга)

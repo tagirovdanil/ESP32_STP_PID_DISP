@@ -5,7 +5,7 @@
     "interface/ftdi/esp32_devkitj_v1.cfg",
     "target/esp32.cfg"
   ],
-  "idf.portWin": "COM10",
+  "idf.portWin": "COM16",
   "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
@@ -17,5 +17,5 @@
     "--compile-commands-dir=c:\\Users\\danik\\ESP32_STP_PID_DISP\\build"
   ],
   "idf.flashType": "UART",
-  "idf.monitorPort": "COM10"
+  "idf.monitorPort": "COM16"
 }
