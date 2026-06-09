@@ -15,7 +15,7 @@
 #include "config.h" 
 
 //static const char *TAG = "control_APP";
-// Инициализация аппаратного ШИМ для Серво
+// Инициализация аппаратного ШИМ для Серво //
 
 volatile float setpoint_kPa = 0;
 volatile float pressure1_kPa = 0;
