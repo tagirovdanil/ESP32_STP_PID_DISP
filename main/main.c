@@ -114,6 +114,34 @@ static void handle_command(char *str) {
     }
 
     // ==========================================================================
+    // ОБРАБОТКА КОМАНДЫ "SER <n> <angle>" — РУЧНОЕ управление серво-краном.
+    // Формат: SER 1 0 / SER 1 90 / SER 1 180 (угол 0..180; серво № пока только 1).
+    // Прямо выставляет ШИМ серво — для теста. ВНИМАНИЕ: пока регулятор в RUNNING,
+    // он перебьёт это значение на следующем тике, поэтому пользоваться в IDLE.
+    // ==========================================================================
+    char *ser_ptr = strstr(str, "ser ");
+    if (ser_ptr == NULL) ser_ptr = strstr(str, "SER ");
+    if (ser_ptr != NULL) {
+        int   idx   = 0;
+        float angle = 0.0f;
+        if (sscanf(ser_ptr + 4, "%d %f", &idx, &angle) == 2) {
+            if (idx != 1) {
+                respond("\r\n>> [ERR] SER: only servo 1 supported\r\n");
+            } else if (angle < 0.0f || angle > 180.0f) {
+                respond("\r\n>> [ERR] SER: angle out of range 0..180\r\n");
+            } else {
+                set_servo_angle(angle);
+                char msg[48];
+                snprintf(msg, sizeof(msg), "\r\n>> Servo %d -> %.0f deg\r\n", idx, angle);
+                respond(msg);
+            }
+        } else {
+            respond("\r\n>> [ERR] SER: format 'SER 1 90'\r\n");
+        }
+        return;
+    }
+
+    // ==========================================================================
     // ОБРАБОТКА КОМАНДЫ "RESET"
     // ==========================================================================
     char *reset_ptr = strstr(str, "reset");
@@ -158,7 +186,7 @@ void usb_uart_rx_task(void *pvParameters) {
         return;
     }
 
-    ESP_LOGI(TAG, "Задача чтения команд через USB UART запущена. Формат: set X / reset / idle / home / sn");
+    ESP_LOGI(TAG, "Задача чтения команд через USB UART запущена. Формат: set X / ser N A / reset / idle / home / sn");
 
     while (1) {
         // Читаем данные из UART_NUM_0. Таймаут 20 мс позволяет задаче «засыпать», если порт пуст

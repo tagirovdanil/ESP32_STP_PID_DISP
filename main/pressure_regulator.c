@@ -34,6 +34,16 @@ volatile RegulatorState requested_reg_state = REG_STATE_NONE;
 // уменьшай это число постепенно и смотри, чтобы мотор не срывался в свист.
 #define VALVE_STEP_US   400
 
+// Защита фильтров от глюков датчика. Битый UART-кадр иногда раскодируется в
+// «валидное» давление (проходит проверку диапазона в pressure_sensor.c), и один
+// такой отсчёт при alpha=0.8 надолго отравляет EMA (P_filt проваливался до ~184
+// на несколько секунд и ложно гнал серво в подкачку). В RUNNING давление
+// физически не меняется быстрее ~100–150 кПа/с, поэтому мгновенную dP/dt выше
+// PRESS_GLITCH_RATE считаем аномалией и отсчёт игнорируем. Но не более
+// PRESS_GLITCH_MAX подряд — иначе при реальном длительном сдвиге датчика залипнем.
+#define PRESS_GLITCH_RATE   400.0f
+#define PRESS_GLITCH_MAX    10
+
 // ============================================================================
 //  ПУБЛИЧНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПРИВОДОВ (используются и из config.c)
 // ============================================================================
@@ -116,6 +126,11 @@ void regulator_init(PressureRegulator* reg, float dt) {
 
     // --- измерение скорости ---
     reg->rate_filter_alpha = 0.8f;   // сильное сглаживание: dP/dt очень шумная
+    // Фильтр давления для ПОРОГОВОГО решения в HOLD (bang-bang серво). Сырое
+    // давление шумит на уровне sensor_noise_delta, и одиночный выброс между
+    // редкими логами латчил серво. EMA по давлению гасит такие спайки.
+    // 0.8 ≈ среднее по ~9 отсчётам, лаг ~200 мс (в HOLD это некритично).
+    reg->press_filter_alpha = 0.8f;
 
     // --- ВНУТРЕННИЙ PI по скорости (дальняя зона) ---
     // Выход — открытие иглы в шагах. Подбирать так:
@@ -133,6 +148,7 @@ void regulator_init(PressureRegulator* reg, float dt) {
     //  - в полосе error 0..2 это же значение = желаемая скорость подхода (ползём медленно).
     // Больше -> раньше останавливаемся (меньше перелёт, грубее точность); меньше -> точнее.
     reg->sensor_noise_delta = 0.22f;
+    reg->sensor_noise_delta_filt = 0.03f;
 
     // --- лимиты привода (в шагах) ---
     reg->valve_max      = MAX_VALVE_STEPS; // полный ход иглы
@@ -142,6 +158,12 @@ void regulator_init(PressureRegulator* reg, float dt) {
     // никогда не опускает иглу ниже floor во время работы, поэтому уходит мёртвое
     // время ~3 с на старте и тонкая зона реально может дать поток.
     reg->valve_flow_floor = 3600 * 0.9; // на всякий случай умножил на 0.9, чтоб наверняка 0 был
+    // --- парковка/коррекции в HOLD ---
+    reg->hold_park_pos    = 0;    // в покое игла полностью закрыта (запечатано, ползучести нет).
+                                  // Можно попробовать ~3000 (ниже порога потока) — парковка/старт
+                                  // эпизода станут быстрее, если запирание там реально герметично.
+    reg->creep_pos_charge = reg->valve_flow_floor; // безопасный дефолт; перезапишется реальной
+    reg->creep_pos_vent   = reg->valve_flow_floor; // позицией при входе в HOLD и в конце эпизодов
     // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
     // слю ~2400 шаг/с, полный ход ~4 с). Если игла открывается слишком медленно —
@@ -157,7 +179,7 @@ void regulator_init(PressureRegulator* reg, float dt) {
 //  В полосе 0..2 кПа скорость = near_rate (передаём sensor_noise_delta): у цели
 //  ползём со скоростью на уровне шума датчика. Отдельной FINE-фазы больше нет.
 // ============================================================================
-static float desired_rate_from_error(float error, float near_rate) {
+static float desired_rate_from_error(float error, float near_rate, float very_near_rate) {
     float e = fabsf(error);
     float rate;
     if      (e > 500.0f) rate = 100.0f;
@@ -165,9 +187,30 @@ static float desired_rate_from_error(float error, float near_rate) {
     else if (e >  80.0f) rate = 20.0f;
     else if (e >  30.0f) rate = 10.0f;
     else if (e >   8.0f) rate = 3.0f;
-    else if (e >   2.0f) rate = 1.0f;        // полоса 2..8 кПа
-    else                 rate = near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
+    else if (e >   5.0f) rate = 1.0f;        // полоса 2..8 кПа
+    else if (e >   3.0)                 rate = near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
+    else rate = very_near_rate;
     return (error >= 0.0f) ? rate : -rate;
+}
+
+// ============================================================================
+//  ВНУТРЕННИЙ PI ПО СКОРОСТИ: держит реальную dP/dt равной желаемой, выход —
+//  открытие иглы (шаги). Общий для фазы подхода (RATE) и эпизодов коррекции в HOLD.
+// ============================================================================
+static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt) {
+    // реальная скорость «в сторону цели» (сравниваем по модулю желаемой)
+    float measured_toward = (desired > 0) ? reg->filtered_rate : -reg->filtered_rate;
+    float rate_err = fabsf(desired) - measured_toward;   // >0 — едем медленнее нужного
+
+    // открытие иглы = floor + Kp*ошибка_скорости + Ki*интеграл
+    reg->rate_integral += rate_err * dt;
+    if (reg->rate_integral < 0.0f)                   reg->rate_integral = 0.0f;
+    if (reg->rate_integral > reg->rate_integral_max) reg->rate_integral = reg->rate_integral_max;
+
+    float out = (float)reg->valve_flow_floor + reg->rate_kp * rate_err + reg->rate_ki * reg->rate_integral;
+    if (out < (float)reg->valve_flow_floor) out = (float)reg->valve_flow_floor;
+    if (out > (float)reg->valve_max)        out = (float)reg->valve_max;
+    return (int32_t)out;
 }
 
 // Ставит серво в нужное положение, но только если оно изменилось
@@ -195,8 +238,9 @@ void pid_regulator_task(void *pvParameters) {
     PressureRegulator reg;
     regulator_init(&reg, 0.02f);
 
-    reg.prev_pressure    = pressure1_kPa;
-    reg.last_pressure_us = esp_timer_get_time();
+    reg.prev_pressure     = pressure1_kPa;
+    reg.filtered_pressure = pressure1_kPa;   // стартуем фильтр с текущего давления, а не с 0
+    reg.last_pressure_us  = esp_timer_get_time();
 
     uint64_t last_us      = esp_timer_get_time();
     uint32_t last_log_ms  = 0;
@@ -257,14 +301,28 @@ void pid_regulator_task(void *pvParameters) {
             float dt_p = (float)(now_us - reg.last_pressure_us) / 1000000.0f;
             if (dt_p < 0.001f) dt_p = 0.001f;
             float raw_rate = (pressure - reg.prev_pressure) / dt_p;   // кПа/с по свежему отсчёту
-            reg.filtered_rate = reg.rate_filter_alpha * reg.filtered_rate
-                              + (1.0f - reg.rate_filter_alpha) * raw_rate;
-            reg.prev_pressure    = pressure;
-            reg.last_pressure_us = now_us;
+
+            if (fabsf(raw_rate) > PRESS_GLITCH_RATE && reg.glitch_skips < PRESS_GLITCH_MAX) {
+                // Аномальный скачок -> битый отсчёт. Игнорируем целиком: фильтры,
+                // prev_pressure и время НЕ трогаем (dt_p сам подрастёт), а для error
+                // этого тика берём последнее хорошее давление.
+                reg.glitch_skips++;
+                pressure = reg.prev_pressure;
+            } else {
+                reg.glitch_skips = 0;
+                reg.raw_rate = raw_rate;                              // сохраняем сырую dP/dt для лога
+                reg.filtered_rate = reg.rate_filter_alpha * reg.filtered_rate
+                                  + (1.0f - reg.rate_filter_alpha) * raw_rate;
+                reg.filtered_pressure = reg.press_filter_alpha * reg.filtered_pressure
+                                      + (1.0f - reg.press_filter_alpha) * pressure;   // EMA давления (для порога HOLD)
+                reg.prev_pressure    = pressure;
+                reg.last_pressure_us = now_us;
+            }
         }
         // если отсчёт не обновился — держим прежнюю filtered_rate (без ложных нулей)
 
-        float error = reg.active_setpoint - pressure;              // + надо набирать, - стравливать
+        float error      = reg.active_setpoint - pressure;              // сырое: фаза RATE и вход в HOLD
+        float error_filt = reg.active_setpoint - reg.filtered_pressure; // сглаженное: bang-bang серво в HOLD
 
         // ======================= АВТОМАТ СОСТОЯНИЙ =======================
         switch (reg.state) {
@@ -329,14 +387,15 @@ void pid_regulator_task(void *pvParameters) {
 
         // ======================= ЛОГИКА REG_STATE_RUNNING =======================
         // Две фазы:
-        //  RATE — ПОДХОД: шаговиком (по скорости) по чуть-чуть подбираемся к цели.
-        //         Как только |error| <= sensor_noise_delta (вошли в полосу шума) —
-        //         ЗАПОМИНАЕМ позицию шаговика и уходим в HOLD НАВСЕГДА (из HOLD не
-        //         выходим, шаговик больше не трогаем).
-        //  HOLD — шаговик заморожен на hold_pos, тонкую доводку делает ТОЛЬКО СЕРВО
-        //         (bang-bang): упало ниже цели на delta -> набираем; выросло выше на
-        //         delta -> стравливаем; дошли РОВНО до цели (error пересёк 0) ->
-        //         нейтраль (изолируем).
+        //  RATE — ПОДХОД: игла по скорости (внутренний PI), серво задаёт направление.
+        //         Как только |error| <= sensor_noise_delta — уходим в HOLD (серво не
+        //         трогаем: ветка HOLD сама доведёт до цели и запечатает).
+        //  HOLD — в покое объём ЗАПЕЧАТАН: игла на hold_park_pos (0), серво в нейтрали,
+        //         газ из трубки серво->игла не сочится в объём (причина ползучести
+        //         +0.3 кПа, подтверждено). Коррекция-эпизод: |error_filt| > порога ->
+        //         серво открывается в нужную сторону, игла дозирует поток тем же PI
+        //         по скорости (старт с выученного открытия creep_pos_*); error_filt
+        //         пересёк 0 -> запоминаем открытие, игла на парковку, серво в нейтраль.
         int32_t target_valve = current_valve_position;   // по умолчанию — стоим
         const char* zone;
 
@@ -344,48 +403,72 @@ void pid_regulator_task(void *pvParameters) {
             // ---- ФАЗА ПОДХОДА (RATE): рулим ШАГОВИКОМ по скорости ----
             zone = "RATE";
 
-            if (fabsf(error) <= reg.sensor_noise_delta) {
-                // Подобрались к цели в пределах шума -> запоминаем позицию шаговика
-                // и уходим в HOLD навсегда. Серво НЕ трогаем — оно осталось в нужную
-                // сторону с фазы RATE и само доведёт до точной цели в ветке HOLD.
-                reg.holding  = true;
-                reg.hold_pos = current_valve_position;
-                target_valve = current_valve_position;   // фиксируем шаговик
-                ESP_LOGI("PID", "HOLD: запомнили pos=%ld, дальше доводит серво. P=%.2f",
-                         (long)reg.hold_pos, pressure);
+            if (fabsf(error) <= reg.sensor_noise_delta) { // было меньшеравно reg.sensor_noise_delta, но поставил 1.0, чтоб не перелетело сильно // в целом щас можно и filt
+                // Дошли до полосы шума -> в HOLD. Серво НЕ трогаем — оно открыто в
+                // нужную сторону, и ветка HOLD тем же PI доведёт давление точно до
+                // цели, после чего запечатает объём. Текущая позиция иглы — рабочее
+                // дозирующее открытие, берём его первым приближением для эпизодов.
+                reg.holding = true;
+                if (current_valve_position > reg.valve_flow_floor) {
+                    reg.creep_pos_charge = current_valve_position;
+                    reg.creep_pos_vent   = current_valve_position;
+                }
+                target_valve = current_valve_position;
+                ESP_LOGI("PID", "HOLD: вход на pos=%ld, доводим и печатаем. P=%.2f",
+                         (long)current_valve_position, pressure);
             } else {
-                float desired = desired_rate_from_error(error, reg.sensor_noise_delta); // знаковая желаемая скорость
+                float desired = desired_rate_from_error(error_filt, reg.sensor_noise_delta, reg.sensor_noise_delta_filt); // знаковая желаемая скорость  // 0.22 и 0.03 для 25мпа
                 apply_servo(&reg, (desired > 0) ? SERVO_CHARGING : SERVO_VENTING);
-
-                // реальная скорость «в сторону цели» (сравниваем по модулю желаемой)
-                float measured_toward = (desired > 0) ? reg.filtered_rate : -reg.filtered_rate;
-                float rate_err = fabsf(desired) - measured_toward;   // >0 — едем медленнее нужного
-
-                // внутренний PI: открытие иглы = floor + Kp*ошибка_скорости + Ki*интеграл.
-                reg.rate_integral += rate_err * dt;
-                if (reg.rate_integral < 0.0f)                  reg.rate_integral = 0.0f;
-                if (reg.rate_integral > reg.rate_integral_max) reg.rate_integral = reg.rate_integral_max;
-
-                float out = (float)reg.valve_flow_floor + reg.rate_kp * rate_err + reg.rate_ki * reg.rate_integral;
-                if (out < (float)reg.valve_flow_floor) out = (float)reg.valve_flow_floor;
-                if (out > (float)reg.valve_max)        out = (float)reg.valve_max;
-                target_valve = (int32_t)out;
+                target_valve = rate_control_step(&reg, desired, dt);
             }
         } else {
-            // ---- ФАЗА ХОЛДА: шаговик ЗАМОРОЖЕН на hold_pos, рулит только СЕРВО ----
+            // ---- ФАЗА ХОЛДА: покой запечатан, коррекции серво+иглой ----
             zone = "HOLD";
-            target_valve = reg.hold_pos;                  // шаговик не двигаем
 
             switch (reg.servo_state) {
-                case SERVO_NEUTRAL:
-                    if (error >  reg.sensor_noise_delta)      apply_servo(&reg, SERVO_CHARGING); // упало -> набрать
-                    else if (error < -reg.sensor_noise_delta) apply_servo(&reg, SERVO_VENTING);  // выросло -> стравить
+                case SERVO_NEUTRAL: {
+                    target_valve = reg.hold_park_pos;     // запечатано: игла закрыта
+                    ServoState dir = SERVO_NEUTRAL;
+                    if      (error_filt >  0.1f) dir = SERVO_CHARGING; // упало -> набрать     // пробую фильт * 2 // маловато, решил 0.1 поставить
+                    else if (error_filt < -0.1f) dir = SERVO_VENTING;  // выросло -> стравить
+                    if (dir != SERVO_NEUTRAL) {
+                        apply_servo(&reg, dir);
+                        // Преднатяг PI: эпизод стартует сразу с выученного дозирующего
+                        // открытия. Иначе от floor интегратор полз бы до порога потока
+                        // минуты (у цели rate_err~0.03 -> ki*I растёт ~1.8 шаг/с).
+                        int32_t start = (dir == SERVO_CHARGING) ? reg.creep_pos_charge
+                                                                : reg.creep_pos_vent;
+                        reg.rate_integral = (float)(start - reg.valve_flow_floor) / reg.rate_ki;
+                        if (reg.rate_integral < 0.0f) reg.rate_integral = 0.0f;
+                        ESP_LOGI("PID", "HOLD: эпизод %s c pos=%ld, err_filt=%.2f",
+                                 (dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС",
+                                 (long)start, error_filt);
+                    }
                     break;
+                }
+
                 case SERVO_CHARGING:
-                    if (error <= 0.0f) apply_servo(&reg, SERVO_NEUTRAL);   // дошли РОВНО до цели -> стоп
+                    if (error_filt <= reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели -> печатаем  // поменял 0 на reg.sensor_noise_delta_filt (0.03) для компенсации перелета. Не уверен что надо именно эту переменную, но в целом как будто она подходит
+                        if (current_valve_position > reg.valve_flow_floor)
+                            reg.creep_pos_charge = current_valve_position;  // выучили открытие
+                        apply_servo(&reg, SERVO_NEUTRAL);
+                        target_valve = reg.hold_park_pos;
+                    } else {
+                        float desired = desired_rate_from_error(error_filt, reg.sensor_noise_delta, reg.sensor_noise_delta_filt);
+                        target_valve  = rate_control_step(&reg, desired, dt);
+                    }
                     break;
+
                 case SERVO_VENTING:
-                    if (error >= 0.0f) apply_servo(&reg, SERVO_NEUTRAL);   // дошли РОВНО до цели -> стоп
+                    if (error_filt >= -reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели -> печатаем
+                        if (current_valve_position > reg.valve_flow_floor)
+                            reg.creep_pos_vent = current_valve_position;    // выучили открытие
+                        apply_servo(&reg, SERVO_NEUTRAL);
+                        target_valve = reg.hold_park_pos;
+                    } else {
+                        float desired = desired_rate_from_error(error_filt, reg.sensor_noise_delta, reg.sensor_noise_delta_filt);
+                        target_valve  = rate_control_step(&reg, desired, dt);
+                    }
                     break;
             }
         }
@@ -400,8 +483,8 @@ void pid_regulator_task(void *pvParameters) {
         uint32_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - last_log_ms >= LOG_PERIOD_MS) {
             ESP_LOGI("PID",
-                "%s | P=%.2f set=%.1f err=%.2f rate=%.2f kPa/s | servo=%d pos=%ld",
-                zone, pressure, reg.active_setpoint, error, reg.filtered_rate,
+                "%s | P=%.2f P_filt=%.2f set=%.1f err=%.2f rate=%.2f rate_filt=%.2f kPa/s | servo=%d pos=%ld",
+                zone, pressure, reg.filtered_pressure, reg.active_setpoint, error, reg.raw_rate, reg.filtered_rate,
                 reg.servo_state, (long)current_valve_position);
             last_log_ms = now_ms;
         }
