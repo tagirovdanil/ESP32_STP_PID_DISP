@@ -158,12 +158,29 @@ void regulator_init(PressureRegulator* reg, float dt) {
     // никогда не опускает иглу ниже floor во время работы, поэтому уходит мёртвое
     // время ~3 с на старте и тонкая зона реально может дать поток.
     reg->valve_flow_floor = 3600 * 0.9; // на всякий случай умножил на 0.9, чтоб наверняка 0 был
-    // --- парковка/коррекции в HOLD ---
-    reg->hold_park_pos    = 0;    // в покое игла полностью закрыта (запечатано, ползучести нет).
-                                  // Можно попробовать ~3000 (ниже порога потока) — парковка/старт
-                                  // эпизода станут быстрее, если запирание там реально герметично.
-    reg->creep_pos_charge = reg->valve_flow_floor; // безопасный дефолт; перезапишется реальной
-    reg->creep_pos_vent   = reg->valve_flow_floor; // позицией при входе в HOLD и в конце эпизодов
+                                        // (он же — парковка иглы в HOLD: запечатано, но близко к зоне потока)
+
+    // --- HOLD: МИКРОДОЗЫ ---
+    // У цели контур по скорости не работает: нужные 0.01-0.02 кПа/с не видны в
+    // dP/dt (шум ±0.5 кПа/с при отсчётах 50 мс), а PI с преднатягом давал поток
+    // 1-3 кПа/с и пинг-понг НАБОР<->СБРОС. Поэтому в HOLD игла стоит на
+    // ФИКСИРОВАННОМ дозирующем открытии step_holding_*, а раз в dose_period_us
+    // смотрим, сколько давление РЕАЛЬНО прошло к цели за окно, и чуть трогаем
+    // открытие:
+    //   прошло < dose_dp_slow    -> +dose_trim      (слишком медленно / не туда)
+    //   прошло > dose_dp_runaway -> -dose_trim_big  (разогнались)
+    //   прошло > dose_dp_fast    -> -dose_trim      (чуть быстрее нужного)
+    // Полоса dose_dp_slow..dose_dp_fast — «хорошо», открытие не трогаем.
+    reg->hold_enter_err  = 0.5f;        // |error| <= этого -> PID выключается, дальше HOLD-струйка
+    reg->dose_step_back  = 100;         // вход в HOLD: открытие = последняя позиция RATE минус это
+    reg->dose_period_us  = 5000000ULL;  // окно проверки прогресса дозы: 5 с
+    reg->dose_dp_slow    = 0.05f;       // кПа за окно
+    reg->dose_dp_fast    = 0.10f;
+    reg->dose_dp_runaway = 0.20f;
+    reg->dose_trim       = 10;          // шаги иглы
+    reg->dose_trim_big   = 50;
+    reg->step_holding_charge = reg->valve_flow_floor;  // безопасный дефолт; засеется при входе в HOLD
+    reg->step_holding_vent   = reg->valve_flow_floor;
     // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
     // слю ~2400 шаг/с, полный ход ~4 с). Если игла открывается слишком медленно —
@@ -195,7 +212,8 @@ static float desired_rate_from_error(float error, float near_rate, float very_ne
 
 // ============================================================================
 //  ВНУТРЕННИЙ PI ПО СКОРОСТИ: держит реальную dP/dt равной желаемой, выход —
-//  открытие иглы (шаги). Общий для фазы подхода (RATE) и эпизодов коррекции в HOLD.
+//  открытие иглы (шаги). Работает ТОЛЬКО в фазе подхода (RATE); в HOLD не
+//  используется — там микродозы (см. hold_dose_step).
 // ============================================================================
 static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt) {
     // реальная скорость «в сторону цели» (сравниваем по модулю желаемой)
@@ -211,6 +229,40 @@ static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt
     if (out < (float)reg->valve_flow_floor) out = (float)reg->valve_flow_floor;
     if (out > (float)reg->valve_max)        out = (float)reg->valve_max;
     return (int32_t)out;
+}
+
+// ============================================================================
+//  МИКРОДОЗЫ В HOLD: игла стоит на фиксированном открытии step_holding_*; раз в
+//  dose_period_us сверяем фактический прогресс давления К ЦЕЛИ за окно и
+//  подстраиваем открытие (+trim / -trim / -trim_big). Никакого dP/dt — только
+//  само давление за 5 с, его видно сквозь шум. Возвращает позицию иглы на тик.
+// ============================================================================
+static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool charging) {
+    int32_t* pos = charging ? &reg->step_holding_charge : &reg->step_holding_vent;
+
+    if (now_us - reg->dose_t0_us >= reg->dose_period_us) {
+        float dp     = reg->filtered_pressure - reg->dose_p0;  // изменение давления за окно
+        float toward = charging ? dp : -dp;                    // прогресс в сторону цели
+        int32_t old  = *pos;
+        if      (toward < reg->dose_dp_slow)    *pos += reg->dose_trim;     // ползём слишком медленно / не туда
+        else if (toward > reg->dose_dp_runaway) *pos -= reg->dose_trim_big; // сильно разогнались
+        else if (toward > reg->dose_dp_fast)    *pos -= reg->dose_trim;     // чуть быстрее нужного
+        if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
+        if (*pos > reg->valve_max)        *pos = reg->valve_max;
+        if (*pos != old)
+            ESP_LOGI("PID", "HOLD: доза %s %ld -> %ld (прогресс %.3f кПа за окно)",
+                     charging ? "НАБОР" : "СБРОС", (long)old, (long)*pos, toward);
+        reg->dose_t0_us = now_us;
+        reg->dose_p0    = reg->filtered_pressure;
+    }
+    return *pos;
+}
+
+// Сброс окна проверки дозы (на входе в HOLD и на старте каждого эпизода),
+// чтобы прогресс мерился от начала текущего эпизода, а не от прошлого.
+static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
+    reg->dose_t0_us = now_us;
+    reg->dose_p0    = reg->filtered_pressure;
 }
 
 // Ставит серво в нужное положение, но только если оно изменилось
@@ -388,14 +440,15 @@ void pid_regulator_task(void *pvParameters) {
         // ======================= ЛОГИКА REG_STATE_RUNNING =======================
         // Две фазы:
         //  RATE — ПОДХОД: игла по скорости (внутренний PI), серво задаёт направление.
-        //         Как только |error| <= sensor_noise_delta — уходим в HOLD (серво не
-        //         трогаем: ветка HOLD сама доведёт до цели и запечатает).
-        //  HOLD — в покое объём ЗАПЕЧАТАН: игла на hold_park_pos (0), серво в нейтрали,
-        //         газ из трубки серво->игла не сочится в объём (причина ползучести
-        //         +0.3 кПа, подтверждено). Коррекция-эпизод: |error_filt| > порога ->
-        //         серво открывается в нужную сторону, игла дозирует поток тем же PI
-        //         по скорости (старт с выученного открытия creep_pos_*); error_filt
-        //         пересёк 0 -> запоминаем открытие, игла на парковку, серво в нейтраль.
+        //         Как только |error| <= hold_enter_err (0.5) — PID выключается
+        //         НАВСЕГДА (до новой уставки), дальше только HOLD-микродозы.
+        //  HOLD — в покое объём ЗАПЕЧАТАН: игла на valve_flow_floor, серво в нейтрали,
+        //         газ из трубки серво->игла не сочится в объём. Коррекция-эпизод:
+        //         |error_filt| > порога -> серво в нужную сторону, игла на
+        //         ФИКСИРОВАННОМ дозирующем открытии step_holding_* (микродоза, без
+        //         PI — скорости у цели не видны измерению dP/dt). Раз в 5 с открытие
+        //         подстраивается по фактическому прогрессу давления (hold_dose_step).
+        //         error_filt дошёл до порога печати -> игла на парковку, серво в нейтраль.
         int32_t target_valve = current_valve_position;   // по умолчанию — стоим
         const char* zone;
 
@@ -403,71 +456,62 @@ void pid_regulator_task(void *pvParameters) {
             // ---- ФАЗА ПОДХОДА (RATE): рулим ШАГОВИКОМ по скорости ----
             zone = "RATE";
 
-            if (fabsf(error) <= reg.sensor_noise_delta) { // было меньшеравно reg.sensor_noise_delta, но поставил 1.0, чтоб не перелетело сильно // в целом щас можно и filt
-                // Дошли до полосы шума -> в HOLD. Серво НЕ трогаем — оно открыто в
-                // нужную сторону, и ветка HOLD тем же PI доведёт давление точно до
-                // цели, после чего запечатает объём. Текущая позиция иглы — рабочее
-                // дозирующее открытие, берём его первым приближением для эпизодов.
+            if (fabsf(error) <= reg.hold_enter_err) {
+                // Подошли на 0.5 -> PID больше не работает. Прикрываем иглу на
+                // dose_step_back от последнего выставленного открытия, запоминаем
+                // это как стартовую дозу НАБОРА (и первое приближение для СБРОСА),
+                // и этой струйкой ветка HOLD доводит до цели и печатает.
                 reg.holding = true;
-                if (current_valve_position > reg.valve_flow_floor) {
-                    reg.creep_pos_charge = current_valve_position;
-                    reg.creep_pos_vent   = current_valve_position;
-                }
-                target_valve = current_valve_position;
-                ESP_LOGI("PID", "HOLD: вход на pos=%ld, доводим и печатаем. P=%.2f",
-                         (long)current_valve_position, pressure);
+                int32_t seed = current_valve_position - reg.dose_step_back;
+                if (seed < reg.valve_flow_floor) seed = reg.valve_flow_floor;
+                reg.step_holding_charge = seed;
+                reg.step_holding_vent   = seed;   // подстроится в первом же СБРОС-эпизоде
+                dose_window_reset(&reg, now_us);
+                target_valve = seed;              // серво НЕ трогаем — доводим в текущую сторону
+                ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld, доводим струйкой. P=%.2f",
+                         (long)current_valve_position, (long)seed, pressure);
             } else {
                 float desired = desired_rate_from_error(error_filt, reg.sensor_noise_delta, reg.sensor_noise_delta_filt); // знаковая желаемая скорость  // 0.22 и 0.03 для 25мпа
                 apply_servo(&reg, (desired > 0) ? SERVO_CHARGING : SERVO_VENTING);
                 target_valve = rate_control_step(&reg, desired, dt);
             }
         } else {
-            // ---- ФАЗА ХОЛДА: покой запечатан, коррекции серво+иглой ----
+            // ---- ФАЗА ХОЛДА: покой запечатан, коррекции — микродозы ----
             zone = "HOLD";
 
             switch (reg.servo_state) {
                 case SERVO_NEUTRAL: {
-                    target_valve = reg.hold_park_pos;     // запечатано: игла закрыта
+                    target_valve = reg.valve_flow_floor;     // запечатано: игла закрыта
                     ServoState dir = SERVO_NEUTRAL;
                     if      (error_filt >  0.1f) dir = SERVO_CHARGING; // упало -> набрать     // пробую фильт * 2 // маловато, решил 0.1 поставить
                     else if (error_filt < -0.1f) dir = SERVO_VENTING;  // выросло -> стравить
                     if (dir != SERVO_NEUTRAL) {
                         apply_servo(&reg, dir);
-                        // Преднатяг PI: эпизод стартует сразу с выученного дозирующего
-                        // открытия. Иначе от floor интегратор полз бы до порога потока
-                        // минуты (у цели rate_err~0.03 -> ki*I растёт ~1.8 шаг/с).
-                        int32_t start = (dir == SERVO_CHARGING) ? reg.creep_pos_charge
-                                                                : reg.creep_pos_vent;
-                        reg.rate_integral = (float)(start - reg.valve_flow_floor) / reg.rate_ki;
-                        if (reg.rate_integral < 0.0f) reg.rate_integral = 0.0f;
-                        ESP_LOGI("PID", "HOLD: эпизод %s c pos=%ld, err_filt=%.2f",
+                        dose_window_reset(&reg, now_us);
+                        target_valve = (dir == SERVO_CHARGING) ? reg.step_holding_charge
+                                                               : reg.step_holding_vent;
+                        ESP_LOGI("PID", "HOLD: эпизод %s, игла на %ld, err_filt=%.2f",
                                  (dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС",
-                                 (long)start, error_filt);
+                                 (long)target_valve, error_filt);
                     }
                     break;
                 }
 
                 case SERVO_CHARGING:
                     if (error_filt <= reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели -> печатаем  // поменял 0 на reg.sensor_noise_delta_filt (0.03) для компенсации перелета. Не уверен что надо именно эту переменную, но в целом как будто она подходит
-                        if (current_valve_position > reg.valve_flow_floor)
-                            reg.creep_pos_charge = current_valve_position;  // выучили открытие
                         apply_servo(&reg, SERVO_NEUTRAL);
-                        target_valve = reg.hold_park_pos;
+                        target_valve = reg.valve_flow_floor;
                     } else {
-                        float desired = desired_rate_from_error(error_filt, reg.sensor_noise_delta, reg.sensor_noise_delta_filt);
-                        target_valve  = rate_control_step(&reg, desired, dt);
+                        target_valve = hold_dose_step(&reg, now_us, true);
                     }
                     break;
 
                 case SERVO_VENTING:
-                    if (error_filt >= -reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели -> печатаем
-                        if (current_valve_position > reg.valve_flow_floor)
-                            reg.creep_pos_vent = current_valve_position;    // выучили открытие
+                    if (error_filt >= -reg.sensor_noise_delta_filt) {            // дошли РОВНО до цели -> печатаем
                         apply_servo(&reg, SERVO_NEUTRAL);
-                        target_valve = reg.hold_park_pos;
+                        target_valve = reg.valve_flow_floor;
                     } else {
-                        float desired = desired_rate_from_error(error_filt, reg.sensor_noise_delta, reg.sensor_noise_delta_filt);
-                        target_valve  = rate_control_step(&reg, desired, dt);
+                        target_valve = hold_dose_step(&reg, now_us, false);
                     }
                     break;
             }
