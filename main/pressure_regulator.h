@@ -87,14 +87,19 @@ typedef struct {
     int32_t  dose_step_back;        // вход в HOLD: стартовое открытие = позиция RATE минус это
     int32_t  step_holding_charge;   // дозирующее открытие иглы для НАБОРА (живёт между эпизодами)
     int32_t  step_holding_vent;     // то же для СБРОСА (перепад на игле другой — своё значение)
+    bool     dose_charge_calibrated; // false: доза НАБОРА ещё ни разу не дала потока (засеяна floor'ом)
+                                     // -> в ветке «медленно» прибавляем dose_trim_big, а не dose_trim
+    bool     dose_vent_calibrated;   // то же для СБРОСА
     uint64_t dose_t0_us;            // начало текущего окна проверки прогресса (мкс)
     float    dose_p0;               // P_filt в начале окна
     uint64_t dose_period_us;        // длительность окна проверки (5 с)
     float    dose_dp_slow;          // прогресс за окно МЕНЬШЕ -> приоткрыть на dose_trim
+    float    dose_dp_VERYslow;      // прогресс за окно В ОБРАТНУЮ СТОРОНУ -> открыть сильно на dose_trim_big
     float    dose_dp_fast;          // прогресс БОЛЬШЕ -> прикрыть на dose_trim
     float    dose_dp_runaway;       // прогресс СИЛЬНО больше -> прикрыть на dose_trim_big
     int32_t  dose_trim;             // мелкий шаг подстройки открытия (шаги иглы)
     int32_t  dose_trim_big;         // грубый шаг подстройки при разгоне
+    int32_t  dose_trim_very_big;         // очень грубый шаг подстройки до калиброки угла на точке
 
     // ---- лимиты привода ----
     int32_t valve_max;              // макс. открытие иглы (шаги)
