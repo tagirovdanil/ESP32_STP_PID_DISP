@@ -13,7 +13,7 @@
 #define PIN_RX1                 26
 #define PIN_TX1                 27
 #define BUF_SIZE                1024
-#define SERIAL_UART1_INTERVAL   50
+#define SERIAL_UART1_INTERVAL   20
 
 // пины дисплея
 #define PIN_MOSI        19
@@ -36,6 +36,8 @@
 extern volatile float setpoint_kPa;
 extern volatile float pressure1_kPa;
 extern uint32_t sum_err;
+extern float pressure_filter_k;
+
 
 // функции датчика и дисплея
 void pressure_sensor_init(void);
@@ -43,5 +45,6 @@ void LCD_init(void);
 bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num);
 void display_update_task(void *pvParameters);
 void pressure_ui_and_usb_init(TFT_t *p_dev);
+void set_pressure_filter_k(float k);
 
 #endif // PRESSURE_SENSOR_H

@@ -5,22 +5,23 @@
 #include "driver/uart.h"
 #include "stdbool.h"
 
-
+/*
 // 1 Настройки периферии (Серво и Шаговик) эта схема Андрея
 #define PIN_SERVO       2  // Пин управления RC серво
 #define PIN_STEP        21  // Пин шага драйвера Nema17
 #define PIN_DIR         17  // Пин направления драйвера Nema17
 #define PIN_ENABLE      32   // Выход сброса ошибки (на EN+ мотора) -> БЕЗОПАСНО
 #define PIN_ALARM       33  // Вход аварии (на AL+ мотора) -> ОЧЕНЬ ВАЖНО!
+*/
 
-/*
+
 // 1 Настройки периферии (Серво и Шаговик) это моя схема
 #define PIN_SERVO       21  // Пин управления RC серво
 #define PIN_STEP        12  // Пин шага драйвера Nema17
 #define PIN_DIR         13  // Пин направления драйвера Nema17
 #define PIN_ENABLE      2   // Выход сброса ошибки (на EN+ мотора) -> БЕЗОПАСНО
 #define PIN_ALARM       15  // Вход аварии (на AL+ мотора) -> ОЧЕНЬ ВАЖНО!
-*/
+
 
 
 // 2 Настройки ШИМ для Серво (14-битное разрешение)
@@ -29,8 +30,8 @@
 #define LEDC_CHANNEL    LEDC_CHANNEL_0
 #define STEP_LEDC_TIMER     LEDC_TIMER_1
 #define STEP_LEDC_CHANNEL   LEDC_CHANNEL_1
-#define MAX_VALVE_STEPS 10000 // Лимит безопасности: 10 оборотов (3600 градусов)
-#define VALVE_MAX_SPEED_HZ  10000 
+#define MAX_VALVE_STEPS 15000 // Лимит безопасности: 10 оборотов (3600 градусов)
+#define VALVE_MAX_SPEED_HZ  15000 
 
 #define SERVO_MIN_US    1000 // 0 градусов
 #define SERVO_MAX_US    2000 // 180 градусов

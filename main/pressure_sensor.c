@@ -26,6 +26,10 @@ uint32_t sum_err = 0;
 uint32_t lastPressureTime = 0;
 extern TaskHandle_t display_task_handle;
 
+float pressure_filter_k = 0.5f;  // глобальная, изменяемая
+
+void set_pressure_filter_k(float k) {pressure_filter_k = k; }
+
 extern void usb_uart_rx_task(void *pvParameters); 
 
 /* ========================================================================== */
@@ -223,13 +227,31 @@ static void handlePressureResponse1(uint8_t *frame, uint8_t length) {
     uint32_t raw_value;
     memcpy(&raw_value, &fval.value, 4);
     const uint32_t OVF_PATTERN = 0x7F800000;
-    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > 3000.0f || fval.value < -100.0f) {
+    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > 6000.0f || fval.value < -100.0f) {
         sum_err++;
         return;
     }
 
-    pressure1_kPa = fval.value;
+    // 2. Блок фильтрации (добавлено)
+    // Коэффициент фильтрации k (от 0.0 до 1.0). 
+    // Чем МЕНЬШЕ k, тем плавнее фильтр, но выше задержка реакции на изменение давления.
+    // k = 0.3 примерно соответствует усреднению по 3-5 значениям.
+    float k = pressure_filter_k;  // вместо const float k = 0.05f; 
+    
+    // Флаг для первой инициализации, чтобы фильтр не стартовал с нуля 
+    static bool isFirstRun = true; 
+    
+    if (isFirstRun) {
+        pressure1_kPa = fval.value; // При первом запуске просто берем текущее значение
+        isFirstRun = false;
+    } else {
+        // Формула фильтра EMA
+        pressure1_kPa = (fval.value * k) + (pressure1_kPa * (1.0f - k));
+    }
+
+    // 3. Обновляем время (как и было)
     lastPressureTime = esp_timer_get_time() / 1000;
+
 }
 
 // Приватный обработчик кадра (обязательно пишется static)

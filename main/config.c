@@ -13,6 +13,7 @@
 #include "driver/uart.h"
 #include "pressure_regulator.h"
 #include "config.h" 
+#include "esp_task_wdt.h"
 
 //static const char *TAG = "control_APP";
 // Инициализация аппаратного ШИМ для Серво
@@ -33,129 +34,6 @@ bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num);
 // Глобальная переменная текущего абсолютного положения вентиля (в шагах)
 volatile int32_t current_valve_position = 0; 
 
-    void hardware_setup_and_calibrate(void) {
-    // 1. Инициализируем ШИМ только для Сервопривода (Таймер 0 / Канал 0)
-    init_servo(); 
-
-    // 2. Конфигурируем ВСЕ ТРИ пина шаговика (STEP, DIR, ENABLE) как обычные выходы GPIO
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PIN_STEP) | (1ULL << PIN_DIR) | (1ULL << PIN_ENABLE), // ТЕПЕРЬ PIN_STEP ТУТ!
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io_conf);
-
-    // 3. Настраиваем пин ALARM (GPIO 15) как вход с программной подтяжкой к 3.3V (инверсная логика)
-    gpio_config_t alarm_conf = {
-        .pin_bit_mask = (1ULL << PIN_ALARM),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, // Обязательно подтягиваем к единице!
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&alarm_conf);
-
-  
-    // Сбрасываем возможные старые ошибки драйвера при включении питания
-    //reset_motor_driver();
-
-    // ВЫЗЫВАЕМ КАЛИБРОВКУ ХОМИНГА (Мотор плавно и честно найдет физический ноль своими импульсами)
-    calibrate_valve_home();
-    
-
-
-    // ==========================================================================
-    // ЖЕЛЕЗОБЕТОННАЯ СКОРОСТНАЯ РУЧНАЯ ПРОДУВКА ПО ШАГАМ (БЕЗ ШИМ)
-    // ==========================================================================
-    if (pressure1_kPa > 5.0f) {
-        ESP_LOGW("PURGE", "Обнаружено остаточное давление: %.1f кПа. Запуск продувки...", pressure1_kPa);
-        
-          // Приостанавливаем задачу дисплея, чтобы она не мешала SPI
-        
-        if (display_task_handle != NULL) {
-            vTaskSuspend(display_task_handle);
-        }
-
-
-        // Ставим сервопривод строго в положение АТМОСФЕРЫ (0 градусов)
-        set_servo_angle(0.0f); 
-        vTaskDelay(pdMS_TO_TICKS(200)); // Даем серве честно переложиться
-        
-        // Включаем направление на ОТКРЫТИЕ иглы вверх
-        gpio_set_level(PIN_DIR, false); // false - ОТКРЫТИЕ иглы вверх
-        esp_rom_delay_us(50);
-
-        ESP_LOGI("PURGE", "Выкручивание иглы строго на 100000 шагов руками...");
-        current_valve_position = 0; 
-
-        // Цикл на ОТКРЫТИЕ: Выдаем строго 100 000 физических импульсов на частоте 4000 Гц
-        for (int32_t i = 0; i < 10000; i++) {
-            gpio_set_level(PIN_STEP, 1);
-            esp_rom_delay_us(10); 
-            gpio_set_level(PIN_STEP, 0);
-            esp_rom_delay_us(200);
-            current_valve_position++;
-
-            // Даём другим задачам поработать каждые 2000 шагов (~400 мс)
-            if (i % 2000 == 0) {
-                vTaskDelay(1);
-            }
-        }
-        
-        ESP_LOGW("PURGE", "Игла открыта на %ld шагов. Ожидание падения давления...", current_valve_position);
-        
-        // Ждем, пока воздух реально выйдет в атмосферу из объема 100 мл
-        while (pressure1_kPa > 2.0f) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            
-        }
-        
-        // В системе честная атмосфера. Вызываем калибровку нуля датчика
-        ESP_LOGI("PURGE", "Атмосфера достигнута. Запуск аппаратного нуля датчика...");
-        //performAdvancedZeroCalibration(0.0f, 1);
-        vTaskDelay(pdMS_TO_TICKS(200)); 
-
-        // ВОЗВРАТ ИГЛЫ ОБРАТНО В ПОЛОЖЕНИЕ АБСОЛЮТНОГО НУЛЯ "0"!
-        ESP_LOGI("PURGE", "Возврат иглы обратно в положение абсолютного нуля (0 шагов)...");
-        gpio_set_level(PIN_DIR, true); // true - ЗАКРЫТИЕ (вкручиваем обратно к седлу)
-        esp_rom_delay_us(50);
-
-        // Делаем ровно 100 000 шагов назад, возвращая вал в исходную точку
-        for (int32_t i = 0; i < 10000; i++) {
-            gpio_set_level(PIN_STEP, 1);
-            esp_rom_delay_us(10); 
-            gpio_set_level(PIN_STEP, 0);
-            esp_rom_delay_us(200);
-            current_valve_position--;
-
-            if (i % 2000 == 0) {
-                vTaskDelay(1);
-                ESP_LOGI("PURGE", "давление в сенсоре...", pressure1_kPa);
-            }
-        }
-
-        // Финальная отсечка сервопривода в безопасную нейтраль
-        set_servo_angle(90.0f); 
-            vTaskDelay(pdMS_TO_TICKS(200));
-            if (display_task_handle != NULL) {
-            vTaskResume(display_task_handle);
-        }
-        
-        ESP_LOGI("PURGE", "Игла успешно вернулась в ноль. Координата в памяти: %ld", current_valve_position);
-    } 
-    else {
-        ESP_LOGI("PURGE", "В системе чисто. Профилактическое обнуление сенсора...");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        //performAdvancedZeroCalibration(0.0f, 1); //пока не надо
-        
-        current_valve_position = 0;
-    }
-   
-}
-
-
 void update_setpoint(float new_setpoint) {
     if (new_setpoint < 0.0f) new_setpoint = 0.0f;
     if (new_setpoint > 4000.0f) new_setpoint = 4000.0f;
@@ -170,7 +48,6 @@ static void reset_motor_driver(void) {
     gpio_set_level(PIN_ENABLE, 0); // Отпускаем, мотор снова активен
     vTaskDelay(pdMS_TO_TICKS(100)); // Даем драйверу прийти в себя
 }
-
 
 void calibrate_valve_home(void) {
     ESP_LOGI("HOMING", "Ожидание стабилизации питания мотора...");
@@ -199,7 +76,7 @@ void calibrate_valve_home(void) {
     gpio_set_level(PIN_DIR, dir_close);
 
     uint32_t total_steps_done = 0;
-    const uint32_t MAX_SAFETY_STEPS = 12000; // Лимит 12 оборотов
+    const uint32_t MAX_SAFETY_STEPS = 15000; // Лимит 15 оборотов
     uint32_t alarm_confirm_counter = 0;
 
     // СВЕРХЧИСТЫЙ ЦИКЛ: Процессор занят ТОЛЬКО генерацией импульсов
@@ -261,6 +138,7 @@ void calibrate_valve_home(void) {
     current_valve_position = 0; 
     is_calibrating = false; // Возвращаем управление экраном основному циклу main.c
     ESP_LOGI("HOMING", "Абсолютный ноль успешно установлен.");
+    ESP_LOGI("PURGE", "После закрытия позиция: %ld", current_valve_position);
     // Очищаем экран черным (или WHITE, смотря какой у вас фон)
     //lcdFillScreen(&dev, BLACK); 
 }
@@ -287,4 +165,111 @@ void init_servo(void) {
         .hpoint         = 0
     };
     ledc_channel_config(&ledc_channel);
+}
+
+void hardware_setup_and_calibrate(void) {
+    // 1. Инициализируем ШИМ только для Сервопривода (Таймер 0 / Канал 0)
+    init_servo(); 
+
+    // 2. Конфигурируем ВСЕ ТРИ пина шаговика (STEP, DIR, ENABLE) как обычные выходы GPIO
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PIN_STEP) | (1ULL << PIN_DIR) | (1ULL << PIN_ENABLE), // ТЕПЕРЬ PIN_STEP ТУТ!
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    // 3. Настраиваем пин ALARM (GPIO 15) как вход с программной подтяжкой к 3.3V (инверсная логика)
+    gpio_config_t alarm_conf = {
+        .pin_bit_mask = (1ULL << PIN_ALARM),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE, // Обязательно подтягиваем к единице!
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&alarm_conf);
+
+  
+    // Сбрасываем возможные старые ошибки драйвера при включении питания
+    reset_motor_driver();
+
+    // ВЫЗЫВАЕМ КАЛИБРОВКУ ХОМИНГА (Мотор плавно и честно найдет физический ноль своими импульсами)
+    calibrate_valve_home();
+    
+    UBaseType_t saved_priority = uxTaskPriorityGet(NULL);
+    vTaskPrioritySet(NULL, 5); // выше UART и дисплея
+
+    // Регистрируем текущую задачу в Task Watchdog
+    esp_task_wdt_add(NULL);
+
+
+    // ==========================================================================
+    // ЖЕЛЕЗОБЕТОННАЯ СКОРОСТНАЯ РУЧНАЯ ПРОДУВКА ПО ШАГАМ (БЕЗ ШИМ)
+    // ==========================================================================
+        if (pressure1_kPa > 5.0f) {
+            if (current_valve_position != 0) {
+                ESP_LOGE("PURGE", "Ошибка: игла не в нуле (%ld)", current_valve_position);
+                return;
+            }
+
+            if (display_task_handle != NULL) vTaskSuspend(display_task_handle);
+
+            set_servo_angle(0.0f);
+            vTaskDelay(pdMS_TO_TICKS(200));
+
+            // Открытие иглы на полный ход
+            gpio_set_level(PIN_DIR, false);
+            current_valve_position = 0;
+            for (int32_t i = 0; i < MAX_VALVE_STEPS; i++) {
+                gpio_set_level(PIN_STEP, 1);
+                esp_rom_delay_us(10);
+                gpio_set_level(PIN_STEP, 0);
+                esp_rom_delay_us(200);
+                current_valve_position++;
+                if (i % 2000 == 0) {
+                    esp_task_wdt_reset();   // сброс WDT без блокировки
+                }
+            }
+
+            while (pressure1_kPa > 2.0f) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                esp_task_wdt_reset();
+            }
+
+            ESP_LOGI("PURGE", "Атмосфера достигнута.");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+
+            if (pressure1_kPa < 1.0f) {
+                performAdvancedZeroCalibration(0.0f, 1);
+                ESP_LOGW("PURGE", "Датчик обнулён.");
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(200));
+
+            // Закрытие иглы обратно в ноль
+            gpio_set_level(PIN_DIR, true);
+            for (int32_t i = 0; i < MAX_VALVE_STEPS; i++) {
+                gpio_set_level(PIN_STEP, 1);
+                esp_rom_delay_us(10);
+                gpio_set_level(PIN_STEP, 0);
+                esp_rom_delay_us(200);
+                current_valve_position--;
+                if (i % 2000 == 0) {
+                    esp_task_wdt_reset();
+                }
+            }
+
+            current_valve_position = 0;   // гарантируем ноль
+            set_servo_angle(90.0f);
+            vTaskDelay(pdMS_TO_TICKS(200));
+
+            if (display_task_handle != NULL) vTaskResume(display_task_handle);
+
+            ESP_LOGI("PURGE", "Продувка завершена. Позиция: %ld", current_valve_position);
+        }
+    // Удаляем задачу из Task Watchdog
+    esp_task_wdt_delete(NULL);
+    vTaskPrioritySet(NULL, saved_priority);
 }

@@ -15,6 +15,7 @@
 #include "st7789.h" 
 #include "fontx.h"
 #include "config.h"  
+#include "pressure_sensor.h"
 
 //static const char *TAG = "control_APP";
 // Инициализация аппаратного ШИМ для Серво
@@ -31,7 +32,6 @@ bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num);
 
 volatile RegulatorState requested_reg_state = REG_STATE_IDLE;
 
-
 // Глобальная переменная текущего абсолютного положения вентиля (в шагах)
 
 void start_pressure_homing(void) {
@@ -44,7 +44,6 @@ void start_pressure_homing(void) {
 void regulator_request_state(RegulatorState new_state) {
     requested_reg_state = new_state;
 }
-
 
 // Функция установки угла сервопривода (0 - 180 градусов)
 void set_servo_angle(float angle) {
@@ -125,81 +124,50 @@ void move_stepper(int steps, int speed_us, bool direction) {
 }
 
 
-void regulator_init(PressureRegulator* reg, float dt) {
-    memset(reg, 0, sizeof(*reg));
-    
-    // PID
-    reg->pid.Kp = 40.0f;
-    reg->pid.Ki = 25.0f;
-    reg->pid.Kd = 10.0f;
-    reg->pid.dt = dt;
-    reg->pid.derivative_alpha = 0.7f;   // было 0.7/0.3
-    reg->pid.kp_scale_high = 1.0f;
-    reg->pid.kp_scale_low  = 0.5f;
-    reg->pid.ki_scale_high = 1.0f;
-    reg->pid.ki_scale_low  = 0.7f;
-    reg->pid.integral_max = 800.0f;
-    reg->pid.integral_min = -800.0f;
-    
-    // пороги (твои)
-    reg->final_charge_on_th  = 0.05f;
-    reg->final_charge_off_th = 0.01f;
-    reg->vent_on_th          = -0.05f;
-    reg->vent_off_th         = -0.01f;
-    
-    // ограничения
-    reg->max_neutral_pos = 15000;
-    reg->max_step = 1000;
-    
-    // начальное положение сервы
-    reg->state = REG_STATE_IDLE; // стартуем в плоожении ни чего не далаю. 
-    reg->servo_state = SERVO_NEUTRAL;
-    reg->prev_state = REG_STATE_IDLE;
-}
-
 void update_ramp(PressureRegulator* reg, float current_pressure) {
     RampController* r = &reg->ramp;
     if (!r->ramp_active || r->final_setpoint < 0.01f) return;
-    
+
     float error_ramp = r->final_setpoint - r->ramp_setpoint;
     if (fabsf(error_ramp) < 0.01f) {
         r->ramp_setpoint = r->final_setpoint;
         r->ramp_active = false;
         return;
     }
-    
+
     float distance = fabsf(r->ramp_setpoint - r->final_setpoint);
     float speed_kPa_s;
-    
+
+    // Умеренные скорости, соответствующие возможностям системы
     if (r->ramp_setpoint > r->final_setpoint) {
-        // Сброс
-        if (distance > 50.0f)      speed_kPa_s = 100.0f;
-        else if (distance > 10.0f) speed_kPa_s = 10.0f;
-        else if (distance > 5.0f)  speed_kPa_s = 0.2f;
-        else if (distance > 2.0f)  speed_kPa_s = 0.05f;
-        else                       speed_kPa_s = 0.01f;
+        // Сброс (снижение)
+        if (distance > 50.0f)       speed_kPa_s = 50.0f;
+        else if (distance > 20.0f)  speed_kPa_s = 10.0f;
+        else if (distance > 10.0f)  speed_kPa_s = 3.0f;
+        else if (distance > 5.0f)   speed_kPa_s = 1.0f;
+        else if (distance > 2.0f)   speed_kPa_s = 0.3f;
+        else                        speed_kPa_s = 0.1f;
     } else {
-        // Набор
-        if (distance > 0.1f * r->final_setpoint) {
-            speed_kPa_s = 0.1f * r->final_setpoint;
-        } else if (distance > 0.02f * r->final_setpoint) {
-            speed_kPa_s = 0.02f * r->final_setpoint;
-        } else if (distance > 2.0f) {
-            speed_kPa_s = 2.0f;
-        } else {
-            speed_kPa_s = 1.0f;
-        }
+        // Набор (повышение)
+        if (distance > 0.2f * r->final_setpoint)        speed_kPa_s = 0.01f * r->final_setpoint;
+        else if (distance > 0.1f * r->final_setpoint)   speed_kPa_s = 0.005f * r->final_setpoint;
+        else if (distance > 5.0f)                       speed_kPa_s = 2.0f;
+        else                                            speed_kPa_s = 0.5f;
     }
-    
-    // Адаптация: не даём ramp сильно обгонять давление при сбросе
-    if (reg->servo_state == SERVO_VENTING && r->ramp_setpoint < current_pressure - 20.0f) {
-        speed_kPa_s = 0.0f;
+
+    // Адаптивное ограничение: ramp не должен отрываться от реального давления
+    // более чем на заданную величину (10 кПа для набора, 20 кПа для сброса).
+    float max_ahead = (r->ramp_setpoint > r->final_setpoint) ? 50.0f : 50.0f;
+    if ((r->ramp_setpoint > r->final_setpoint && r->ramp_setpoint < current_pressure - max_ahead) ||
+        (r->ramp_setpoint < r->final_setpoint && r->ramp_setpoint > current_pressure + max_ahead)) {
+        speed_kPa_s = 0.0f;  // останавливаем ramp, пока давление не приблизится
     }
-    
+
     float step = speed_kPa_s * reg->pid.dt;
     if (step > distance) step = distance;
     r->ramp_setpoint += (error_ramp > 0 ? step : -step);
 }
+
 
 float calculate_pid(PIDController* pid, float error, float derivative, bool is_venting) {
     float abs_err = fabsf(error);
@@ -225,11 +193,11 @@ float calculate_pid(PIDController* pid, float error, float derivative, bool is_v
             pid->vent_integral += error * pid->dt;
             // Anti-windup: если выход на максимуме, останавливаем накопление
             float raw_output = proportional + ki_eff * (-pid->vent_integral) + pid->Kd * derivative;
-            if (raw_output > 80000.0f && error < 0) {
+            if (raw_output > 8000.0f && error < 0) {
                 pid->vent_integral -= error * pid->dt; // откат
             }
             float output = proportional + ki_eff * (-pid->vent_integral) + pid->Kd * derivative;
-            if (output > 80000.0f) output = 80000.0f;
+            if (output > 8000.0f) output = 8000.0f;
             if (output < 0.0f) output = 0.0f;
             return output;
         } else {
@@ -246,18 +214,18 @@ float calculate_pid(PIDController* pid, float error, float derivative, bool is_v
         float output = kp_eff * error + ki_eff * pid->integral + pid->Kd * derivative;
         
         // Anti-windup с back-calculation
-        if (output > 80000.0f) {
-            if (error > 0) pid->integral -= (output - 80000.0f) / ki_eff * 0.1f;
-            output = 80000.0f;
-        } else if (output < -80000.0f) {
-            if (error < 0) pid->integral -= (output + 80000.0f) / ki_eff * 0.1f;
-            output = -80000.0f;
+        if (output > 8000.0f) {
+            if (error > 0) pid->integral -= (output - 8000.0f) / ki_eff * 0.1f;
+            output = 8000.0f;
+        } else if (output < -8000.0f) {
+            if (error < 0) pid->integral -= (output + 8000.0f) / ki_eff * 0.1f;
+            output = -8000.0f;
         }
         
         if (output < 0.0f) output = 0.0f;
         
         // Накапливаем интеграл (только если не в насыщении)
-        if ((output < 80000.0f || error <= 0) && (output > 0.0f || error >= 0)) {
+        if ((output < 8000.0f || error <= 0) && (output > 0.0f || error >= 0)) {
             pid->integral += error * pid->dt;
             if (pid->integral > pid->integral_max) pid->integral = pid->integral_max;
             if (pid->integral < pid->integral_min) pid->integral = pid->integral_min;
@@ -302,29 +270,56 @@ void update_servo_state(PressureRegulator* reg, float error) {
 }
 
 void apply_neutral_dwell(PressureRegulator* reg, float error, int32_t* target) {
-    if (*target > reg->max_neutral_pos) *target = reg->max_neutral_pos;
+    // Дожим только при очень малых ошибках (режим микронастройки)
+    if (fabsf(error) > 0.2f) return;   // не вмешиваемся, работает основной ПИД
+
+    // Плавное пропорциональное воздействие (без интегратора, чтобы не раскачивать)
+    float gain = 1500.0f;              // 1500 шагов на 1 кПа ошибки
+    float boost = gain * error;        // при error = 0.01 кПа → 15 шагов, очень мало
+
+    // Жёстко ограничиваем максимальное изменение за один вызов
+    if (boost > 50.0f) boost = 50.0f;
+    if (boost < -50.0f) boost = -50.0f;
+
+    int32_t new_target = *target + (int32_t)boost;
+
+    // Не позволяем выходить за пределы нейтрали (0…max_neutral_pos)
+    if (new_target > reg->max_neutral_pos) new_target = reg->max_neutral_pos;
+    if (new_target < 0) new_target = 0;
+
+    *target = new_target;
+}
+
+void regulator_init(PressureRegulator* reg, float dt) {
+    memset(reg, 0, sizeof(*reg));
     
-    if (error > 0.01f && error < 0.1f) {
-        reg->stuck_counter_pos++;
-        if (reg->stuck_counter_pos > 25) {
-            *target += 50;
-            if (*target > reg->max_neutral_pos) *target = reg->max_neutral_pos;
-            reg->stuck_counter_pos = 0;
-        }
-    } else {
-        reg->stuck_counter_pos = 0;
-    }
+    // PID
+    reg->pid.Kp = 10.0f;
+    reg->pid.Ki = 10.0f;
+    reg->pid.Kd = 5.0f;
+    reg->pid.dt = dt;
+    reg->pid.derivative_alpha = 0.7f;   // было 0.7/0.3
+    reg->pid.kp_scale_high = 2.0f;
+    reg->pid.kp_scale_low  = 0.5f;
+    reg->pid.ki_scale_high = 2.0f;
+    reg->pid.ki_scale_low  = 0.7f;
+    reg->pid.integral_max = 200.0f;
+    reg->pid.integral_min = -200.0f;
     
-    if (error < -0.01f && error > -0.1f) {
-        reg->stuck_counter_neg++;
-        if (reg->stuck_counter_neg > 25) {
-            *target -= 50;
-            if (*target < 0) *target = 0;
-            reg->stuck_counter_neg = 0;
-        }
-    } else {
-        reg->stuck_counter_neg = 0;
-    }
+    // пороги (твои)
+    reg->final_charge_off_th = 0.5f;   // серво перекроется, когда ошибка ≤ 0.5 кПа
+    reg->final_charge_on_th  = 1.0f;   // снова включится только при ошибке > 1.0 кПа (почти никогда)
+    reg->vent_on_th          = -0.5f;  // сброс включится только при перелёте < -0.5 кПа
+    reg->vent_off_th         = -0.2f;  // выключится при > -0.2 кПа
+    
+    // ограничения
+    reg->max_neutral_pos = 1500;
+    reg->max_step = 100;
+    
+    // начальное положение сервы
+    reg->state = REG_STATE_IDLE; // стартуем в плоожении ни чего не далаю. 
+    reg->servo_state = SERVO_NEUTRAL;
+    reg->prev_state = REG_STATE_IDLE;
 }
 
 
@@ -334,15 +329,17 @@ void apply_neutral_dwell(PressureRegulator* reg, float error, int32_t* target) {
 
 void pid_regulator_task(void *pvParameters) {
     PressureRegulator reg;
-    regulator_init(&reg, 0.03f);
-
+    regulator_init(&reg, 0.1f);  // тут задаем частоту дискритизации ПИД регулятора 
+    
+    set_pressure_filter_k(0.5f);  // на старте быстрая реакция
+    
     float previous_pressure = pressure1_kPa;
     float filtered_rate = 0.0f;
     int32_t target_position = 0;
 
     // Таймер для периодического логирования
     uint32_t last_log_time_ms = 0;
-    const uint32_t LOG_PERIOD_MS = 500;
+    const uint32_t LOG_PERIOD_MS = 200;
 
     while (1) {
         // Обработка запрошенного состояния
@@ -383,6 +380,7 @@ void pid_regulator_task(void *pvParameters) {
 
         // Новая уставка
         if (setpoint_kPa != reg.ramp.final_setpoint && setpoint_kPa > 0.01f) {
+            set_pressure_filter_k(0.5f);
             reg.ramp.final_setpoint = setpoint_kPa;
             reg.ramp.ramp_setpoint = pressure1_kPa;
             reg.ramp.ramp_active = true;
@@ -414,7 +412,7 @@ void pid_regulator_task(void *pvParameters) {
                 }
                 target_position = 0;
                 if (current_valve_position != 0) {
-                    move_valve_absolute(0, 20);
+                    move_valve_absolute(0, 100);
                 }
                 reg.pid.integral = 0.0f;
                 reg.pid.vent_integral = 0.0f;
@@ -440,7 +438,7 @@ void pid_regulator_task(void *pvParameters) {
                 }
                 target_position = 0;
                 if (current_valve_position != 0) {
-                    move_valve_absolute(0, 20);
+                    move_valve_absolute(0, 100);
                 }
                 if (esp_timer_get_time() / 1000 - last_log_time_ms > LOG_PERIOD_MS) {
                     ESP_LOGI("PID", "Hold | Pres=%.2f kPa | Pos=%ld", pressure1_kPa, (long int)current_valve_position);
@@ -456,11 +454,11 @@ void pid_regulator_task(void *pvParameters) {
                 reg.servo_state = SERVO_VENTING;
 
                 int32_t chunk_target = current_valve_position;
-                const int32_t STEP_CHUNK = 2000;
-                while (current_valve_position < 100000) {
+                const int32_t STEP_CHUNK = 200;
+                while (current_valve_position < 10000) {
                     chunk_target += STEP_CHUNK;
-                    if (chunk_target > 100000) chunk_target = 100000;
-                    move_valve_absolute(chunk_target, 190);
+                    if (chunk_target > 10000) chunk_target = 10000;
+                    move_valve_absolute(chunk_target, 100);
                     vTaskDelay(1);
                 }
 
@@ -472,7 +470,7 @@ void pid_regulator_task(void *pvParameters) {
                 while (current_valve_position > 0) {
                     chunk_target -= STEP_CHUNK;
                     if (chunk_target < 0) chunk_target = 0;
-                    move_valve_absolute(chunk_target, 190);
+                    move_valve_absolute(chunk_target, 100);
                     vTaskDelay(1);
                 }
 
@@ -504,6 +502,7 @@ void pid_regulator_task(void *pvParameters) {
             update_ramp(&reg, pressure1_kPa);
             if (!reg.ramp.ramp_active) {
                 reg.state = REG_STATE_HOLDING;
+                set_pressure_filter_k(0.05f);
                 ESP_LOGI("PID", "Ramp завершён, переход в HOLDING");
             }
         }
@@ -514,7 +513,8 @@ void pid_regulator_task(void *pvParameters) {
 
         float raw_rate = (current_pressure - previous_pressure) / reg.pid.dt;
         previous_pressure = current_pressure;
-        filtered_rate = 0.8f * filtered_rate + 0.2f * raw_rate;
+        //filtered_rate = 0.8f * filtered_rate + 0.2f * raw_rate;
+        filtered_rate = 0.9f * filtered_rate + 0.1f * raw_rate;
 
         float derivative = (error - reg.pid.prev_error) / reg.pid.dt;
         reg.pid.prev_error = error;
@@ -526,7 +526,7 @@ void pid_regulator_task(void *pvParameters) {
         float output = calculate_pid(&reg.pid, error, reg.pid.derivative_filtered, is_venting);
         int32_t target_raw = (int32_t)output;
 
-        if (target_raw > 80000) target_raw = 80000;
+        if (target_raw > 10000) target_raw = 10000;
         if (target_raw < 0) target_raw = 0;
 
         target_position = target_raw;
@@ -546,7 +546,12 @@ void pid_regulator_task(void *pvParameters) {
         if (step > reg.max_step) target_position = current_valve_position + reg.max_step;
         else if (step < -reg.max_step) target_position = current_valve_position - reg.max_step;
 
-        move_valve_absolute(target_position, 20);
+        if (reg.state == REG_STATE_HOLDING && reg.servo_state == SERVO_NEUTRAL) {
+            if (step > 200) target_position = current_valve_position + (step > 0 ? 200 : -200);
+            else if (step < -200) target_position = current_valve_position - 200;
+        }
+
+        move_valve_absolute(target_position, 100);
 
         // Логирование раз в 500 мс
         uint32_t now_ms = esp_timer_get_time() / 1000;
