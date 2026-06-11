@@ -175,7 +175,7 @@ void regulator_init(PressureRegulator* reg, float dt) {
     //   прошло > dose_dp_fast    -> -dose_trim      (чуть быстрее нужного)
     // Полоса dose_dp_slow..dose_dp_fast — «хорошо», открытие не трогаем.
     reg->hold_enter_err  = 0.5f;        // |error| <= этого -> PID выключается, дальше HOLD-струйка
-    reg->dose_step_back  = 100;         // вход в HOLD: открытие = последняя позиция RATE минус это
+    reg->dose_step_back  = 200;         // вход в HOLD: открытие = последняя позиция RATE минус это
     reg->dose_period_us  = 5000000ULL;  // окно проверки прогресса дозы: 5 с
     reg->dose_dp_slow    = 0.05f;       // кПа за окно
     reg->dose_dp_VERYslow    = -0.05f;
@@ -183,11 +183,37 @@ void regulator_init(PressureRegulator* reg, float dt) {
     reg->dose_dp_runaway = 0.20f;
     reg->dose_trim       = 10;          // шаги иглы
     reg->dose_trim_big   = 50;
-    reg->dose_trim_very_big   = 150;
+    reg->dose_trim_very_big   = 50; // было 100, но решил поставить 50, так как на 100 бывает перескакивает
     reg->step_holding_charge = reg->valve_flow_floor;  // безопасный дефолт; засеется при входе в HOLD
     reg->step_holding_vent   = reg->valve_flow_floor;
     reg->dose_charge_calibrated = false; // флаги ставятся при входе в HOLD: направление подхода
     reg->dose_vent_calibrated   = false; // калибровано, противоположное разгоняется с floor по +trim_big
+
+    // --- ВТОРОЙ (ТОЧНЫЙ) ХОЛДИНГ: равновесное приоткрытие вместо подкачек ---
+    // После выхода на точку НАБОРОМ (доза подобрана делом) серво НЕ печатаем,
+    // оставляем в НАБОРЕ: игла встаёт на step_holding_charge - fine_seed_back и
+    // раз в fine_period_us двигается на +-fine_trim по знаку сползания давления
+    // за окно (росло -> прикрыть, падало -> приоткрыть) — ищем открытие, где
+    // приток через иглу равен утечке. Окно с |dP| < fine_eq_band = «равновесие»:
+    // открытие запоминается в fine_eq_pos, игла стоит на нём БЕЗ подкачек.
+    // Если при этом стоим МИМО цели (поиск съел давление: |err_filt| >
+    // fine_corr_err) — ВРЕМЕННАЯ КОРРЕКЦИЯ: игла на fine_corr_step от равновесия
+    // в сторону цели, РОВНО дошли -> обратно на fine_eq_pos (само равновесие не
+    // трогаем). Печатать и докачивать просадку обычным HOLD нельзя: пока объём
+    // запечатан, магистраль успевает измениться и равновесие протухает
+    // (проверено: найденные 3393 после докачки уже лили).
+    // Выход на точку СБРОСОМ в точный холдинг НЕ ведёт: печатаем, ждём
+    // естественного стравливания вниз, обычный эпизод НАБОРА подбирает дозу и
+    // выводит на точку — только тогда включается точный холдинг (hold_fine_step).
+    reg->hold_fine_enable = true;        // КОНФИГ: false = старое поведение (печать + эпизоды подкачки)
+    reg->fine_seed_back   = 20;          // вход без найденного равновесия: игла = step_holding_charge минус это
+    reg->fine_trim        = 2;           // +-шаг подстройки открытия за окно
+    reg->fine_period_us   = 5000000ULL;  // окно оценки знака скорости: 5 с
+    reg->fine_eq_band     = 0.01f;       // |dP| за окно меньше этого = «стоим», равновесие найдено
+    reg->fine_eq_found    = false;       // сбрасывается на новой уставке (равновесие там другое)
+    reg->fine_corr_step   = 20;          // отступ коррекции от равновесия: видимый поток, но без разгона
+    reg->fine_corr_err    = 0.05f;       // мёртвая зона цели; меньше — дёргаемся от шума P_filt (~±0.02)
+    reg->fine_corr_dir    = 0;           // коррекция не активна
     // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
     // слю ~2400 шаг/с, полный ход ~4 с). Если игла открывается слишком медленно —
@@ -312,6 +338,76 @@ static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
     reg->dose_p0    = reg->filtered_pressure;
 }
 
+// ============================================================================
+//  ТОЧНЫЙ ХОЛДИНГ: серво постоянно в НАБОРЕ, игла стоит на равновесном
+//  приоткрытии (приток компенсирует утечку). Раз в fine_period_us смотрим, куда
+//  сползло отфильтрованное давление за окно, и двигаем открытие на fine_trim
+//  ПРОТИВ знака: росло -> прикрыть, падало -> приоткрыть. dP за окно — это та же
+//  средняя скорость, только сквозь шум её видно (мгновенная dP/dt у цели тонет).
+//  Окно с |dP| < fine_eq_band = «стоим»: открытие запоминается в fine_eq_pos.
+//  Стоим, но МИМО цели (|err_filt| > fine_corr_err) — ВРЕМЕННАЯ КОРРЕКЦИЯ:
+//  игла на fine_corr_step от равновесия в сторону цели, окна замораживаются;
+//  err_filt пересёк ноль (РОВНО дошли) — игла обратно на fine_eq_pos, окно с
+//  чистого листа. Равновесие коррекция не трогает — это «подтолкнуть и
+//  вернуться». Докачивать просадку печатью/обычным HOLD нельзя: пока объём
+//  запечатан, магистраль меняется и равновесие протухает.
+//  Окно переиспользует dose_t0_us/dose_p0 — с эпизодами оно не пересекается.
+// ============================================================================
+static int32_t hold_fine_step(PressureRegulator* reg, uint64_t now_us, float error_filt) {
+    // --- активная коррекция: окна заморожены, каждый тик ждём ровного прихода ---
+    if (reg->fine_corr_dir != 0) {
+        bool reached = (reg->fine_corr_dir > 0) ? (error_filt <= 0.0f)
+                                                : (error_filt >= 0.0f);
+        if (reached) {
+            ESP_LOGI("PID", "FINE: коррекция дошла (err_filt=%+.2f) — игла %ld обратно на равновесие %ld",
+                     error_filt, (long)reg->fine_pos, (long)reg->fine_eq_pos);
+            reg->fine_corr_dir = 0;
+            reg->fine_pos      = reg->fine_eq_pos;
+            dose_window_reset(reg, now_us);
+        }
+        return reg->fine_pos;
+    }
+
+    if (now_us - reg->dose_t0_us >= reg->fine_period_us) {
+        float dp = reg->filtered_pressure - reg->dose_p0;   // знак = знак средней dP/dt за окно
+        int32_t old = reg->fine_pos;
+
+        if (fabsf(dp) < reg->fine_eq_band) {
+            // «стоим» — текущее открытие и есть равновесное, запоминаем
+            reg->fine_eq_pos = reg->fine_pos;
+            if (!reg->fine_eq_found) {
+                reg->fine_eq_found = true;
+                ESP_LOGI("PID", "FINE: равновесие найдено, игла %ld (dP=%+.3f)",
+                         (long)reg->fine_eq_pos, dp);
+            }
+            if (fabsf(error_filt) > reg->fine_corr_err) {
+                // стоим, но мимо цели -> подтолкнуть давление временным отступом
+                reg->fine_corr_dir = (error_filt > 0.0f) ? +1 : -1;
+                reg->fine_pos = reg->fine_eq_pos + reg->fine_corr_dir * reg->fine_corr_step;
+                if (reg->fine_pos < reg->valve_flow_floor) reg->fine_pos = reg->valve_flow_floor;
+                if (reg->fine_pos > reg->valve_max)        reg->fine_pos = reg->valve_max;
+                ESP_LOGI("PID", "FINE: коррекция, игла %ld -> %ld (err_filt=%+.2f), до цели и обратно",
+                         (long)reg->fine_eq_pos, (long)reg->fine_pos, error_filt);
+            } else {
+                ESP_LOGI("PID", "FINE: стоим, игла %ld (dP=%+.3f кПа за окно)",
+                         (long)reg->fine_pos, dp);
+            }
+        } else {
+            if (dp < 0.0f) reg->fine_pos += reg->fine_trim;   // давление падает -> приоткрыть
+            else           reg->fine_pos -= reg->fine_trim;   // растёт -> прикрыть
+            if (reg->fine_pos < reg->valve_flow_floor) reg->fine_pos = reg->valve_flow_floor;
+            if (reg->fine_pos > reg->valve_max)        reg->fine_pos = reg->valve_max;
+            if (reg->fine_pos != old)
+                ESP_LOGI("PID", "FINE: игла %ld -> %ld (dP=%+.3f кПа за окно, скорость %+.4f кПа/с)",
+                         (long)old, (long)reg->fine_pos, dp,
+                         dp / ((float)reg->fine_period_us / 1000000.0f));
+        }
+        reg->dose_t0_us = now_us;
+        reg->dose_p0    = reg->filtered_pressure;
+    }
+    return reg->fine_pos;
+}
+
 // Ставит серво в нужное положение, но только если оно изменилось
 // (чтобы не дёргать ШИМ каждый тик).
 static void apply_servo(PressureRegulator* reg, ServoState s) {
@@ -328,6 +424,9 @@ static void apply_servo(PressureRegulator* reg, ServoState s) {
 static void reset_controllers(PressureRegulator* reg) {
     reg->rate_integral = 0.0f;
     reg->holding       = false;
+    reg->fine_holding  = false;
+    reg->fine_eq_found = false;   // на новой уставке равновесное открытие другое
+    reg->fine_corr_dir = 0;       // недоигранная коррекция к новой уставке не относится
 }
                                                       //и только потом ждать минимально необходимую скорость (которая должна быть больше чем sensor_noise_delta)
 // ============================================================================
@@ -496,6 +595,15 @@ void pid_regulator_task(void *pvParameters) {
         //         PI — скорости у цели не видны измерению dP/dt). Раз в 5 с открытие
         //         подстраивается по фактическому прогрессу давления (hold_dose_step).
         //         error_filt дошёл до порога печати -> игла на парковку, серво в нейтраль.
+        //  FINE — точный холдинг (конфиг hold_fine_enable): когда НАБОРОМ вышли на
+        //         точку, не печатаем — серво остаётся в НАБОРЕ, игла на
+        //         step_holding_charge - fine_seed_back, раз в fine_period_us
+        //         +-fine_trim по знаку сползания давления. Окно с |dP| <
+        //         fine_eq_band = равновесие: открытие запоминается, игла стоит
+        //         на нём без подкачек; стоим мимо цели — временная коррекция
+        //         +-fine_corr_step от равновесия до ровного прихода на цель и
+        //         обратно (hold_fine_step). Увод за hold_enter_err -> обратно
+        //         в HOLD (эпизоды).
         int32_t target_valve = current_valve_position;   // по умолчанию — стоим
         const char* zone;
 
@@ -535,6 +643,23 @@ void pid_regulator_task(void *pvParameters) {
                 apply_servo(&reg, (desired > 0) ? SERVO_CHARGING : SERVO_VENTING);
                 target_valve = rate_control_step(&reg, desired, dt);
             }
+        } else if (reg.fine_holding) {
+            // ---- ТОЧНЫЙ ХОЛДИНГ: серво стоит в НАБОРЕ, игла на равновесном
+            //      приоткрытии, раз в окно +-fine_trim по знаку скорости ----
+            zone = "FINE";
+
+            if (fabsf(error_filt) > reg.hold_enter_err) {
+                // увело дальше, чем тонкая подстройка (+-fine_trim / 5 с) может
+                // отработать — печатаем и отдаём обычной механике эпизодов;
+                // когда эпизод НАБОРА снова выведет на точку, FINE включится сам
+                reg.fine_holding  = false;
+                reg.fine_corr_dir = 0;   // недоигранная коррекция отменяется
+                apply_servo(&reg, SERVO_NEUTRAL);
+                target_valve = reg.valve_flow_floor;
+                ESP_LOGW("PID", "FINE: err_filt=%.2f — выход в обычный HOLD", error_filt);
+            } else {
+                target_valve = hold_fine_step(&reg, now_us, error_filt);
+            }
         } else {
             // ---- ФАЗА ХОЛДА: покой запечатан, коррекции — микродозы ----
             zone = "HOLD";
@@ -558,9 +683,30 @@ void pid_regulator_task(void *pvParameters) {
                 }
 
                 case SERVO_CHARGING:
-                    if (error_filt <= reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели -> печатаем  // поменял 0 на reg.sensor_noise_delta_filt (0.03) для компенсации перелета. Не уверен что надо именно эту переменную, но в целом как будто она подходит
-                        apply_servo(&reg, SERVO_NEUTRAL);
-                        target_valve = reg.valve_flow_floor;
+                    if (error_filt <= reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели  // поменял 0 на reg.sensor_noise_delta_filt (0.03) для компенсации перелета. Не уверен что надо именно эту переменную, но в целом как будто она подходит
+                        if (reg.hold_fine_enable && reg.dose_charge_calibrated) {
+                            // НАБОРОМ вышли на точку и доза проверена делом ->
+                            // вместо печати точный холдинг: серво ОСТАЁТСЯ в
+                            // НАБОРЕ. Если равновесие уже найдено — игла сразу
+                            // на него; если нет — чуть ниже дозы и ищем
+                            // (+-fine_trim раз в окно по знаку скорости).
+                            reg.fine_holding  = true;
+                            reg.fine_corr_dir = 0;
+                            reg.fine_pos = reg.fine_eq_found
+                                         ? reg.fine_eq_pos
+                                         : reg.step_holding_charge - reg.fine_seed_back;
+                            if (reg.fine_pos < reg.valve_flow_floor) reg.fine_pos = reg.valve_flow_floor;
+                            dose_window_reset(&reg, now_us);
+                            target_valve = reg.fine_pos;
+                            ESP_LOGI("PID", "FINE: вход, игла %ld (%s), серво остаётся в НАБОРЕ. P=%.2f",
+                                     (long)reg.fine_pos,
+                                     reg.fine_eq_found ? "найденное равновесие"
+                                                       : "доза НАБОРА минус отступ, ищем",
+                                     pressure);
+                        } else {
+                            apply_servo(&reg, SERVO_NEUTRAL);   // печатаем как раньше
+                            target_valve = reg.valve_flow_floor;
+                        }
                     } else {
                         target_valve = hold_dose_step(&reg, now_us, true);
                     }
