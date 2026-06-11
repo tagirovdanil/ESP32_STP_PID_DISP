@@ -265,7 +265,7 @@ static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt
     if (out > (float)reg->valve_max)        out = (float)reg->valve_max;
     return (int32_t)out;
 }
-
+//
 // ============================================================================
 //  МИКРОДОЗЫ В HOLD: игла стоит на фиксированном открытии step_holding_*; раз в
 //  dose_period_us сверяем фактический прогресс давления К ЦЕЛИ за окно и
