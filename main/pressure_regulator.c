@@ -210,7 +210,7 @@ static float desired_rate_from_error(float error, float near_rate, float very_ne
     else if (e > 250.0f) rate = 50.0f;
     else if (e >  80.0f) rate = 20.0f;
     else if (e >  30.0f) rate = 10.0f;
-    else if (e >   8.0f) rate = 3.0f;
+    else if (e >   16.0f) rate = 3.0f;
     else if (e >   5.0f) rate = 1.0f;        // полоса 2..8 кПа
     else if (e >   3.0)                 rate = near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
     else rate = very_near_rate;
@@ -236,7 +236,7 @@ static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt
     // магистрали). Поэтому закрываемся на полном слю (max_step за тик), а
     // интегратор синхронизируем с фактической позицией, иначе после отпускания
     // тормоза PI вернул бы иглу обратно вверх.
-    if (measured_toward > 3.0f * fabsf(desired) && (measured_toward - fabsf(desired)) > 1.5f) {
+    if (measured_toward > 2.0f * fabsf(desired) && (measured_toward - fabsf(desired)) > 1.5f) {
         int32_t out_brake = current_valve_position - reg->max_step;
         if (out_brake < reg->valve_flow_floor) out_brake = reg->valve_flow_floor;
         reg->rate_integral = ((float)out_brake - (float)reg->valve_flow_floor
@@ -396,7 +396,7 @@ void pid_regulator_task(void *pvParameters) {
         // раз rate=0). Поэтому скорость пересчитываем ТОЛЬКО когда пришёл свежий
         // отсчёт (значение реально изменилось), и по реальному времени с прошлого.
         float pressure = pressure1_kPa;
-        if (pressure != reg.prev_pressure) {
+        if (fabsf(pressure-reg.prev_pressure) > 0.001f ) { // сравниваем если на одинаковых показаниях датчик дает чуть разное
             float dt_p = (float)(now_us - reg.last_pressure_us) / 1000000.0f;
             if (dt_p < 0.001f) dt_p = 0.001f;
             float raw_rate = (pressure - reg.prev_pressure) / dt_p;   // кПа/с по свежему отсчёту
