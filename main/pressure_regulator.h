@@ -140,6 +140,14 @@ typedef struct {
     float    fine_corr_err;         // «стоим», но |err_filt| больше этого -> запускаем коррекцию
     int32_t  fine_corr_dir;         // 0 = коррекции нет; +1/-1 = игла на fine_eq_pos +/- corr_step,
                                     // err_filt пересёк ноль -> игла обратно на fine_eq_pos
+    int32_t  fine_trim_fast;        // крупная подстройка за окно, пока давление ещё активно
+                                    // движется (fine_change >= fine_hold_change) — вместо fine_trim
+    float    fine_change;           // |ΔP_filt| за последние ~5 с (скользящее окно) — гейт FINE->HOLD
+    float    fine_hold_change;      // fine_change >= этого = «ещё движусь»: остаёмся в FINE,
+                                    // крупный шаг, в HOLD не уходим (защита от дёрганья у порога)
+    uint64_t fine_rate_t0_us;       // трекер fine_change: начало текущего чекпойнта (мкс)
+    float    fine_rate_p_cur;       // P_filt на последнем чекпойнте (0..period/2 назад)
+    float    fine_rate_p_prev;      // P_filt на предыдущем чекпойнте (period/2..period назад)
 
     // ---- лимиты привода ----
     int32_t valve_max;              // макс. открытие иглы (шаги)

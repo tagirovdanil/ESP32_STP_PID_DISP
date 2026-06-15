@@ -214,6 +214,142 @@ bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num) {
     return true;
 }
 
+// ==========================================================================
+// СЛУЖЕБНАЯ ПАУЗА/ВОЗОБНОВЛЕНИЕ ФОНОВОГО ОПРОСА ДАТЧИКА
+// Одиночные служебные команды (чтение/запись диапазона) делят тот же UART, что
+// и периодический опрос измерений. Чтобы их ответы не перемешивались с потоком
+// измерений, на время команды останавливаем периодический таймер и поднимаем
+// is_calibrating (регулятор и отрисовка экрана тоже встают на паузу). resume
+// обязателен в КАЖДОЙ ветви выхода.
+// ==========================================================================
+void pressure_task_pause(void) {
+    is_calibrating = true;
+    esp_timer_stop(pressure_timer);
+}
+
+void pressure_task_resume(void) {
+    esp_timer_start_periodic(pressure_timer, SERIAL_UART1_INTERVAL * 1000);
+    is_calibrating = false;
+}
+
+// ======================== ЧТЕНИЕ ДИАПАЗОНОВ (RangeFF / Range0 / Range1 …) ========================
+// rangeByte: 0x00..0x04 — конкретный диапазон, 0xFF — текущий выбранный.
+// Возвращает true при успехе; out_pmax/out_pmin (если != NULL) заполняются прочитанными значениями.
+bool ReadRange(uint8_t rangeByte, uart_port_t uart_num, float *out_pmax, float *out_pmin)
+{
+    // Формируем команду: 0x02 0x02 0x0E 0x01 <RANGE> <CRC>
+    uint8_t cmd[6] = {0x02, 0x02, 0x0e, 0x01, rangeByte, 0x00};
+    cmd[5] = calculateChecksum(cmd, 5);        // ← правильная контрольная сумма
+
+    static uint8_t temp_buf[64];
+    const char* sensorName = (uart_num == SENSOR_UART_NUM) ? "1" : "2";
+
+    int attempts = 3;
+    pressure_task_pause();
+    while (attempts--) {
+        uart_flush_input(uart_num);
+        uart_write_bytes(uart_num, cmd, sizeof(cmd));
+        uart_wait_tx_done(uart_num, pdMS_TO_TICKS(50));
+
+        int rx_len = uart_read_bytes(uart_num, temp_buf, sizeof(temp_buf), pdMS_TO_TICKS(150));
+
+        if (rx_len > 0) {
+            ESP_LOGI("RANGE", "=== Sensor %s | Range 0x%02X ===", sensorName, rangeByte);
+            ESP_LOG_BUFFER_HEX("RANGE", temp_buf, rx_len);
+
+            if (rx_len >= 16) {
+                union {
+                    uint8_t bytes[4];
+                    float value;
+                } fval;
+
+                // pmax (байты 8-11)
+                fval.bytes[0] = temp_buf[11];
+                fval.bytes[1] = temp_buf[10];
+                fval.bytes[2] = temp_buf[9];
+                fval.bytes[3] = temp_buf[8];
+                float pmax_val = fval.value;
+
+                // pmin (байты 12-15)
+                fval.bytes[0] = temp_buf[15];
+                fval.bytes[1] = temp_buf[14];
+                fval.bytes[2] = temp_buf[13];
+                fval.bytes[3] = temp_buf[12];
+                float pmin_val = fval.value;
+
+                ESP_LOGI("RANGE", "Sensor %s → pmax = %.3f | pmin = %.3f",
+                         sensorName, pmax_val, pmin_val);
+
+                if (out_pmax) *out_pmax = pmax_val;
+                if (out_pmin) *out_pmin = pmin_val;
+                pressure_task_resume();
+                return true;
+            }
+
+            ESP_LOGE("RANGE", "Sensor %s → слишком мало байт (%d)", sensorName, rx_len);
+            pressure_task_resume();
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    ESP_LOGE("RANGE", "Sensor %s → НЕ УДАЛОСЬ прочитать диапазон 0x%02X после 3 попыток",
+             sensorName, rangeByte);
+    pressure_task_resume();
+    return false;
+}
+
+// ======================== ВЫБОР ДИАПАЗОНА (команда 0x23) ========================
+// rangeByte: 0x00..0x04. Возвращает true, если датчик подтвердил выбор (ACK + статус 0).
+bool SetRange(uint8_t rangeByte, uart_port_t uart_num)
+{
+    if (rangeByte > 0x04) {
+        ESP_LOGE("RANGE", "Неверный номер диапазона (должен быть 0..4)");
+        return false;
+    }
+
+    // Формируем команду: 0x02 0x02 0x23 0x01 <Range> <CRC>
+    uint8_t cmd[6] = {0x02, 0x02, 0x23, 0x01, rangeByte, 0x00};
+    cmd[5] = calculateChecksum(cmd, 5);
+
+    static uint8_t rx_buf[32];
+    const char* sensorName = (uart_num == SENSOR_UART_NUM) ? "1" : "2";
+
+    int attempts = 3;
+    pressure_task_pause();
+    while (attempts--) {
+        uart_flush_input(uart_num);
+        uart_write_bytes(uart_num, cmd, sizeof(cmd));
+        uart_wait_tx_done(uart_num, pdMS_TO_TICKS(50));
+
+        int rx_len = uart_read_bytes(uart_num, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(150));
+
+        if (rx_len >= 7) {
+            ESP_LOGI("RANGE", "=== SetRange 0x%02X → Sensor %s ===", rangeByte, sensorName);
+            ESP_LOG_BUFFER_HEX("RANGE", rx_buf, rx_len);
+
+            // Проверяем ответ по протоколу: 0x06 (ACK), эхо команды 0x23, статус 0x00 = успех
+            bool ok = (rx_buf[0] == 0x06 && rx_buf[2] == 0x23 && rx_buf[5] == 0x00);
+            if (ok) {
+                ESP_LOGI("RANGE", "✅ Диапазон 0x%02X успешно выбран на датчике %s",
+                         rangeByte, sensorName);
+            } else {
+                ESP_LOGE("RANGE", "Датчик %s не подтвердил выбор диапазона 0x%02X",
+                         sensorName, rangeByte);
+            }
+            pressure_task_resume();
+            return ok;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    ESP_LOGE("RANGE", "❌ Не удалось выполнить SetRange 0x%02X на датчике %s после 3 попыток",
+             rangeByte, sensorName);
+    pressure_task_resume();
+    return false;
+}
+
 // Приватный обработчик ответа (обязательно пишется static)
 static void handlePressureResponse1(uint8_t *frame, uint8_t length) {
     union { uint8_t bytes[4]; float value; } fval;
@@ -223,7 +359,7 @@ static void handlePressureResponse1(uint8_t *frame, uint8_t length) {
     uint32_t raw_value;
     memcpy(&raw_value, &fval.value, 4);
     const uint32_t OVF_PATTERN = 0x7F800000;
-    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > 3000.0f || fval.value < -100.0f) {
+    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > 26000.0f || fval.value < -100.0f) {
         sum_err++;
         return;
     }

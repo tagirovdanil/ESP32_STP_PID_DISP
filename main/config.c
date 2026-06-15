@@ -80,7 +80,7 @@ volatile int32_t current_valve_position = 0;
 
 
         // Ставим сервопривод строго в положение АТМОСФЕРЫ (0 градусов)
-        set_servo_angle(0.0f); 
+        set_servo_angle(180.0f); // ИСПРАВИТЬ ЧТОБ ПРЕСЕТОМ БЫЛО, А ГРАДУСЫ ВЫСТАВЛЯТЬ КОНФИГОМ В ДРУГОМ МЕСТЕ (в прешурконтроллер как щас там например)
         vTaskDelay(pdMS_TO_TICKS(200)); // Даем серве честно переложиться
         
         // Включаем направление на ОТКРЫТИЕ иглы вверх
@@ -208,7 +208,7 @@ void calibrate_valve_home(void) {
             // Защита от наводок (дебаунс)
             if (gpio_get_level(PIN_ALARM) != 0) {
                 alarm_confirm_counter++;
-                if (alarm_confirm_counter >= 10) {
+                if (alarm_confirm_counter >= 1) {
                     break; // Физический упор найден!
                 }
             } else {

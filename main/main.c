@@ -63,7 +63,7 @@ static void respond(const char *msg) {
 // РАЗБОР И ИСПОЛНЕНИЕ ОДНОЙ КОМАНДЫ
 // Источник команды — USB UART0 или WiFi/TCP (обработчик общий, чтобы не
 // плодить гонки с глобальным состоянием регулятора). Формат: set X / reset /
-// idle / abort / home / sn / zero.
+// idle / abort / home / sn / zero / range [N] / setrange N.
 // ==========================================================================
 static void handle_command(char *str) {
 
@@ -157,6 +157,53 @@ static void handle_command(char *str) {
     }
 
     // ==========================================================================
+    // КОМАНДА "SETRANGE N" — выбор рабочего диапазона датчика (0..4), протокол 0x23.
+    // ВАЖНО: проверяем РАНЬШЕ "range" и "set " — обе они подстроки этой команды.
+    // ==========================================================================
+    char *setrange_ptr = strstr(str, "setrange");
+    if (setrange_ptr == NULL) setrange_ptr = strstr(str, "SETRANGE");
+    if (setrange_ptr != NULL) {
+        int n = -1;
+        if (sscanf(setrange_ptr + 8, "%d", &n) == 1 && n >= 0 && n <= 4) {
+            ESP_LOGI(TAG, "Команда SETRANGE %d", n);
+            bool ok = SetRange((uint8_t)n, SENSOR_UART_NUM);
+            ESP_LOGI(TAG, "SetRange %d -> %s", n, ok ? "OK" : "FAILED (нет/неверный ответ)");
+        } else {
+            ESP_LOGE(TAG, "SETRANGE: формат 'setrange N' (N=0..4)");
+        }
+        return;
+    }
+
+    // ==========================================================================
+    // КОМАНДА "RANGE [N]" — чтение диапазона датчика. Без аргумента — текущий
+    // (посылаем 0xFF), N=0..4 — конкретный диапазон. Печатает pmin/pmax.
+    // ==========================================================================
+    char *range_ptr = strstr(str, "range");
+    if (range_ptr == NULL) range_ptr = strstr(str, "RANGE");
+    if (range_ptr != NULL) {
+        int n = -1;
+        uint8_t rb = 0xFF;                      // нет аргумента → текущий диапазон
+        if (sscanf(range_ptr + 5, "%d", &n) == 1) {
+            if (n < 0 || n > 4) {
+                ESP_LOGE(TAG, "RANGE: N должен быть 0..4 (или без аргумента — текущий)");
+                return;
+            }
+            rb = (uint8_t)n;
+        }
+        ESP_LOGI(TAG, "Команда RANGE 0x%02X", rb);
+        float pmax = 0.0f, pmin = 0.0f;
+        bool ok = ReadRange(rb, SENSOR_UART_NUM, &pmax, &pmin);
+        if (!ok) {
+            ESP_LOGE(TAG, "Не удалось прочитать диапазон");
+        } else if (rb == 0xFF) {
+            ESP_LOGI(TAG, "Текущий диапазон: pmin=%.3f pmax=%.3f", pmin, pmax);
+        } else {
+            ESP_LOGI(TAG, "Диапазон %d: pmin=%.3f pmax=%.3f", rb, pmin, pmax);
+        }
+        return;
+    }
+
+    // ==========================================================================
     // ОБРАБОТКА КОМАНДЫ "SET X"
     // ==========================================================================
     char *cmd_ptr = strstr(str, "set ");
@@ -186,7 +233,7 @@ void usb_uart_rx_task(void *pvParameters) {
         return;
     }
 
-    ESP_LOGI(TAG, "Задача чтения команд через USB UART запущена. Формат: set X / ser N A / reset / idle / home / sn");
+    ESP_LOGI(TAG, "Задача чтения команд через USB UART запущена. Формат: set X / ser N A / reset / idle / home / sn / range [N] / setrange N");
 
     while (1) {
         // Читаем данные из UART_NUM_0. Таймаут 20 мс позволяет задаче «засыпать», если порт пуст

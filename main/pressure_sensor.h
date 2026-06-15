@@ -44,4 +44,11 @@ bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num);
 void display_update_task(void *pvParameters);
 void pressure_ui_and_usb_init(TFT_t *p_dev);
 
+// служебные команды диапазона датчика (делят UART с опросом — на время работы
+// ставят периодический опрос на паузу через pressure_task_pause/resume)
+void pressure_task_pause(void);
+void pressure_task_resume(void);
+bool ReadRange(uint8_t rangeByte, uart_port_t uart_num, float *out_pmax, float *out_pmin);
+bool SetRange(uint8_t rangeByte, uart_port_t uart_num);
+
 #endif // PRESSURE_SENSOR_H
