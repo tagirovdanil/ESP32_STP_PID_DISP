@@ -160,7 +160,7 @@ void regulator_init(PressureRegulator* reg, float dt) {
     // держался вниз до ~3600 -> ставим floor около нижней границы потока. Регулятор
     // никогда не опускает иглу ниже floor во время работы, поэтому уходит мёртвое
     // время ~3 с на старте и тонкая зона реально может дать поток.
-    reg->valve_flow_floor = 0;// 3600 * 0.9; // на всякий случай умножил на 0.8, чтоб наверняка 0 был
+    reg->valve_flow_floor = 100;// 0;// 3600 * 0.9; // на всякий случай умножил на 0.8, чтоб наверняка 0 был
                                         // (он же — парковка иглы в HOLD: запечатано, но близко к зоне потока)
 
     // --- HOLD: МИКРОДОЗЫ ---
@@ -175,19 +175,44 @@ void regulator_init(PressureRegulator* reg, float dt) {
     //   прошло > dose_dp_fast    -> -dose_trim      (чуть быстрее нужного)
     // Полоса dose_dp_slow..dose_dp_fast — «хорошо», открытие не трогаем.
     reg->hold_enter_err  = 0.5f;        // |error| <= этого -> PID выключается, дальше HOLD-струйка
-    reg->dose_step_back  = 200;         // вход в HOLD: открытие = последняя позиция RATE минус это
+    reg->dose_step_back  = 60;          // вход в HOLD набором: СТАРТ СВИПА поиска = позиция RATE минус это
+                                        // (было 200 для старой иглы; у новой порог ~позиции RATE, нужен
+                                        //  малый отступ — свип стартует чуть ниже порога и быстро доходит)
     reg->dose_period_us  = 5000000ULL;  // окно проверки прогресса дозы: 5 с
     reg->dose_dp_slow    = 0.05f;       // кПа за окно
-    reg->dose_dp_VERYslow    = -0.05f;
+    reg->dose_dp_VERYslow    = -0.03f;  // прогресс хуже этого (явная утечка/мимо за окно) -> крупный добор
+                                        // (было -0.05: утечку -0.047 не ловило, падало в «медленно» +2)
     reg->dose_dp_fast    = 0.10f;
     reg->dose_dp_runaway = 0.20f;
-    reg->dose_trim       = 10;          // шаги иглы
-    reg->dose_trim_big   = 50;
-    reg->dose_trim_very_big   = 50; // было 100, но решил поставить 50, так как на 100 бывает перескакивает
+    reg->dose_trim       = 2;          // шаги иглы     // было 10
+    reg->dose_trim_big   = 10;   // было 50
+    reg->dose_trim_very_big   = 10; // было 100, но решил поставить 50, так как на 100 бывает перескакивает     // было 50
     reg->step_holding_charge = reg->valve_flow_floor;  // безопасный дефолт; засеется при входе в HOLD
     reg->step_holding_vent   = reg->valve_flow_floor;
     reg->dose_charge_calibrated = false; // флаги ставятся при входе в HOLD: направление подхода
     reg->dose_vent_calibrated   = false; // калибровано, противоположное разгоняется с floor по +trim_big
+
+    // --- БЫСТРЫЙ ПОИСК ПОРОГА ПОТОКА (идея 3) ---
+    // Свип иглой вверх до первого потока вместо медленного +dose_trim за 5 с.
+    // Числа: +1 шаг раз в 0.2 с (=5 шаг/с), окно детекции 1 с, поток = ΔP>=0.05
+    // кПа за окно, после нахождения откат на 10 (лаг детекции ~ 1шаг*10 за окно),
+    // пауза 2 с в floor. Свип медленный для большого мёртвого хода — поднимай
+    // search_step (и search_back пропорционально), если порог высоко по шагам.
+    reg->dose_searching        = false;
+    reg->search_phase          = 0;
+    reg->search_step_period_us = 200000ULL;   // 0.2 с
+    reg->search_step           = 1;           // мелкий шаг = точная локализация порога
+    reg->search_hist_dt_us     = 250000ULL;   // чекпойнт раз в 0.25 с -> лаги 0.25..1.0 с
+    reg->search_hist_idx       = 0;
+    reg->search_hist_count     = 0;
+    reg->search_hist_t0_us     = 0;
+    reg->search_dp_flow        = 0.05f;       // P_filt выросло на это над лагом = поток (>шум)
+    reg->search_back           = 20;           // встаём почти на сам порог (детекция многолаговая, лаг мал)
+    reg->search_warmup_rate    = 0.10f;       // |rate_filt|<0.1 кПа/с = давление устаканилось
+    reg->search_warmup_max_us  = 2500000ULL;  // но прогрев не дольше 2.5 с
+    reg->search_settle_us      = 2000000ULL;  // 2 с
+    reg->search_settle_t0_us   = 0;
+    reg->search_found_pos      = 0;
 
     // --- ВТОРОЙ (ТОЧНЫЙ) ХОЛДИНГ: равновесное приоткрытие вместо подкачек ---
     // После выхода на точку НАБОРОМ (доза подобрана делом) серво НЕ печатаем,
@@ -318,7 +343,10 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
                      charging ? "НАБОР" : "СБРОС", (long)*pos, toward);
         }
 
-        if      (toward < reg->dose_dp_VERYslow)    *pos += *calib ? (reg->dose_trim_big - 10) : reg->dose_trim_very_big;     // едем в обратную сторону  // -10 чтобы типо было +40 а не +50, так как 50 я еще и минусую, чтоб туда сюда не болтало
+        if      (toward < reg->dose_dp_VERYslow)    *pos += *calib ? reg->dose_trim_big : reg->dose_trim_very_big;     // явно вниз/мимо -> крупный добор (+dose_trim_big=10).
+        // ВАЖНО: было (dose_trim_big - 10). При старом dose_trim_big=50 это давало +40, но
+        // сейчас dose_trim_big=10 -> выходило +0: при утечке быстрее -0.05/окно доза НЕ
+        // двигалась вообще (застревала, давление текло вниз). Теперь догоняет крупным шагом.
         else if (toward < reg->dose_dp_slow)    *pos += *calib ? reg->dose_trim     // штатный добор
                                                               : reg->dose_trim_very_big; // разгон с floor: ищем порог потока быстрее
         else if (toward > reg->dose_dp_runaway) *pos -= reg->dose_trim_big; // сильно разогнались
@@ -339,6 +367,117 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
 static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
     reg->dose_t0_us = now_us;
     reg->dose_p0    = reg->filtered_pressure;
+}
+
+// ============================================================================
+//  БЫСТРЫЙ ПОИСК ПОРОГА ПОТОКА (идея 3). Пока доза НАБОРА не калибрована (порог
+//  иглы неизвестен), вместо медленного +dose_trim за 5 с от floor свипуем иглой
+//  вверх по search_step раз в search_step_period_us. Детекция потока — по
+//  нескольким лагам: P_filt поднялось на search_dp_flow над ЛЮБЫМ из чекпойнтов
+//  (кольцо раз в search_hist_dt_us, лаги 0.25..1.0с) -> поток пошёл. Тогда резко в
+//  floor, пауза search_settle_us (давление устаканивается), после паузы доза =
+//  найденная позиция минус search_back (компенсация лага детекции), калибровка
+//  засчитана -> дальше обычные микродозы hold_dose_step. Возвращает позицию иглы.
+// ============================================================================
+static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
+    // --- инициализация на входе в поиск: фаза ПРОГРЕВ ---
+    if (!reg->dose_searching) {
+        reg->dose_searching      = true;
+        reg->search_phase        = 0;                       // 0 = ПРОГРЕВ фильтра
+        // Свип стартуем НЕ с floor, а с подсказки RATE (seed уже лежит в
+        // step_holding_charge = позиция RATE минус dose_step_back). У этой иглы
+        // порог высоко по шагам (~позиция RATE), свип с floor занял бы десятки
+        // секунд; с seed — несколько. Кламп в [floor, valve_max] на всякий.
+        if (reg->step_holding_charge < reg->valve_flow_floor) reg->step_holding_charge = reg->valve_flow_floor;
+        if (reg->step_holding_charge > reg->valve_max)        reg->step_holding_charge = reg->valve_max;
+        reg->search_settle_t0_us = now_us;                  // таймер фазы (тут — прогрев)
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — вход, фаза ПРОГРЕВ (игла в floor, ждём P_filt; свип начнётся с %ld). P_filt=%.2f rate_filt=%.2f",
+                 (long)reg->step_holding_charge, reg->filtered_pressure, reg->filtered_rate);
+    }
+
+    // --- фаза 0 ПРОГРЕВ: после RATE фильтр P_filt ОТСТАЁТ от raw и слюит вверх.
+    //     rate_filt считается по RAW (а raw после закрытия иглы стабилен почти сразу),
+    //     поэтому ждём |rate_filt| мал = «raw стоит», затем ПРИБИВАЕМ P_filt к raw и
+    //     только тогда свипаем. Без прибивки остаточный слю P_filt (rate_filt уже мал,
+    //     а P_filt ещё ползёт — это РАЗНЫЕ EMA) принимается за поток: ловили «поток на
+    //     221», а реально 266. ---
+    if (reg->search_phase == 0) {
+        bool settled = fabsf(reg->filtered_rate) < reg->search_warmup_rate;
+        bool timeout = (now_us - reg->search_settle_t0_us) >= reg->search_warmup_max_us;
+        if (settled || timeout) {
+            reg->filtered_pressure = reg->prev_pressure;    // прибить P_filt к raw: убрать лаг EMA
+            reg->search_phase      = 1;                     // -> СВИП
+            reg->search_step_t0_us = now_us;
+            reg->search_hist_t0_us = now_us;
+            reg->search_hist_idx   = 0;
+            reg->search_hist_count = 0;
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — старт СВИПА с %ld (+%ld за %.2fс, %s). P_filt прибит к raw=%.2f",
+                     (long)reg->step_holding_charge, (long)reg->search_step,
+                     (float)reg->search_step_period_us / 1000000.0f,
+                     settled ? "raw стабилен" : "таймаут прогрева",
+                     reg->filtered_pressure);
+        }
+        return reg->valve_flow_floor;
+    }
+
+    // --- фаза 2 SETTLE: стоим в floor, ждём устаканивания, потом садимся на порог ---
+    if (reg->search_phase == 2) {
+        if (now_us - reg->search_settle_t0_us >= reg->search_settle_us) {
+            int32_t seed = reg->search_found_pos - reg->search_back;
+            if (seed < reg->valve_flow_floor) seed = reg->valve_flow_floor;
+            reg->step_holding_charge    = seed;
+            reg->dose_charge_calibrated = true;     // порог найден делом
+            reg->dose_searching         = false;    // поиск завершён
+            dose_window_reset(reg, now_us);         // дозу мерим с чистого листа
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — завершён: порог %ld -> доза %ld (минус %ld), дальше микродозы",
+                     (long)reg->search_found_pos, (long)seed, (long)reg->search_back);
+            return seed;
+        }
+        return reg->valve_flow_floor;               // ждём в floor
+    }
+
+    // --- фаза 1 СВИП: поток = P_filt поднялось на search_dp_flow над ЛЮБЫМ из
+    //     недавних чекпойнтов (лаги 0.25..1.0с). Проверяем КАЖДЫЙ тик -> реагируем
+    //     почти сразу, без ожидания закрытия одного длинного окна (раньше окно 1с
+    //     давало ΔP=0.27 и перелёт). ---
+    float max_rise = 0.0f;
+    for (int i = 0; i < reg->search_hist_count; i++) {
+        float rise = reg->filtered_pressure - reg->search_hist[i];
+        if (rise > max_rise) max_rise = rise;
+    }
+    if (max_rise >= reg->search_dp_flow) {
+        reg->search_found_pos    = reg->step_holding_charge;
+        reg->search_phase        = 2;                          // -> в floor, пауза
+        reg->search_settle_t0_us = now_us;
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — ПОТОК на игле %ld (P_filt +%.3f над лагом <=%.2fс) -> floor, пауза %.1fс",
+                 (long)reg->search_found_pos, max_rise,
+                 (float)(reg->search_hist_dt_us * SEARCH_HIST_N) / 1000000.0f,
+                 (float)reg->search_settle_us / 1000000.0f);
+        return reg->valve_flow_floor;
+    }
+    // новый чекпойнт раз в search_hist_dt_us (кольцо, глубина SEARCH_HIST_N)
+    if (now_us - reg->search_hist_t0_us >= reg->search_hist_dt_us) {
+        reg->search_hist_t0_us = now_us;
+        reg->search_hist[reg->search_hist_idx] = reg->filtered_pressure;
+        reg->search_hist_idx = (reg->search_hist_idx + 1) % SEARCH_HIST_N;
+        if (reg->search_hist_count < SEARCH_HIST_N) reg->search_hist_count++;
+    }
+
+    // --- свип: приращение иглы раз в период ---
+    if (now_us - reg->search_step_t0_us >= reg->search_step_period_us) {
+        reg->search_step_t0_us    = now_us;
+        reg->step_holding_charge += reg->search_step;
+        if (reg->step_holding_charge >= reg->valve_max) {
+            // дошли до упора без потока -> калибруемся на максимуме (лучшее усилие)
+            reg->step_holding_charge    = reg->valve_max;
+            reg->dose_charge_calibrated = true;
+            reg->dose_searching         = false;
+            dose_window_reset(reg, now_us);
+            ESP_LOGW("PID", "HOLD: ПОИСК ПОРОГА — свип дошёл до valve_max=%ld без потока, калибровка на упоре",
+                     (long)reg->valve_max);
+        }
+    }
+    return reg->step_holding_charge;
 }
 
 // ============================================================================
@@ -431,6 +570,7 @@ static void reset_controllers(PressureRegulator* reg) {
     reg->fine_eq_found = false;   // на новой уставке равновесное открытие другое
     reg->fine_corr_dir = 0;       // недоигранная коррекция к новой уставке не относится
     reg->fine_rate_t0_us = 0;     // сброс трекера fine_change (на новой уставке история не нужна)
+    reg->dose_searching  = false; // начатый поиск порога потока к новой уставке не относится
 }
                                                       //и только потом ждать минимально необходимую скорость (которая должна быть больше чем sensor_noise_delta)
 // ============================================================================
@@ -652,14 +792,20 @@ void pid_regulator_task(void *pvParameters) {
                     reg.step_holding_charge    = reg.valve_flow_floor;
                     reg.dose_charge_calibrated = false;
                 } else {                                       // подходили набором
-                    reg.step_holding_charge    = seed;
-                    reg.dose_charge_calibrated = true;
+                    reg.step_holding_charge    = seed;       // = старт свипа поиска порога (подсказка RATE)
+                    // Доверять seed как готовой дозе нельзя: у этой иглы порог потока
+                    // ~ позиции RATE (RATE до него и доводил), а seed = RATE - dose_step_back
+                    // НИЖЕ порога -> сразу медленная доза +2/5с через мёртвую зону (видели
+                    // 259->59 -> ползёт обратно ~250 с). Поэтому ВСЕГДА запускаем быстрый
+                    // поиск порога (идея 3): он свипнёт от seed вверх и найдёт реальный порог.
+                    reg.dose_charge_calibrated = false;
                     reg.step_holding_vent      = reg.valve_flow_floor;
                     reg.dose_vent_calibrated   = false;
                 }
                 dose_window_reset(&reg, now_us);
                 target_valve = seed;              // серво НЕ трогаем — доводим в текущую сторону
-                ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld, доводим струйкой. P=%.2f",
+                // (набор -> дальше быстрый ПОИСК ПОРОГА от seed; сброс -> доводим струйкой)
+                ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed). P=%.2f",
                          (long)current_valve_position, (long)seed, pressure);
             } else {
                 float desired = desired_rate_from_error(error_filt, reg.sensor_noise_delta * 1.5, 0.15); // знаковая желаемая скорость  // 0.22 и 0.03 для 25мпа // *1.5 взял когда аварийное понижение лонастроил, потому что пофакут скорость нужна по хорошему чтобы побольше чем шум иначе почти не растет (чень долго растет)
@@ -704,12 +850,19 @@ void pid_regulator_task(void *pvParameters) {
                     ESP_LOGW("PID", "FINE: change=%.2f -> правка равновесия %+ld: игла %ld -> запомнено %ld",
                              reg.fine_change, (long)adj, (long)reg.fine_pos, (long)newpos);
                 }
+                // Эпизод НАБОРА (если давление просело) откроет иглу на step_holding_charge —
+                // но это ГРУБАЯ доза, она ВЫШЕ равновесия (дозе надо переливать, чтобы P дошло
+                // до цели), а FINE держался на fine_pos НИЖЕ равновесия (там подтекало). Прыжок
+                // сразу на грубую дозу перелетает (видели 258->274 -> P 1000.14). Садим дозу в
+                // середину между ними — это ~равновесие, эпизод подкачает мягко.
+                if (error_filt > 0.0f)
+                    reg.step_holding_charge = (reg.fine_pos + reg.step_holding_charge) / 2;
                 reg.fine_holding  = false;
                 reg.fine_corr_dir = 0;   // недоигранная коррекция отменяется
                 apply_servo(&reg, SERVO_NEUTRAL);
                 target_valve = reg.valve_flow_floor;
-                ESP_LOGW("PID", "FINE: err_filt=%.2f change=%.2f/5с — выход в обычный HOLD",
-                         error_filt, reg.fine_change);
+                ESP_LOGW("PID", "FINE: err_filt=%.2f change=%.2f/5с — выход в обычный HOLD (доза -> %ld)",
+                         error_filt, reg.fine_change, (long)reg.step_holding_charge);
             } else {
                 int32_t trim = fast ? reg.fine_trim_fast : reg.fine_trim;
                 target_valve = hold_fine_step(&reg, now_us, error_filt, trim);
@@ -738,6 +891,7 @@ void pid_regulator_task(void *pvParameters) {
 
                 case SERVO_CHARGING:
                     if (error_filt <= reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели  // поменял 0 на reg.sensor_noise_delta_filt (0.03) для компенсации перелета. Не уверен что надо именно эту переменную, но в целом как будто она подходит
+                        reg.dose_searching = false;   // цель достигнута — быстрый поиск (если шёл) прекращаем
                         if (reg.hold_fine_enable && reg.dose_charge_calibrated) {
                             // НАБОРОМ вышли на точку и доза проверена делом ->
                             // вместо печати точный холдинг: серво ОСТАЁТСЯ в
@@ -761,6 +915,11 @@ void pid_regulator_task(void *pvParameters) {
                             apply_servo(&reg, SERVO_NEUTRAL);   // печатаем как раньше
                             target_valve = reg.valve_flow_floor;
                         }
+                    } else if (!reg.dose_charge_calibrated) {
+                        // порог потока ещё неизвестен -> быстрый свип к нему (идея 3),
+                        // а не медленный +dose_trim за 5 с через весь мёртвый ход
+                        zone = "SEARCH";
+                        target_valve = hold_search_step(&reg, now_us);
                     } else {
                         target_valve = hold_dose_step(&reg, now_us, true);
                     }
