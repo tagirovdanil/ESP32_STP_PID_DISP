@@ -110,6 +110,7 @@ typedef struct {
     //      фактическому прогрессу давления, без PI ----
     bool     holding;               // true = фаза HOLD (PID выключен до новой уставки)
     float    hold_enter_err;        // |error| <= этого -> RATE выключается, входим в HOLD
+    float    hold_exit_err;         // в HOLD |err_filt| > этого -> назад в RATE качать (гистерезис со hold_enter_err)
     int32_t  dose_step_back;        // вход в HOLD набором: старт свипа поиска порога = позиция RATE минус это
     int32_t  step_holding_charge;   // дозирующее открытие иглы для НАБОРА (живёт между эпизодами)
     int32_t  step_holding_vent;     // то же для СБРОСА (перепад на игле другой — своё значение)
@@ -165,7 +166,14 @@ typedef struct {
     bool     fine_holding;          // true = сейчас точный холдинг: серво стоит в НАБОРЕ,
                                     // игла на равновесном приоткрытии
     int32_t  fine_pos;              // текущее открытие иглы точного холдинга
-    int32_t  fine_seed_back;        // вход БЕЗ найденного равновесия: step_holding_charge минус это
+    int32_t  fine_seed_back;        // ПЕРВЫЙ вход в FINE: step_holding_charge минус это
+    // Переучивание на ПОВТОРНОМ входе: вместо «всегда доза-fine_seed_back» садимся на
+    // ±fine_relearn_step от позиции прошлого выхода по стороне выброса (вниз -> открыть
+    // больше, вверх -> прикрыть). Сходимся к равновесию мелким шагом между эпизодами.
+    int32_t  fine_relearn_step;     // ±шаг переучивания позиции FINE на повторном входе
+    bool     fine_visited;          // были ли уже в FINE этой уставкой (иначе вход = доза - fine_seed_back)
+    int32_t  fine_last_pos;         // позиция FINE на прошлом выходе (база для переучивания)
+    int32_t  fine_seed_adj;         // +-fine_relearn_step: знак по стороне прошлого выброса
     int32_t  fine_trim;             // подстройка открытия за окно (+- по знаку скорости)
     uint64_t fine_period_us;        // окно оценки знака скорости (5 с)
     float    fine_eq_band;          // |dP| за окно МЕНЬШЕ этого = «стоим»: равновесие найдено
