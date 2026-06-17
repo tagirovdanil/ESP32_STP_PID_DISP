@@ -96,32 +96,16 @@ void move_valve_absolute(int32_t target_position, uint32_t speed_us) {
     }
 }
 
-// Генерация N шагов в заданном направлении (с программными концевиками).
-void move_stepper(int steps, int speed_us, bool direction) {
-    gpio_set_level(PIN_DIR, direction);
-    for (int i = 0; i < steps; i++) {
-        if (direction == true  && current_valve_position >= MAX_VALVE_STEPS) break;
-        if (direction == false && current_valve_position <= 0)               break;
-        gpio_set_level(PIN_STEP, 1);
-        esp_rom_delay_us(10);
-        gpio_set_level(PIN_STEP, 0);
-        esp_rom_delay_us(speed_us);
-        if (direction == true) current_valve_position++;
-        else                   current_valve_position--;
-    }
-}
-
 // ============================================================================
 //  ИНИЦИАЛИЗАЦИЯ РЕГУЛЯТОРА
 //  Все коэффициенты ФИКСИРОВАННЫЕ — настраиваются один раз. Значения ниже —
 //  стартовые/безопасные, под конкретное железо их нужно подобрать (см. подсказки).
 // ============================================================================
-void regulator_init(PressureRegulator* reg, float dt) {
+void regulator_init(PressureRegulator* reg) {
     memset(reg, 0, sizeof(*reg));
 
     reg->state           = REG_STATE_IDLE;
     reg->servo_state     = SERVO_NEUTRAL;
-    reg->dt              = dt;
     reg->active_setpoint = 0.0f;
 
     // --- измерение скорости ---
@@ -192,6 +176,12 @@ void regulator_init(PressureRegulator* reg, float dt) {
     reg->dose_trim_big   = 5;    // было 10; «большой» шаг при дрейфе <dose_dp_VERYslow и при разгоне >runaway.
                                  // На 1000 кПа +10 переливал (280->290 -> подскок до 1000.18) -> 5
     reg->dose_trim_very_big   = 10; // было 100, но решил поставить 50, так как на 100 бывает перескакивает     // было 50
+    reg->dose_big_min_err = 0.5f;       // п.1: ближе 0.5 кПа к цели (по СЫРОМУ давлению) big/very_big не применяем
+    // п.2: кольцо лагов мультиоконной проверки HOLD/FINE (как окно поиска порога, но на 5с-масштаб)
+    reg->dose_hist_dt_us = 1250000ULL;  // 1.25 с -> лаги 1.25/2.5/3.75/5.0 с
+    reg->dose_hist_idx   = 0;
+    reg->dose_hist_count = 0;
+    reg->dose_hist_t0_us = 0;
     reg->step_holding_charge = reg->valve_flow_floor;  // безопасный дефолт; засеется при входе в HOLD
     reg->step_holding_vent   = reg->valve_flow_floor;
     reg->dose_charge_calibrated = false; // флаги ставятся при входе в HOLD: направление подхода
@@ -202,7 +192,7 @@ void regulator_init(PressureRegulator* reg, float dt) {
     // Числа: +1 шаг раз в 0.2 с (=5 шаг/с), окно детекции 1 с, поток = ΔP>=0.05
     // кПа за окно, после нахождения откат на 10 (лаг детекции ~ 1шаг*10 за окно),
     // пауза 2 с в floor. Свип медленный для большого мёртвого хода — поднимай
-    // search_step (и search_back пропорционально), если порог высоко по шагам.
+    // search_step, если порог высоко по шагам.
     reg->dose_searching        = false;
     reg->search_phase          = 0;
     reg->search_step_period_us = 200000ULL;   // 0.2 с
@@ -212,15 +202,13 @@ void regulator_init(PressureRegulator* reg, float dt) {
     reg->search_hist_count     = 0;
     reg->search_hist_t0_us     = 0;
     reg->search_dp_flow        = 0.05f;       // P_filt выросло на это над лагом = поток (>шум)
-    reg->search_back           = 20;          // НЕ ИСПОЛЬЗУЕТСЯ (была старая схема floor+пауза+доза-отступ)
     reg->search_warmup_rate    = 0.10f;       // |rate_filt|<0.1 кПа/с = давление устаканилось
     reg->search_warmup_max_us  = 2500000ULL;  // но прогрев не дольше 2.5 с
-    reg->search_settle_us      = 2000000ULL;  // НЕ ИСПОЛЬЗУЕТСЯ (старая пауза в floor); фаза 2 теперь «едем до цели»
-    reg->search_settle_t0_us   = 0;           // переиспользуется как таймер фазы ПРОГРЕВ
+    reg->search_settle_t0_us   = 0;           // таймер фазы ПРОГРЕВ
     reg->search_found_pos      = 0;
     reg->search_target_back    = 1.0f;        // финиш фазы 2 на (цель - 1.0): хвост доводит без перелёта +
                                               // калибровка фиксируется РАНЬШЕ внешней проверки «дошли» (см. .h)
-    reg->search_done_back      = 20;          // после финиша держать иглу на (найденная - 30), а не на самой
+    reg->search_done_back      = 10;          // после финиша держать иглу на (найденная - 10), а не на самой
                                               // флоу-позиции: мягкий добор хвоста без перелёта (0 = на найденной)
 
     // --- ВТОРОЙ (ТОЧНЫЙ) ХОЛДИНГ: равновесное приоткрытие вместо подкачек ---
@@ -231,9 +219,8 @@ void regulator_init(PressureRegulator* reg, float dt) {
     // приток через иглу равен утечке. Окно с |dP| < fine_eq_band = «равновесие»:
     // открытие запоминается в fine_eq_pos, игла стоит на нём БЕЗ подкачек.
     // Если при этом стоим МИМО цели (поиск съел давление: |err_filt| >
-    // fine_corr_err) — ВРЕМЕННАЯ КОРРЕКЦИЯ: игла на fine_corr_step от равновесия
-    // в сторону цели, РОВНО дошли -> обратно на fine_eq_pos (само равновесие не
-    // трогаем). Печатать и докачивать просадку обычным HOLD нельзя: пока объём
+    // fine_corr_err) — само равновесие мягко двигаем на fine_trim в сторону
+    // цели. Печатать и докачивать просадку обычным HOLD нельзя: пока объём
     // запечатан, магистраль успевает измениться и равновесие протухает
     // (проверено: найденные 3393 после докачки уже лили).
     // Выход на точку СБРОСОМ в точный холдинг НЕ ведёт: печатаем, ждём
@@ -248,9 +235,8 @@ void regulator_init(PressureRegulator* reg, float dt) {
     reg->fine_period_us   = 5000000ULL;  // окно оценки знака скорости: 5 с
     reg->fine_eq_band     = 0.01f;       // |dP| за окно меньше этого = «стоим», равновесие найдено
     reg->fine_eq_found    = false;       // сбрасывается на новой уставке (равновесие там другое)
-    reg->fine_corr_step   = 20;          // отступ коррекции от равновесия: видимый поток, но без разгона
     reg->fine_corr_err    = 0.05f;       // мёртвая зона цели; меньше — дёргаемся от шума P_filt (~±0.02)
-    reg->fine_corr_dir    = 0;           // коррекция не активна
+    reg->fine_dev_guard   = 0.05f;       // q2: ниже цели на 0.05+ не прикрываем (−), выше на 0.05+ не приоткрываем (+)
     reg->fine_trim_fast   = 8;           // пока давление ещё активно движется — крупный шаг (вместо fine_trim=2)
     reg->fine_hold_change = 0.5f;        // |ΔP_filt| за ~5 с >= этого = «ещё движусь»: не отдаём в HOLD
     reg->fine_rate_t0_us  = 0;           // 0 -> трекер fine_change сам инициализируется на 1-м тике RUNNING
@@ -332,6 +318,28 @@ static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt
     if (out > (float)reg->valve_max)        out = (float)reg->valve_max;
     return (int32_t)out;
 }
+
+// Добавляет чекпойнт P_filt в кольцо лагов раз в dose_hist_dt_us (п.2). Кольцо
+// общее для дозы (HOLD) и FINE — фазы не пересекаются.
+static void dose_hist_tick(PressureRegulator* reg, uint64_t now_us) {
+    if (now_us - reg->dose_hist_t0_us >= reg->dose_hist_dt_us) {
+        reg->dose_hist_t0_us = now_us;
+        reg->dose_hist[reg->dose_hist_idx] = reg->filtered_pressure;
+        reg->dose_hist_idx = (reg->dose_hist_idx + 1) % DOSE_HIST_N;
+        if (reg->dose_hist_count < DOSE_HIST_N) reg->dose_hist_count++;
+    }
+}
+
+// Сброс окна проверки дозы (на входе в HOLD и на старте каждого эпизода), чтобы
+// прогресс мерился от начала текущего эпизода, а не от прошлого. Заодно чистит
+// кольцо лагов (п.2): после смены фазы / защитного залпа лаги считаем заново.
+static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
+    reg->dose_t0_us = now_us;
+    reg->dose_p0    = reg->filtered_pressure;
+    reg->dose_hist_count = 0;
+    reg->dose_hist_idx   = 0;
+    reg->dose_hist_t0_us = now_us;
+}
 //
 // ============================================================================
 //  МИКРОДОЗЫ В HOLD: игла стоит на фиксированном открытии step_holding_*; раз в
@@ -339,10 +347,50 @@ static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt
 //  подстраиваем открытие (+trim / -trim / -trim_big). Никакого dP/dt — только
 //  само давление за 5 с, его видно сквозь шум. Возвращает позицию иглы на тик.
 // ============================================================================
-static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool charging) {
+static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool charging, float pressure_raw) {
     int32_t* pos   = charging ? &reg->step_holding_charge    : &reg->step_holding_vent;
     bool*    calib = charging ? &reg->dose_charge_calibrated : &reg->dose_vent_calibrated;
 
+    // п.1: близко к цели (по СЫРОМУ давлению) крупный шаг переливает -> big/very_big
+    // заменяем обычным dose_trim. Далеко от цели — штатные крупные шаги.
+    bool    far      = fabsf(reg->active_setpoint - pressure_raw) >= reg->dose_big_min_err;
+    int32_t big      = far ? reg->dose_trim_big      : reg->dose_trim;
+    int32_t very_big = far ? reg->dose_trim_very_big : reg->dose_trim;
+
+    // п.2: кольцо чекпойнтов P_filt -> лаги 1.25..5с (статичные пороги, как в поиске).
+    dose_hist_tick(reg, now_us);
+
+    // --- ЗАЩИТНЫЕ направления — по ЛЮБОМУ лагу СРАЗУ (не ждём 5с) ---
+    //   разгон     (прогресс к цели за какой-то лаг > runaway)  -> прикрыть big
+    //   утечка/мимо (прогресс за какой-то лаг < VERYslow)        -> открыть big/very_big
+    // Короткий лаг ловит резкий выброс, длинный — пологий (как search_dp_flow).
+    // После залпа сбрасываем окно+кольцо -> ждём отклик, без повторного выстрела.
+    if (reg->dose_hist_count > 0) {
+        float toward_max = -1e9f, toward_min = 1e9f;
+        for (int i = 0; i < reg->dose_hist_count; i++) {
+            float toward_i = charging ? (reg->filtered_pressure - reg->dose_hist[i])
+                                      : (reg->dose_hist[i] - reg->filtered_pressure);
+            if (toward_i > toward_max) toward_max = toward_i;
+            if (toward_i < toward_min) toward_min = toward_i;
+        }
+        int32_t old = *pos;
+        bool fired = true;
+        if      (toward_max > reg->dose_dp_runaway)  *pos -= big;                     // где-то разогнались
+        else if (toward_min < reg->dose_dp_VERYslow) *pos += *calib ? big : very_big; // где-то течёт/мимо
+        else                                         fired = false;
+        if (fired) {
+            if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
+            if (*pos > reg->valve_max)        *pos = reg->valve_max;
+            if (*pos != old)
+                ESP_LOGI("PID", "HOLD: доза %s ЗАЩИТА %ld -> %ld (toward_max=%+.3f toward_min=%+.3f по лагам<=%.2fс)",
+                         charging ? "НАБОР" : "СБРОС", (long)old, (long)*pos, toward_max, toward_min,
+                         (float)(reg->dose_hist_dt_us * DOSE_HIST_N) / 1000000.0f);
+            dose_window_reset(reg, now_us);
+            return *pos;
+        }
+    }
+
+    // --- ОСНОВНОЕ ОКНО 5с (длинный лаг): «медленно / хорошо / чуть быстро» ---
     if (now_us - reg->dose_t0_us >= reg->dose_period_us) {
         float dp     = reg->filtered_pressure - reg->dose_p0;  // изменение давления за окно
         float toward = charging ? dp : -dp;                    // прогресс в сторону цели
@@ -356,14 +404,11 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
                      charging ? "НАБОР" : "СБРОС", (long)*pos, toward);
         }
 
-        if      (toward < reg->dose_dp_VERYslow)    *pos += *calib ? reg->dose_trim_big : reg->dose_trim_very_big;     // явно вниз/мимо -> крупный добор (+dose_trim_big=10).
-        // ВАЖНО: было (dose_trim_big - 10). При старом dose_trim_big=50 это давало +40, но
-        // сейчас dose_trim_big=10 -> выходило +0: при утечке быстрее -0.05/окно доза НЕ
-        // двигалась вообще (застревала, давление текло вниз). Теперь догоняет крупным шагом.
-        else if (toward < reg->dose_dp_slow)    *pos += *calib ? reg->dose_trim     // штатный добор
-                                                              : reg->dose_trim_very_big; // разгон с floor: ищем порог потока быстрее
-        else if (toward > reg->dose_dp_runaway) *pos -= reg->dose_trim_big; // сильно разогнались
-        else if (toward > reg->dose_dp_fast)    *pos -= reg->dose_trim;     // чуть быстрее нужного
+        if      (toward < reg->dose_dp_VERYslow) *pos += *calib ? big : very_big;  // явно вниз/мимо (резерв длинного окна)
+        else if (toward < reg->dose_dp_slow)     *pos += *calib ? reg->dose_trim   // штатный добор
+                                                               : very_big;         // разгон с floor: ищем порог потока быстрее
+        else if (toward > reg->dose_dp_runaway)  *pos -= big;                      // сильно разогнались (резерв длинного окна)
+        else if (toward > reg->dose_dp_fast)     *pos -= reg->dose_trim;           // чуть быстрее нужного
         if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
         if (*pos > reg->valve_max)        *pos = reg->valve_max;
         if (*pos != old)
@@ -376,13 +421,6 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
     return *pos;
 }
 
-// Сброс окна проверки дозы (на входе в HOLD и на старте каждого эпизода),
-// чтобы прогресс мерился от начала текущего эпизода, а не от прошлого.
-static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
-    reg->dose_t0_us = now_us;
-    reg->dose_p0    = reg->filtered_pressure;
-}
-
 // ============================================================================
 //  БЫСТРЫЙ ПОИСК ПОРОГА ПОТОКА (идея 3). Пока доза НАБОРА не калибрована (порог
 //  иглы неизвестен), вместо медленного +dose_trim за 5 с от floor свипуем иглой
@@ -390,8 +428,7 @@ static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
 //  нескольким лагам: P_filt поднялось на search_dp_flow над ЛЮБЫМ из чекпойнтов
 //  (кольцо раз в search_hist_dt_us, лаги 0.25..1.0с) -> поток пошёл. Тогда иглу НЕ
 //  роняем в floor, а ДЕРЖИМ на найденной позиции и едем вверх до цели; дошли ->
-//  калибровка засчитана, в дозу/удержание с этой же позиции. (search_back и
-//  search_settle_us от старой версии «floor+пауза+доза-отступ» больше не нужны.)
+//  калибровка засчитана, в дозу/удержание с этой же позиции.
 //  Возвращает позицию иглы.
 // ============================================================================
 static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
@@ -517,6 +554,18 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
     return reg->step_holding_charge;
 }
 
+// q2. FINE: дрейф-шаг иглы с защитой «не толкать прочь от цели». Падает (drift<0)
+// -> приоткрыть (+trim), растёт -> прикрыть (−trim). НО если давление уже ниже цели
+// на fine_dev_guard и больше — НЕ прикрываем; если выше на столько же — НЕ
+// приоткрываем (естественный дрейф К цели не глушим). error_filt = цель − P_filt
+// (>0 = ниже цели). Возвращает фактический сдвиг: +trim / −trim / 0 (подавлено).
+static int32_t fine_drift_step(PressureRegulator* reg, float drift, float error_filt, int32_t trim) {
+    int32_t step = (drift < 0.0f) ? trim : -trim;
+    if (step < 0 && error_filt >=  reg->fine_dev_guard) step = 0;  // ниже цели -> не прикрываем
+    if (step > 0 && error_filt <= -reg->fine_dev_guard) step = 0;  // выше цели -> не приоткрываем
+    return step;
+}
+
 // ============================================================================
 //  ТОЧНЫЙ ХОЛДИНГ: серво постоянно в НАБОРЕ, игла стоит на равновесном
 //  приоткрытии (приток компенсирует утечку). Раз в fine_period_us смотрим, куда
@@ -524,30 +573,47 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
 //  ПРОТИВ знака: росло -> прикрыть, падало -> приоткрыть. dP за окно — это та же
 //  средняя скорость, только сквозь шум её видно (мгновенная dP/dt у цели тонет).
 //  Окно с |dP| < fine_eq_band = «стоим»: открытие запоминается в fine_eq_pos.
-//  Стоим, но МИМО цели (|err_filt| > fine_corr_err) — ВРЕМЕННАЯ КОРРЕКЦИЯ:
-//  игла на fine_corr_step от равновесия в сторону цели, окна замораживаются;
-//  err_filt пересёк ноль (РОВНО дошли) — игла обратно на fine_eq_pos, окно с
-//  чистого листа. Равновесие коррекция не трогает — это «подтолкнуть и
-//  вернуться». Докачивать просадку печатью/обычным HOLD нельзя: пока объём
+//  Стоим, но МИМО цели (|err_filt| > fine_corr_err) — само равновесие мягко
+//  двигаем на fine_trim в сторону цели (P ниже -> приоткрыть, выше -> прикрыть).
+//  Докачивать просадку печатью/обычным HOLD нельзя: пока объём
 //  запечатан, магистраль меняется и равновесие протухает.
 //  Окно переиспользует dose_t0_us/dose_p0 — с эпизодами оно не пересекается.
 // ============================================================================
 bool first_in_fine = false;
 static int32_t hold_fine_step(PressureRegulator* reg, uint64_t now_us, float error_filt, int32_t trim) {
-    // --- активная коррекция: окна заморожены, каждый тик ждём ровного прихода ---
-    if (reg->fine_corr_dir != 0) {
-        bool reached = (reg->fine_corr_dir > 0) ? (error_filt <= 0.0f)
-                                                : (error_filt >= 0.0f);
-        if (reached) {
-            ESP_LOGI("PID", "FINE: коррекция дошла (err_filt=%+.2f) — игла %ld обратно на равновесие %ld",
-                     error_filt, (long)reg->fine_pos, (long)reg->fine_eq_pos);
-            reg->fine_corr_dir = 0;
-            reg->fine_pos      = reg->fine_eq_pos;
-            dose_window_reset(reg, now_us);
+    // п.2: то же кольцо лагов, что и в дозе (FINE и HOLD-доза не пересекаются).
+    dose_hist_tick(reg, now_us);
+
+    // --- ДРЕЙФ — по ЛЮБОМУ лагу СРАЗУ (не ждём 5с): берём лаг с макс. |dP|;
+    //     |dP| >= fine_eq_band (статичный порог) -> корректируем приоткрытие.
+    //     Падает -> приоткрыть, растёт -> прикрыть. После шага сброс окна+кольца.
+    //     «Стоим/равновесие» (тихо на всех лагах целое окно) уходит в 5с-ветку ниже.
+    if (reg->dose_hist_count > 0) {
+        float drift = 0.0f;                                   // знаковый dP лага с макс. |dP|
+        for (int i = 0; i < reg->dose_hist_count; i++) {
+            float dp_i = reg->filtered_pressure - reg->dose_hist[i];
+            if (fabsf(dp_i) > fabsf(drift)) drift = dp_i;
         }
-        return reg->fine_pos;
+        if (fabsf(drift) >= reg->fine_eq_band) {
+            int32_t step = fine_drift_step(reg, drift, error_filt, trim);  // q2: дрейф со «стоп прочь от цели»
+            if (step != 0) {
+                int32_t old = reg->fine_pos;
+                reg->fine_pos += step;
+                if (reg->fine_pos < reg->valve_flow_floor) reg->fine_pos = reg->valve_flow_floor;
+                if (reg->fine_pos > reg->valve_max)        reg->fine_pos = reg->valve_max;
+                if (reg->fine_pos != old)
+                    ESP_LOGI("PID", "FINE: дрейф %ld -> %ld (dP=%+.3f по лагу<=%.2fс, шаг %+ld)",
+                             (long)old, (long)reg->fine_pos, drift,
+                             (float)(reg->dose_hist_dt_us * DOSE_HIST_N) / 1000000.0f, (long)step);
+                dose_window_reset(reg, now_us);
+                return reg->fine_pos;
+            }
+            // step==0: дрейф ведёт К цели -> не толкаем прочь, держим иглу, даём
+            // давлению дойти само. Окно/кольцо НЕ сбрасываем -> идём в 5с-ветку ниже.
+        }
     }
 
+    // --- ОСНОВНОЕ ОКНО 5с (длинный лаг): равновесие / стоим мимо цели ---
     if (now_us - reg->dose_t0_us >= reg->fine_period_us) {
         float dp = reg->filtered_pressure - reg->dose_p0;   // знак = знак средней dP/dt за окно
         int32_t old = reg->fine_pos;
@@ -562,8 +628,8 @@ static int32_t hold_fine_step(PressureRegulator* reg, uint64_t now_us, float err
             }
             if (fabsf(error_filt) > reg->fine_corr_err) {
                 // Стоим (приток=утечка), но равновесие НЕ на цели -> МЯГКО сдвигаем его
-                // к цели на fine_trim. Раньше тут был рывок +fine_corr_step(20) "до цели
-                // и обратно": при 1000 кПа это перелив 273->293 -> подскок до 1000.26 и
+                // к цели на fine_trim. Раньше тут был рывок до цели и обратно (на 20
+                // шагов): при 1000 кПа это перелив 273->293 -> подскок до 1000.26 и
                 // срыв в СБРОС (см. лог). И возврат на то же равновесие = снова просадка
                 // (цикл). Маленький сдвиг равновесия не перебрасывает и реально центрирует.
                 if (error_filt > 0.0f) reg->fine_pos += reg->fine_trim;  // P ниже цели -> приоткрыть
@@ -578,8 +644,7 @@ static int32_t hold_fine_step(PressureRegulator* reg, uint64_t now_us, float err
                          (long)reg->fine_pos, dp);
             }
         } else {
-            if (dp < 0.0f) reg->fine_pos += trim;   // давление падает -> приоткрыть
-            else           reg->fine_pos -= trim;   // растёт -> прикрыть
+            reg->fine_pos += fine_drift_step(reg, dp, error_filt, trim);  // q2: дрейф со «стоп прочь от цели»
             if (reg->fine_pos < reg->valve_flow_floor) reg->fine_pos = reg->valve_flow_floor;
             if (reg->fine_pos > reg->valve_max)        reg->fine_pos = reg->valve_max;
             if (reg->fine_pos != old)
@@ -611,7 +676,6 @@ static void reset_controllers(PressureRegulator* reg) {
     reg->holding       = false;
     reg->fine_holding  = false;
     reg->fine_eq_found = false;   // на новой уставке равновесное открытие другое
-    reg->fine_corr_dir = 0;       // недоигранная коррекция к новой уставке не относится
     reg->fine_rate_t0_us = 0;     // сброс трекера fine_change (на новой уставке история не нужна)
     reg->dose_searching  = false; // начатый поиск порога потока к новой уставке не относится
     reg->fine_visited    = false; // переучивание FINE (±5 от прошлой позиции) — на новой уставке с чистого листа
@@ -624,7 +688,7 @@ static void reset_controllers(PressureRegulator* reg) {
 uint64_t fix_time_for_delay = 0;
 void pid_regulator_task(void *pvParameters) {
     PressureRegulator reg;
-    regulator_init(&reg, 0.02f);
+    regulator_init(&reg);
 
     reg.prev_pressure     = pressure1_kPa;
     reg.filtered_pressure = pressure1_kPa;   // стартуем фильтр с текущего давления, а не с 0
@@ -642,7 +706,6 @@ void pid_regulator_task(void *pvParameters) {
         last_us = now_us;
         if (dt < 0.005f) dt = 0.005f;   // защита от слишком малого/большого dt
         if (dt > 0.1f)   dt = 0.1f;
-        reg.dt = dt;
 
         // -------- 1. Обработка внешних запросов (idle/abort, homing) --------
         RegulatorState req = requested_reg_state;
@@ -790,10 +853,9 @@ void pid_regulator_task(void *pvParameters) {
         //         step_holding_charge - fine_seed_back, раз в fine_period_us
         //         +-fine_trim по знаку сползания давления. Окно с |dP| <
         //         fine_eq_band = равновесие: открытие запоминается, игла стоит
-        //         на нём без подкачек; стоим мимо цели — временная коррекция
-        //         +-fine_corr_step от равновесия до ровного прихода на цель и
-        //         обратно (hold_fine_step). Увод за hold_enter_err -> обратно
-        //         в HOLD (эпизоды).
+        //         на нём без подкачек; стоим мимо цели — само равновесие мягко
+        //         двигаем на fine_trim в сторону цели (hold_fine_step). Увод за
+        //         hold_enter_err -> обратно в HOLD (эпизоды).
         // -------- Трекер «насколько P_filt ушло за последние ~5 с» (гейт FINE->HOLD) --------
         // Два чекпойнта по fine_period_us/2: сравниваем текущее P_filt с отсчётами
         // 2.5..5 с назад, берём больший сдвиг. По нему фаза FINE решает, давление
@@ -829,7 +891,6 @@ void pid_regulator_task(void *pvParameters) {
             reg.dose_searching         = false;
             reg.dose_charge_calibrated = false;
             reg.dose_vent_calibrated   = false;
-            reg.fine_corr_dir          = 0;
             reg.fine_visited           = false;  // большой выброс — переучивание FINE начинаем заново
             reg.rate_integral          = 0.0f;   // чистый старт контура скорости
         }
@@ -929,7 +990,6 @@ void pid_regulator_task(void *pvParameters) {
                 if (error_filt > 0.0f)
                     reg.step_holding_charge = (reg.fine_pos + reg.step_holding_charge) / 2;
                 reg.fine_holding  = false;
-                reg.fine_corr_dir = 0;   // недоигранная коррекция отменяется
                 apply_servo(&reg, SERVO_NEUTRAL);
                 target_valve = reg.valve_flow_floor;
                 ESP_LOGW("PID", "FINE: err_filt=%.2f change=%.2f/5с — выход в обычный HOLD (доза -> %ld)",
@@ -972,7 +1032,6 @@ void pid_regulator_task(void *pvParameters) {
                             // на него; если нет — чуть ниже дозы и ищем
                             // (+-fine_trim раз в окно по знаку скорости).
                             reg.fine_holding  = true;
-                            reg.fine_corr_dir = 0;
                             if (reg.fine_visited) {
                                 // уже были в FINE этой уставкой -> ±fine_relearn_step от
                                 // последней позиции по стороне прошлого выброса (учимся)
@@ -1007,7 +1066,7 @@ void pid_regulator_task(void *pvParameters) {
                         zone = "SEARCH";
                         target_valve = hold_search_step(&reg, now_us);
                     } else {
-                        target_valve = hold_dose_step(&reg, now_us, true);
+                        target_valve = hold_dose_step(&reg, now_us, true, pressure);
                     }
                     break;
 
@@ -1016,7 +1075,7 @@ void pid_regulator_task(void *pvParameters) {
                         apply_servo(&reg, SERVO_NEUTRAL);
                         target_valve = reg.valve_flow_floor;
                     } else {
-                        target_valve = hold_dose_step(&reg, now_us, false);
+                        target_valve = hold_dose_step(&reg, now_us, false, pressure);
                     }
                     break;
             }

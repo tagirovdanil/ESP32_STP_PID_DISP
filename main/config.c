@@ -14,7 +14,6 @@
 #include "pressure_regulator.h"
 #include "config.h" 
 
-//static const char *TAG = "control_APP";
 // Инициализация аппаратного ШИМ для Серво //
 
 volatile float setpoint_kPa = 0;
@@ -56,10 +55,6 @@ volatile int32_t current_valve_position = 0;
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&alarm_conf);
-
-  
-    // Сбрасываем возможные старые ошибки драйвера при включении питания
-    //reset_motor_driver();
 
     // ВЫЗЫВАЕМ КАЛИБРОВКУ ХОМИНГА (Мотор плавно и честно найдет физический ноль своими импульсами)
     calibrate_valve_home();
@@ -114,8 +109,7 @@ volatile int32_t current_valve_position = 0;
         
         // В системе честная атмосфера. Вызываем калибровку нуля датчика
         ESP_LOGI("PURGE", "Атмосфера достигнута. Запуск аппаратного нуля датчика...");
-        //performAdvancedZeroCalibration(0.0f, 1);
-        vTaskDelay(pdMS_TO_TICKS(200)); 
+        vTaskDelay(pdMS_TO_TICKS(200));
 
         // ВОЗВРАТ ИГЛЫ ОБРАТНО В ПОЛОЖЕНИЕ АБСОЛЮТНОГО НУЛЯ "0"!
         ESP_LOGI("PURGE", "Возврат иглы обратно в положение абсолютного нуля (0 шагов)...");
@@ -148,8 +142,7 @@ volatile int32_t current_valve_position = 0;
     else {
         ESP_LOGI("PURGE", "В системе чисто. Профилактическое обнуление сенсора...");
         vTaskDelay(pdMS_TO_TICKS(500));
-        //performAdvancedZeroCalibration(0.0f, 1); //пока не надо
-        
+
         current_valve_position = 0;
     }
    
@@ -261,8 +254,6 @@ void calibrate_valve_home(void) {
     current_valve_position = 0; 
     is_calibrating = false; // Возвращаем управление экраном основному циклу main.c
     ESP_LOGI("HOMING", "Абсолютный ноль успешно установлен.");
-    // Очищаем экран черным (или WHITE, смотря какой у вас фон)
-    //lcdFillScreen(&dev, BLACK); 
 }
 
 void init_servo(void) {

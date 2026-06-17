@@ -12,10 +12,6 @@
 #include "pressure_regulator.h"
 
 static const char *TAG = "SENSOR_MODULE";
-// Служебные переменные для расчета кПа/сек
-//static float previous_pressure = 0.0f;
-//static bool nyrok_done = false; // Флаг, что один нырок в атмосферу при перелете выполнен
-
 
 esp_timer_handle_t pressure_timer;
 
@@ -23,7 +19,6 @@ uint8_t rxBuffer1[12];
 uint8_t rxIndex1 = 0;
 bool frameStarted1 = false;
 uint32_t sum_err = 0;
-uint32_t lastPressureTime = 0;
 extern TaskHandle_t display_task_handle;
 
 extern void usb_uart_rx_task(void *pvParameters); 
@@ -135,7 +130,7 @@ void IRAM_ATTR timerCallback(void *arg) {
     uart_write_bytes(SENSOR_UART_NUM, (const char*)prCmd1, sizeof(prCmd1));
 }
 // Обработчик ответа от датчика на команду калибровки/измерения
-static void handlePressureResponse1(uint8_t *frame, uint8_t length);
+static void handlePressureResponse1(uint8_t *frame);
 
 // Обработчик успешно принятого и проверенного UART кадра
 static void handleUART1ReceivedFrame(uint8_t *frame, uint8_t length);
@@ -351,7 +346,7 @@ bool SetRange(uint8_t rangeByte, uart_port_t uart_num)
 }
 
 // Приватный обработчик ответа (обязательно пишется static)
-static void handlePressureResponse1(uint8_t *frame, uint8_t length) {
+static void handlePressureResponse1(uint8_t *frame) {
     union { uint8_t bytes[4]; float value; } fval;
     fval.bytes[0] = frame[10]; fval.bytes[1] = frame[9];
     fval.bytes[2] = frame[8];  fval.bytes[3] = frame[7];
@@ -365,7 +360,6 @@ static void handlePressureResponse1(uint8_t *frame, uint8_t length) {
     }
 
     pressure1_kPa = fval.value;
-    lastPressureTime = esp_timer_get_time() / 1000;
 }
 
 // Приватный обработчик кадра (обязательно пишется static)
@@ -394,7 +388,7 @@ static void handleUART1ReceivedFrame(uint8_t *frame, uint8_t length) {
                      frame[3], frame[5]);
             return;
         }
-        handlePressureResponse1(frame, 12);
+        handlePressureResponse1(frame);
     }
     // Анализ заголовков, CRC и вызов handlePressureResponse1
 }
@@ -421,9 +415,6 @@ static void processIncomingData(void) {
         }
     }
 }
-
-// Перед самой функцией нужно объявить таску, чтобы xTaskCreate понимал, что это такое
-extern void usb_uart_rx_task(void *pvParameters); 
 
 void pressure_ui_and_usb_init(TFT_t *p_dev) {
 
