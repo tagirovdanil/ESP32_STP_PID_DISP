@@ -80,6 +80,15 @@ static void handle_command(char *str) {
         return;
     }
 
+    // Команда "leak" — одноразовый тест утечки: накачать объём (серво НАБОР + игла
+    // настежь), запечатать, измерить падение давления за 5 с (скорость утечки),
+    // затем стравить всё. Выполняется в задаче регулятора (REG_STATE_LEAK).
+    if (strstr(str, "leak") || strstr(str, "LEAK")) {
+        regulator_request_state(REG_STATE_LEAK);
+        respond("\r\n>> Leak test started\r\n");
+        return;
+    }
+
     // Команда "home" – принудительный сброс давления
     if (strstr(str, "home") || strstr(str, "HOME")) {
         calibrate_valve_home();

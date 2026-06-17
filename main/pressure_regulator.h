@@ -73,12 +73,13 @@ typedef enum {
     SERVO_VENTING    // 0 град — стравливаем
 } ServoState;
 
-// Состояния автомата регулятора. Снаружи используется только REG_STATE_IDLE.
+// Состояния автомата регулятора. Снаружи запрашиваются REG_STATE_IDLE и REG_STATE_LEAK.
 typedef enum {
     REG_STATE_NONE = 0, // «нет запроса» — служебное значение для requested_reg_state
     REG_STATE_IDLE,     // ничего не делаем, серво в нейтрали, игла закрыта
     REG_STATE_HOMING,   // принудительный физический сброс давления
-    REG_STATE_RUNNING   // активное регулирование (внутри: дальняя/тонкая зона)
+    REG_STATE_RUNNING,  // активное регулирование (внутри: дальняя/тонкая зона)
+    REG_STATE_LEAK      // одноразовый тест утечки (накачать, запечатать, измерить, стравить)
 } RegulatorState;
 
 typedef struct {

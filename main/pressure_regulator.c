@@ -161,11 +161,11 @@ void regulator_init(PressureRegulator* reg) {
     reg->hold_enter_err  = 0.8f;        // |error| <= этого -> PID выключается, дальше HOLD-струйка
     reg->hold_exit_err   = 5.0f;        // в HOLD |err_filt| больше -> микродозой не вытянуть, назад в RATE качать.
                                         // >>hold_enter_err: гистерезис, чтоб не дёргалось RATE<->HOLD у цели
-    reg->dose_step_back  = 30;          // вход в HOLD набором: СТАРТ СВИПА поиска = позиция RATE минус это
+    reg->dose_step_back  = 30;          // вход в HOLD набором: СТАРТ ПЕРЕБОРА поиска = позиция RATE минус это
                                         // (было 60; на высоком давлении порог ВЫШЕ позиции RATE, отступ вниз
-                                        //  только удлинял свип -> 30. Прогрев в floor страхует от перелёта)
+                                        //  только удлинял перебор -> 30. Подгон в floor страхует от перелёта)
                                         // (было 200 для старой иглы; у новой порог ~позиции RATE, нужен
-                                        //  малый отступ — свип стартует чуть ниже порога и быстро доходит)
+                                        //  малый отступ — перебор стартует чуть ниже порога и быстро доходит)
     reg->dose_period_us  = 5000000ULL;  // окно проверки прогресса дозы: 5 с
     reg->dose_dp_slow    = 0.05f;       // кПа за окно
     reg->dose_dp_VERYslow    = -0.04f;  // прогресс хуже этого (явная утечка/мимо за окно) -> крупный добор
@@ -188,10 +188,10 @@ void regulator_init(PressureRegulator* reg) {
     reg->dose_vent_calibrated   = false; // калибровано, противоположное разгоняется с floor по +trim_big
 
     // --- БЫСТРЫЙ ПОИСК ПОРОГА ПОТОКА (идея 3) ---
-    // Свип иглой вверх до первого потока вместо медленного +dose_trim за 5 с.
+    // Перебор иглой вверх до первого потока вместо медленного +dose_trim за 5 с.
     // Числа: +1 шаг раз в 0.2 с (=5 шаг/с), окно детекции 1 с, поток = ΔP>=0.05
     // кПа за окно, после нахождения откат на 10 (лаг детекции ~ 1шаг*10 за окно),
-    // пауза 2 с в floor. Свип медленный для большого мёртвого хода — поднимай
+    // пауза 2 с в floor. Перебор медленный для большого мёртвого хода — поднимай
     // search_step, если порог высоко по шагам.
     reg->dose_searching        = false;
     reg->search_phase          = 0;
@@ -203,8 +203,8 @@ void regulator_init(PressureRegulator* reg) {
     reg->search_hist_t0_us     = 0;
     reg->search_dp_flow        = 0.05f;       // P_filt выросло на это над лагом = поток (>шум)
     reg->search_warmup_rate    = 0.10f;       // |rate_filt|<0.1 кПа/с = давление устаканилось
-    reg->search_warmup_max_us  = 2500000ULL;  // но прогрев не дольше 2.5 с
-    reg->search_settle_t0_us   = 0;           // таймер фазы ПРОГРЕВ
+    reg->search_warmup_max_us  = 2500000ULL;  // но подгон не дольше 2.5 с
+    reg->search_settle_t0_us   = 0;           // таймер фазы Подгон
     reg->search_found_pos      = 0;
     reg->search_target_back    = 1.0f;        // финиш фазы 2 на (цель - 1.0): хвост доводит без перелёта +
                                               // калибровка фиксируется РАНЬШЕ внешней проверки «дошли» (см. .h)
@@ -428,7 +428,7 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
 
 // ============================================================================
 //  БЫСТРЫЙ ПОИСК ПОРОГА ПОТОКА (идея 3). Пока доза НАБОРА не калибрована (порог
-//  иглы неизвестен), вместо медленного +dose_trim за 5 с от floor свипуем иглой
+//  иглы неизвестен), вместо медленного +dose_trim за 5 с от floor перебираем иглой
 //  вверх по search_step раз в search_step_period_us. Детекция потока — по
 //  нескольким лагам: P_filt поднялось на search_dp_flow над ЛЮБЫМ из чекпойнтов
 //  (кольцо раз в search_hist_dt_us, лаги 0.25..1.0с) -> поток пошёл. Тогда иглу НЕ
@@ -437,25 +437,25 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
 //  Возвращает позицию иглы.
 // ============================================================================
 static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
-    // --- инициализация на входе в поиск: фаза ПРОГРЕВ ---
+    // --- инициализация на входе в поиск: фаза Подгон ---
     if (!reg->dose_searching) {
         reg->dose_searching      = true;
-        reg->search_phase        = 0;                       // 0 = ПРОГРЕВ фильтра
-        // Свип стартуем НЕ с floor, а с подсказки RATE (seed уже лежит в
+        reg->search_phase        = 0;                       // 0 = Подгон фильтра
+        // Перебор стартуем НЕ с floor, а с подсказки RATE (seed уже лежит в
         // step_holding_charge = позиция RATE минус dose_step_back). У этой иглы
-        // порог высоко по шагам (~позиция RATE), свип с floor занял бы десятки
+        // порог высоко по шагам (~позиция RATE), перебор с floor занял бы десятки
         // секунд; с seed — несколько. Кламп в [floor, valve_max] на всякий.
         if (reg->step_holding_charge < reg->valve_flow_floor) reg->step_holding_charge = reg->valve_flow_floor;
         if (reg->step_holding_charge > reg->valve_max)        reg->step_holding_charge = reg->valve_max;
-        reg->search_settle_t0_us = now_us;                  // таймер фазы (тут — прогрев)
-        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — вход, фаза ПРОГРЕВ (игла в floor, ждём P_filt; свип начнётся с %ld). P_filt=%.2f rate_filt=%.2f",
+        reg->search_settle_t0_us = now_us;                  // таймер фазы (тут — Подгон)
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — вход, фаза ПОДГОНА УГЛА (игла в floor, ждём P_filt; перебор начнётся с %ld). P_filt=%.2f rate_filt=%.2f",
                  (long)reg->step_holding_charge, reg->filtered_pressure, reg->filtered_rate);
     }
 
-    // --- фаза 0 ПРОГРЕВ: после RATE фильтр P_filt ОТСТАЁТ от raw и слюит вверх.
+    // --- фаза 0 Подгон: после RATE фильтр P_filt ОТСТАЁТ от raw и слюит вверх.
     //     rate_filt считается по RAW (а raw после закрытия иглы стабилен почти сразу),
     //     поэтому ждём |rate_filt| мал = «raw стоит», затем ПРИБИВАЕМ P_filt к raw и
-    //     только тогда свипаем. Без прибивки остаточный слю P_filt (rate_filt уже мал,
+    //     только тогда перебираем. Без прибивки остаточный слю P_filt (rate_filt уже мал,
     //     а P_filt ещё ползёт — это РАЗНЫЕ EMA) принимается за поток: ловили «поток на
     //     221», а реально 266. ---
     if (reg->search_phase == 0) {
@@ -463,16 +463,21 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
         bool timeout = (now_us - reg->search_settle_t0_us) >= reg->search_warmup_max_us;
         if (settled || timeout) {
             reg->filtered_pressure = reg->prev_pressure;    // прибить P_filt к raw: убрать лаг EMA
-            reg->search_phase      = 1;                     // -> СВИП
+            reg->search_phase      = 1;                     // -> ПЕРЕБОР
             reg->search_step_t0_us = now_us;
             reg->search_hist_t0_us = now_us;
             reg->search_hist_idx   = 0;
             reg->search_hist_count = 0;
-            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — старт СВИПА с %ld (+%ld за %.2fс, %s). P_filt прибит к raw=%.2f",
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — старт ПЕРЕБОРА с %ld (+%ld за %.2fс, %s). P_filt прибит к raw=%.2f",
                      (long)reg->step_holding_charge, (long)reg->search_step,
                      (float)reg->search_step_period_us / 1000000.0f,
-                     settled ? "raw стабилен" : "таймаут прогрева",
+                     settled ? "raw стабилен" : "таймаут подгона",
                      reg->filtered_pressure);
+            // В самом начале перебора давление падает (скорость отрицательная) ->
+            // запечатанный объём травит мимо иглы. Кричим капсом для диагностики.
+            if (reg->filtered_rate < 0.0f)
+                ESP_LOGW("PID", "УТЕЧКА: СКОРОСТЬ: %.3f кПа/с ШАГ: %ld",
+                         reg->filtered_rate, (long)reg->step_holding_charge);
         }
         return reg->valve_flow_floor;
     }
@@ -486,7 +491,7 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
         if (err_filt <= reg->search_target_back ) {          // доехали почти до цели (цель - search_target_back):
                                                             // остаток доведёт хвост давления, а калибровка
                                                             // фиксируется ЗДЕСЬ — раньше внешней проверки точной
-                                                            // цели в SERVO_CHARGING (иначе свип повторится)
+                                                            // цели в SERVO_CHARGING (иначе перебор повторится)
             // Держим НЕ на самой флоу-позиции (там поток активен, хвоста search_target_back
             // хватает с перелётом), а на search_done_back шагов НИЖЕ: поток слабее -> остаток
             // давление добирает мягко, ниже порога потока доза догонит +dose_trim. Клампим в floor.
@@ -515,7 +520,7 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
         return reg->search_found_pos;               // держим иглу, давление растёт к цели
     }
 
-    // --- фаза 1 СВИП: поток = P_filt поднялось на search_dp_flow над ЛЮБЫМ из
+    // --- фаза 1 ПЕРЕБОР: поток = P_filt поднялось на search_dp_flow над ЛЮБЫМ из
     //     недавних чекпойнтов (лаги 0.25..1.0с). Проверяем КАЖДЫЙ тик -> реагируем
     //     почти сразу, без ожидания закрытия одного длинного окна (раньше окно 1с
     //     давало ΔP=0.27 и перелёт). ---
@@ -542,7 +547,7 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
         if (reg->search_hist_count < SEARCH_HIST_N) reg->search_hist_count++;
     }
 
-    // --- свип: приращение иглы раз в период ---
+    // --- перебор: приращение иглы раз в период ---
     if (now_us - reg->search_step_t0_us >= reg->search_step_period_us) {
         reg->search_step_t0_us    = now_us;
         reg->step_holding_charge += reg->search_step;
@@ -552,7 +557,7 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
             reg->dose_charge_calibrated = true;
             reg->dose_searching         = false;
             dose_window_reset(reg, now_us);
-            ESP_LOGW("PID", "HOLD: ПОИСК ПОРОГА — свип дошёл до valve_max=%ld без потока, калибровка на упоре",
+            ESP_LOGW("PID", "HOLD: ПОИСК ПОРОГА — перебор дошёл до valve_max=%ld без потока, калибровка на упоре",
                      (long)reg->valve_max);
         }
     }
@@ -687,6 +692,86 @@ static void reset_controllers(PressureRegulator* reg) {
     first_in_fine        = false; // недоигранная пауза входа в FINE к новой уставке не относится
 }
                                                       //и только потом ждать минимально необходимую скорость (которая должна быть больше чем sensor_noise_delta)
+
+// ============================================================================
+//  ТЕСТ УТЕЧКИ (команда leak). Накачивает объём (серво НАБОР + игла настежь 10000),
+//  ждёт 2 с; запечатывает (игла 0, серво нейтраль), ждёт 10 с устаканиться; за
+//  окно 5 с мерит, сколько давления потерялось -> печатает скорость утечки кПа/с;
+//  в конце стравливает всё. Блокирующая процедура, крутится в задаче регулятора
+//  (REG_STATE_LEAK) -> единолично владеет иглой/серво. Иглу гоняем кусками с
+//  vTaskDelay, чтобы длинный ход не морил сторожевой таймер.
+// ============================================================================
+static void leak(PressureRegulator* reg) {
+    const int32_t  LEAK_OPEN    = 10000; // игла настежь (= MAX_VALVE_STEPS)
+    const int32_t  STEP_CHUNK   = 2000;  // ход кусками — кормим watchdog
+    const uint32_t LEAK_STEP_US = 190;   // скорость хода иглы (как в homing). На штатных
+                                         // VALVE_STEP_US=400 полный ход 10000 шагов ~4с в
+                                         // КАЖДУЮ сторону -> накачка+печать растягивались на
+                                         // ~10с. 190 (~5кГц) homing тянет без срыва.
+    int32_t chunk;
+
+    ESP_LOGW("PID", "LEAK: тест утечки — НАЧАЛО (P=%.2f)", pressure1_kPa);
+
+    // -- 1. Накачка: серво в НАБОР, игла настежь, ждём 2 с --
+    apply_servo(reg, SERVO_CHARGING);
+    chunk = current_valve_position;
+    while (current_valve_position < LEAK_OPEN) {
+        chunk += STEP_CHUNK;
+        if (chunk > LEAK_OPEN) chunk = LEAK_OPEN;
+        move_valve_absolute(chunk, LEAK_STEP_US);
+        vTaskDelay(1);
+    }
+    ESP_LOGI("LEAK", "LEAK: игла настежь %ld, накачка 0.1с", (long)current_valve_position);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // -- 2. Запечатать: игла 0, серво нейтраль, ждём 10 с устаканиться --
+    chunk = current_valve_position;
+    while (current_valve_position > 0) {
+        chunk -= STEP_CHUNK;
+        if (chunk < 0) chunk = 0;
+        move_valve_absolute(chunk, LEAK_STEP_US);
+        vTaskDelay(1);
+    }
+    apply_servo(reg, SERVO_NEUTRAL);
+    ESP_LOGI("LEAK", "LEAK: запечатано (игла 0, серво нейтраль), устаканиваемся 30с (P=%.2f)", pressure1_kPa);
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    ESP_LOGI("LEAK", "давление щас, устаканиваемся (P=%.2f)", pressure1_kPa);
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    ESP_LOGI("LEAK", "давление щас, устаканиваемся (P=%.2f)", pressure1_kPa);
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    ESP_LOGI("LEAK", "давление щас, считаем утечку (P=%.2f)", pressure1_kPa);
+
+    // -- 3. Окно 5 с: сколько давления потеряли --
+    float p_start = pressure1_kPa;
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    float p_end = pressure1_kPa;
+    float lost  = p_start - p_end;      // >0 = давление упало (утечка)
+    ESP_LOGW("PID", "LEAK: за 5с потеряно %.3f кПа -> УТЕЧКА %.4f кПа/с (P %.2f -> %.2f)",
+             lost, lost / 5.0f, p_start, p_end);
+
+    // -- 4. Стравить всё: серво СБРОС, игла настежь, ждём падения, закрыть --
+    ESP_LOGI("PID", "LEAK: стравливаем всё...");
+    apply_servo(reg, SERVO_VENTING);
+    chunk = current_valve_position;
+    while (current_valve_position < LEAK_OPEN) {
+        chunk += STEP_CHUNK;
+        if (chunk > LEAK_OPEN) chunk = LEAK_OPEN;
+        move_valve_absolute(chunk, LEAK_STEP_US);
+        vTaskDelay(1);
+    }
+    for (int guard = 0; pressure1_kPa > 0.2f && guard < 3000; guard++)
+        vTaskDelay(pdMS_TO_TICKS(10));   // ждём падения давления, но не вечно (~30с макс)
+    chunk = current_valve_position;
+    while (current_valve_position > 0) {
+        chunk -= STEP_CHUNK;
+        if (chunk < 0) chunk = 0;
+        move_valve_absolute(chunk, LEAK_STEP_US);
+        vTaskDelay(1);
+    }
+    apply_servo(reg, SERVO_NEUTRAL);
+    ESP_LOGW("PID", "LEAK: тест утечки — КОНЕЦ (P=%.2f)", pressure1_kPa);
+}
+
 // ============================================================================
 //  ГЛАВНАЯ ЗАДАЧА РЕГУЛЯТОРА
 // ============================================================================
@@ -723,6 +808,9 @@ void pid_regulator_task(void *pvParameters) {
         } else if (req == REG_STATE_HOMING) {
             is_homing = true;
             requested_reg_state = REG_STATE_NONE;
+        } else if (req == REG_STATE_LEAK) {
+            reg.state = REG_STATE_LEAK;          // одноразовый тест утечки (см. case ниже)
+            requested_reg_state = REG_STATE_NONE;
         }
 
         // -------- 2. Пока идёт калибровка экрана/нуля — не трогаем привод --------
@@ -735,7 +823,7 @@ void pid_regulator_task(void *pvParameters) {
         if (is_homing) reg.state = REG_STATE_HOMING;
 
         // -------- 4. Появилась новая уставка -> переходим в активное регулирование --------
-        if (setpoint_kPa != reg.active_setpoint && reg.state != REG_STATE_HOMING) {
+        if (setpoint_kPa != reg.active_setpoint && reg.state != REG_STATE_HOMING && reg.state != REG_STATE_LEAK) {
             reg.active_setpoint = setpoint_kPa;
             reset_controllers(&reg);
             reg.state = REG_STATE_RUNNING;
@@ -832,6 +920,16 @@ void pid_regulator_task(void *pvParameters) {
                 continue;
             }
 
+            // ---------- ТЕСТ УТЕЧКИ ----------
+            case REG_STATE_LEAK: {
+                leak(&reg);                       // блокирующая процедура; в конце всё стравлено
+                setpoint_kPa        = 0.0f;
+                reg.active_setpoint = 0.0f;
+                reset_controllers(&reg);
+                reg.state = REG_STATE_IDLE;
+                continue;
+            }
+
             // ---------- АКТИВНОЕ РЕГУЛИРОВАНИЕ ----------
             case REG_STATE_RUNNING:
                 break;  // основная логика ниже
@@ -925,12 +1023,12 @@ void pid_regulator_task(void *pvParameters) {
                     reg.step_holding_charge    = reg.valve_flow_floor;
                     reg.dose_charge_calibrated = false;
                 } else {                                       // подходили набором
-                    reg.step_holding_charge    = seed;       // = старт свипа поиска порога (подсказка RATE)
+                    reg.step_holding_charge    = seed;       // = старт перебора поиска порога (подсказка RATE)
                     // Доверять seed как готовой дозе нельзя: у этой иглы порог потока
                     // ~ позиции RATE (RATE до него и доводил), а seed = RATE - dose_step_back
                     // НИЖЕ порога -> сразу медленная доза +2/5с через мёртвую зону (видели
                     // 259->59 -> ползёт обратно ~250 с). Поэтому ВСЕГДА запускаем быстрый
-                    // поиск порога (идея 3): он свипнёт от seed вверх и найдёт реальный порог.
+                    // поиск порога (идея 3): он переберет от seed вверх и найдёт реальный порог.
                     reg.dose_charge_calibrated = false;
                     reg.step_holding_vent      = reg.valve_flow_floor;
                     reg.dose_vent_calibrated   = false;
@@ -1066,7 +1164,7 @@ void pid_regulator_task(void *pvParameters) {
                             target_valve = reg.valve_flow_floor;
                         }
                     } else if (!reg.dose_charge_calibrated) {
-                        // порог потока ещё неизвестен -> быстрый свип к нему (идея 3),
+                        // порог потока ещё неизвестен -> быстрый перебор к нему (идея 3),
                         // а не медленный +dose_trim за 5 с через весь мёртвый ход
                         zone = "SEARCH";
                         target_valve = hold_search_step(&reg, now_us);
