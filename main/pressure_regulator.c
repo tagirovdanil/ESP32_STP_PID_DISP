@@ -360,9 +360,13 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
     // п.2: кольцо чекпойнтов P_filt -> лаги 1.25..5с (статичные пороги, как в поиске).
     dose_hist_tick(reg, now_us);
 
-    // --- ЗАЩИТНЫЕ направления — по ЛЮБОМУ лагу СРАЗУ (не ждём 5с) ---
-    //   разгон     (прогресс к цели за какой-то лаг > runaway)  -> прикрыть big
-    //   утечка/мимо (прогресс за какой-то лаг < VERYslow)        -> открыть big/very_big
+    // --- ЗАЩИТНЫЕ / CLOSE направления — по ЛЮБОМУ лагу СРАЗУ (не ждём 5с) ---
+    //   разгон      (прогресс к цели за какой-то лаг > runaway) -> прикрыть big
+    //   чуть быстро (прогресс за какой-то лаг > fast)           -> прикрыть dose_trim
+    //   утечка/мимо (прогресс за какой-то лаг < VERYslow)       -> открыть big/very_big
+    // ВАЖНО: «слишком МЕДЛЕННО» (toward < slow) тут НЕТ — это проверка «НЕ МЕНЬШЕ X»,
+    // а на коротком лаге даже нормальный подход даёт <slow (времени мало) -> ложно
+    // «медленно» -> перелив. Минимум-прогресс судим только по полному 5с окну ниже.
     // Короткий лаг ловит резкий выброс, длинный — пологий (как search_dp_flow).
     // После залпа сбрасываем окно+кольцо -> ждём отклик, без повторного выстрела.
     if (reg->dose_hist_count > 0) {
@@ -375,8 +379,9 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
         }
         int32_t old = *pos;
         bool fired = true;
-        if      (toward_max > reg->dose_dp_runaway)  *pos -= big;                     // где-то разогнались
-        else if (toward_min < reg->dose_dp_VERYslow) *pos += *calib ? big : very_big; // где-то течёт/мимо
+        if      (toward_max > reg->dose_dp_runaway)  *pos -= big;                      // где-то сильно разогнались
+        else if (toward_max > reg->dose_dp_fast)     *pos -= reg->dose_trim;           // q1.3: где-то чуть быстро -> прикрыть по ЛЮБОМУ лагу
+        else if (toward_min < reg->dose_dp_VERYslow) *pos += *calib ? big : very_big;  // где-то течёт/мимо
         else                                         fired = false;
         if (fired) {
             if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
