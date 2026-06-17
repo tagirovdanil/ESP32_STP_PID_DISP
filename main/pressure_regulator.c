@@ -160,7 +160,7 @@ void regulator_init(PressureRegulator* reg, float dt) {
     // держался вниз до ~3600 -> ставим floor около нижней границы потока. Регулятор
     // никогда не опускает иглу ниже floor во время работы, поэтому уходит мёртвое
     // время ~3 с на старте и тонкая зона реально может дать поток.
-    reg->valve_flow_floor = 100;// 0;// 3600 * 0.9; // на всякий случай умножил на 0.8, чтоб наверняка 0 был
+    reg->valve_flow_floor = 0;// 3600 * 0.9; // на всякий случай умножил на 0.8, чтоб наверняка 0 был
                                         // (он же — парковка иглы в HOLD: запечатано, но близко к зоне потока)
 
     // --- HOLD: МИКРОДОЗЫ ---
@@ -174,10 +174,12 @@ void regulator_init(PressureRegulator* reg, float dt) {
     //   прошло > dose_dp_runaway -> -dose_trim_big  (разогнались)
     //   прошло > dose_dp_fast    -> -dose_trim      (чуть быстрее нужного)
     // Полоса dose_dp_slow..dose_dp_fast — «хорошо», открытие не трогаем.
-    reg->hold_enter_err  = 0.5f;        // |error| <= этого -> PID выключается, дальше HOLD-струйка
+    reg->hold_enter_err  = 0.8f;        // |error| <= этого -> PID выключается, дальше HOLD-струйка
     reg->hold_exit_err   = 5.0f;        // в HOLD |err_filt| больше -> микродозой не вытянуть, назад в RATE качать.
                                         // >>hold_enter_err: гистерезис, чтоб не дёргалось RATE<->HOLD у цели
-    reg->dose_step_back  = 60;          // вход в HOLD набором: СТАРТ СВИПА поиска = позиция RATE минус это
+    reg->dose_step_back  = 30;          // вход в HOLD набором: СТАРТ СВИПА поиска = позиция RATE минус это
+                                        // (было 60; на высоком давлении порог ВЫШЕ позиции RATE, отступ вниз
+                                        //  только удлинял свип -> 30. Прогрев в floor страхует от перелёта)
                                         // (было 200 для старой иглы; у новой порог ~позиции RATE, нужен
                                         //  малый отступ — свип стартует чуть ниже порога и быстро доходит)
     reg->dose_period_us  = 5000000ULL;  // окно проверки прогресса дозы: 5 с
@@ -210,12 +212,16 @@ void regulator_init(PressureRegulator* reg, float dt) {
     reg->search_hist_count     = 0;
     reg->search_hist_t0_us     = 0;
     reg->search_dp_flow        = 0.05f;       // P_filt выросло на это над лагом = поток (>шум)
-    reg->search_back           = 20;           // встаём почти на сам порог (детекция многолаговая, лаг мал)
+    reg->search_back           = 20;          // НЕ ИСПОЛЬЗУЕТСЯ (была старая схема floor+пауза+доза-отступ)
     reg->search_warmup_rate    = 0.10f;       // |rate_filt|<0.1 кПа/с = давление устаканилось
     reg->search_warmup_max_us  = 2500000ULL;  // но прогрев не дольше 2.5 с
-    reg->search_settle_us      = 2000000ULL;  // 2 с
-    reg->search_settle_t0_us   = 0;
+    reg->search_settle_us      = 2000000ULL;  // НЕ ИСПОЛЬЗУЕТСЯ (старая пауза в floor); фаза 2 теперь «едем до цели»
+    reg->search_settle_t0_us   = 0;           // переиспользуется как таймер фазы ПРОГРЕВ
     reg->search_found_pos      = 0;
+    reg->search_target_back    = 1.0f;        // финиш фазы 2 на (цель - 1.0): хвост доводит без перелёта +
+                                              // калибровка фиксируется РАНЬШЕ внешней проверки «дошли» (см. .h)
+    reg->search_done_back      = 20;          // после финиша держать иглу на (найденная - 30), а не на самой
+                                              // флоу-позиции: мягкий добор хвоста без перелёта (0 = на найденной)
 
     // --- ВТОРОЙ (ТОЧНЫЙ) ХОЛДИНГ: равновесное приоткрытие вместо подкачек ---
     // После выхода на точку НАБОРОМ (доза подобрана делом) серво НЕ печатаем,
@@ -234,9 +240,11 @@ void regulator_init(PressureRegulator* reg, float dt) {
     // естественного стравливания вниз, обычный эпизод НАБОРА подбирает дозу и
     // выводит на точку — только тогда включается точный холдинг (hold_fine_step).
     reg->hold_fine_enable = true;        // КОНФИГ: false = старое поведение (печать + эпизоды подкачки)
-    reg->fine_seed_back   = 20;          // ПЕРВЫЙ вход в FINE: игла = step_holding_charge минус это
-    reg->fine_relearn_step = 5;          // повторный вход: ±5 к позиции прошлого выхода по стороне выброса
-    reg->fine_trim        = 2;           // +-шаг подстройки открытия за окно
+    reg->fine_seed_back   = 2;           // ПЕРВЫЙ вход в FINE: игла = step_holding_charge минус это.
+                                         // Дозовая позиция чуть ВЫШЕ равновесия -> небольшой откат вниз
+                                         // (было 20 — FINE потом долго полз вверх; 0 = садиться ровно на дозу)
+    reg->fine_relearn_step = 2;          // повторный вход: ±2 к позиции прошлого выхода по стороне выброса
+    reg->fine_trim        = 1;           // +-шаг подстройки открытия за окно
     reg->fine_period_us   = 5000000ULL;  // окно оценки знака скорости: 5 с
     reg->fine_eq_band     = 0.01f;       // |dP| за окно меньше этого = «стоим», равновесие найдено
     reg->fine_eq_found    = false;       // сбрасывается на новой уставке (равновесие там другое)
@@ -294,7 +302,7 @@ static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt
     // магистрали). Поэтому закрываемся на полном слю (max_step за тик), а
     // интегратор синхронизируем с фактической позицией, иначе после отпускания
     // тормоза PI вернул бы иглу обратно вверх.
-    float koef_for_big_error = (setpoint_kPa > 200) ? 3.5 : 2;
+    float koef_for_big_error = (setpoint_kPa > 200) ? 4.5 : 3; // было - float koef_for_big_error = (setpoint_kPa > 200) ? 3.5 : 2;
     if (measured_toward > koef_for_big_error * fabsf(desired) && (measured_toward - fabsf(desired)) > 0.2f) {  // было > 1.5f, не смогло замедлится на 50
         int32_t out_brake = current_valve_position - reg->max_step;
         if (out_brake < reg->valve_flow_floor) out_brake = reg->valve_flow_floor;
@@ -380,10 +388,11 @@ static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
 //  иглы неизвестен), вместо медленного +dose_trim за 5 с от floor свипуем иглой
 //  вверх по search_step раз в search_step_period_us. Детекция потока — по
 //  нескольким лагам: P_filt поднялось на search_dp_flow над ЛЮБЫМ из чекпойнтов
-//  (кольцо раз в search_hist_dt_us, лаги 0.25..1.0с) -> поток пошёл. Тогда резко в
-//  floor, пауза search_settle_us (давление устаканивается), после паузы доза =
-//  найденная позиция минус search_back (компенсация лага детекции), калибровка
-//  засчитана -> дальше обычные микродозы hold_dose_step. Возвращает позицию иглы.
+//  (кольцо раз в search_hist_dt_us, лаги 0.25..1.0с) -> поток пошёл. Тогда иглу НЕ
+//  роняем в floor, а ДЕРЖИМ на найденной позиции и едем вверх до цели; дошли ->
+//  калибровка засчитана, в дозу/удержание с этой же позиции. (search_back и
+//  search_settle_us от старой версии «floor+пауза+доза-отступ» больше не нужны.)
+//  Возвращает позицию иглы.
 // ============================================================================
 static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
     // --- инициализация на входе в поиск: фаза ПРОГРЕВ ---
@@ -426,20 +435,42 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
         return reg->valve_flow_floor;
     }
 
-    // --- фаза 2 SETTLE: стоим в floor, ждём устаканивания, потом садимся на порог ---
+    // --- фаза 2 ЕДЕМ ДО ЦЕЛИ: поток найден -> НЕ роняем в floor, ДЕРЖИМ иглу на
+    //     найденной позиции и даём давлению дорасти до цели; дошли -> в дозу с этой
+    //     же (текучей) позиции. Раньше тут была пауза в floor (давление утекало) +
+    //     доза доползала обратно к порогу — это и был самый долгий кусок. ---
     if (reg->search_phase == 2) {
-        if (now_us - reg->search_settle_t0_us >= reg->search_settle_us) {
-            int32_t seed = reg->search_found_pos - reg->search_back;
-            if (seed < reg->valve_flow_floor) seed = reg->valve_flow_floor;
-            reg->step_holding_charge    = seed;
-            reg->dose_charge_calibrated = true;     // порог найден делом
-            reg->dose_searching         = false;    // поиск завершён
-            dose_window_reset(reg, now_us);         // дозу мерим с чистого листа
-            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — завершён: порог %ld -> доза %ld (минус %ld), дальше микродозы",
-                     (long)reg->search_found_pos, (long)seed, (long)reg->search_back);
-            return seed;
+        float err_filt = reg->active_setpoint - reg->filtered_pressure;
+        if (err_filt <= reg->search_target_back ) {          // доехали почти до цели (цель - search_target_back):
+                                                            // остаток доведёт хвост давления, а калибровка
+                                                            // фиксируется ЗДЕСЬ — раньше внешней проверки точной
+                                                            // цели в SERVO_CHARGING (иначе свип повторится)
+            // Держим НЕ на самой флоу-позиции (там поток активен, хвоста search_target_back
+            // хватает с перелётом), а на search_done_back шагов НИЖЕ: поток слабее -> остаток
+            // давление добирает мягко, ниже порога потока доза догонит +dose_trim. Клампим в floor.
+            int32_t hold_pos = reg->search_found_pos - reg->search_done_back;
+            if (hold_pos < reg->valve_flow_floor) hold_pos = reg->valve_flow_floor;
+            reg->step_holding_charge    = hold_pos;       // с него держим (и сюда же сядет первый вход FINE)
+            reg->dose_charge_calibrated = true;
+            reg->dose_searching         = false;
+            dose_window_reset(reg, now_us);
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — финиш на (цель-%.2f) на игле %ld -> держим %ld (-%ld), калибровка зафиксирована",
+                     reg->search_target_back, (long)reg->search_found_pos, (long)hold_pos, (long)reg->search_done_back);
+            return hold_pos;
         }
-        return reg->valve_flow_floor;               // ждём в floor
+        // страховка от застоя: если за ~1 с давление не подросло (поток на найденной
+        // позиции слабее утечки / ложный детект) — приоткрыть ещё, иначе зависнем ниже цели.
+        if (now_us - reg->search_step_t0_us >= 1000000ULL) {
+            if (reg->filtered_pressure < reg->dose_p0 + 0.02f) {
+                reg->search_found_pos += reg->search_step;
+                if (reg->search_found_pos > reg->valve_max) reg->search_found_pos = reg->valve_max;
+                ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — давление стоит, приоткрыл до %ld (едем до цели)",
+                         (long)reg->search_found_pos);
+            }
+            reg->search_step_t0_us = now_us;
+            reg->dose_p0           = reg->filtered_pressure;
+        }
+        return reg->search_found_pos;               // держим иглу, давление растёт к цели
     }
 
     // --- фаза 1 СВИП: поток = P_filt поднялось на search_dp_flow над ЛЮБЫМ из
@@ -452,14 +483,14 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
         if (rise > max_rise) max_rise = rise;
     }
     if (max_rise >= reg->search_dp_flow) {
-        reg->search_found_pos    = reg->step_holding_charge;
-        reg->search_phase        = 2;                          // -> в floor, пауза
-        reg->search_settle_t0_us = now_us;
-        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — ПОТОК на игле %ld (P_filt +%.3f над лагом <=%.2fс) -> floor, пауза %.1fс",
+        reg->search_found_pos  = reg->step_holding_charge;
+        reg->search_phase      = 2;                            // -> ЕДЕМ ДО ЦЕЛИ (не floor!)
+        reg->search_step_t0_us = now_us;                       // таймер страховки от застоя в фазе 2
+        reg->dose_p0           = reg->filtered_pressure;       // опорное P_filt для проверки роста
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — ПОТОК на игле %ld (P_filt +%.3f над лагом <=%.2fс) -> едем до цели",
                  (long)reg->search_found_pos, max_rise,
-                 (float)(reg->search_hist_dt_us * SEARCH_HIST_N) / 1000000.0f,
-                 (float)reg->search_settle_us / 1000000.0f);
-        return reg->valve_flow_floor;
+                 (float)(reg->search_hist_dt_us * SEARCH_HIST_N) / 1000000.0f);
+        return reg->search_found_pos;
     }
     // новый чекпойнт раз в search_hist_dt_us (кольцо, глубина SEARCH_HIST_N)
     if (now_us - reg->search_hist_t0_us >= reg->search_hist_dt_us) {
@@ -947,7 +978,11 @@ void pid_regulator_task(void *pvParameters) {
                                 // последней позиции по стороне прошлого выброса (учимся)
                                 reg.fine_pos = reg.fine_last_pos + reg.fine_seed_adj;
                             } else {
-                                reg.fine_pos = reg.step_holding_charge - reg.fine_seed_back; // первый вход
+                                // первый вход: дозовая/флоу-позиция step_holding_charge ВЫШЕ равновесия
+                                // (доза переливает, чтобы ДОСТАТЬ цель), поэтому садимся на fine_seed_back
+                                // шагов НИЖЕ — ближе к точке, где приток = утечке. fine_seed_back держим
+                                // МАЛЕНЬКИМ (~4): большой откат (было 20) FINE потом долго отыгрывал вверх.
+                                reg.fine_pos = reg.step_holding_charge - reg.fine_seed_back;
                             }
                             if (reg.fine_pos < reg.valve_flow_floor) reg.fine_pos = reg.valve_flow_floor;
                             if (reg.fine_pos > reg.valve_max)        reg.fine_pos = reg.valve_max;
@@ -956,7 +991,7 @@ void pid_regulator_task(void *pvParameters) {
                             ESP_LOGI("PID", "FINE: вход, игла %ld (%s), серво остаётся в НАБОРЕ. P=%.2f",
                                      (long)reg.fine_pos,
                                      reg.fine_visited ? "±переучивание от прошлой"
-                                                      : "первый вход: доза минус отступ",
+                                                      : "первый вход: на найденную флоу-позицию",
                                      pressure);
                             //target_valve = reg.fine_pos;
                             target_valve = reg.valve_flow_floor;
