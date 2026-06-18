@@ -248,6 +248,7 @@ void regulator_init(PressureRegulator* reg) {
                                          // 2 с после паузы -> направление удержания (dP<0 НАБОР / dP>=0 СБРОС)
     reg->fine_ss_seal_band = 0.003f;     // |дрейф| меньше этого = объём держит сам -> без FINE, перекрываем
                                          // всё (игла 0, серво нейтраль). На 50 кПа видели dP=-0.001 за 2с
+    reg->fine_ss_vent_offset = 0.3f;     // подход СБРОСОМ: замер дрейфа запечатываем на (цель+0.3), не на цели (п.2)
     // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
     // слю ~2400 шаг/с, полный ход ~4 с). Если игла открывается слишком медленно —
@@ -444,23 +445,30 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
 //  калибровка засчитана, в дозу/удержание с этой же позиции.
 //  Возвращает позицию иглы.
 // ============================================================================
-static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
+// charging=true — поиск порога НАБОРА (поток = РОСТ P, едем до цели снизу);
+// charging=false — поиск порога СБРОСА (поток = ПАДЕНИЕ P, едем до цели сверху).
+// Направление потока задаёт серво; величину ищем иглой одинаково (открытие вверх).
+static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool charging) {
+    int32_t*    pos      = charging ? &reg->step_holding_charge    : &reg->step_holding_vent;
+    bool*       calib    = charging ? &reg->dose_charge_calibrated : &reg->dose_vent_calibrated;
+    const char* dir_name = charging ? "НАБОР" : "СБРОС";
+
     // --- инициализация на входе в поиск: фаза Подгон ---
     if (!reg->dose_searching) {
         reg->dose_searching      = true;
         reg->search_phase        = 0;                       // 0 = Подгон фильтра
         // Перебор стартуем НЕ с floor, а с подсказки RATE (seed уже лежит в
-        // step_holding_charge = позиция RATE минус dose_step_back). У этой иглы
-        // порог высоко по шагам (~позиция RATE), перебор с floor занял бы десятки
-        // секунд; с seed — несколько. Кламп в [floor, valve_max] на всякий.
-        if (reg->step_holding_charge < reg->valve_flow_floor) reg->step_holding_charge = reg->valve_flow_floor;
-        if (reg->step_holding_charge > reg->valve_max)        reg->step_holding_charge = reg->valve_max;
+        // step_holding_* = позиция RATE минус dose_step_back). У этой иглы порог высоко
+        // по шагам (~позиция RATE), перебор с floor занял бы десятки секунд; с seed —
+        // несколько. Кламп в [floor, valve_max] на всякий.
+        if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
+        if (*pos > reg->valve_max)        *pos = reg->valve_max;
         reg->search_settle_t0_us = now_us;                  // таймер фазы (тут — Подгон)
-        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — вход, фаза ПОДГОНА УГЛА (игла в floor, ждём P_filt; перебор начнётся с %ld). P_filt=%.2f rate_filt=%.2f",
-                 (long)reg->step_holding_charge, reg->filtered_pressure, reg->filtered_rate);
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — вход, фаза ПОДГОНА УГЛА (игла в floor, ждём P_filt; перебор начнётся с %ld). P_filt=%.2f rate_filt=%.2f",
+                 dir_name, (long)*pos, reg->filtered_pressure, reg->filtered_rate);
     }
 
-    // --- фаза 0 Подгон: после RATE фильтр P_filt ОТСТАЁТ от raw и слюит вверх.
+    // --- фаза 0 Подгон: после RATE фильтр P_filt ОТСТАЁТ от raw и слюит.
     //     rate_filt считается по RAW (а raw после закрытия иглы стабилен почти сразу),
     //     поэтому ждём |rate_filt| мал = «raw стоит», затем ПРИБИВАЕМ P_filt к raw и
     //     только тогда перебираем. Без прибивки остаточный слю P_filt (rate_filt уже мал,
@@ -476,74 +484,78 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
             reg->search_hist_t0_us = now_us;
             reg->search_hist_idx   = 0;
             reg->search_hist_count = 0;
-            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — старт ПЕРЕБОРА с %ld (+%ld за %.2fс, %s). P_filt прибит к raw=%.2f",
-                     (long)reg->step_holding_charge, (long)reg->search_step,
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — старт ПЕРЕБОРА с %ld (+%ld за %.2fс, %s). P_filt прибит к raw=%.2f",
+                     dir_name, (long)*pos, (long)reg->search_step,
                      (float)reg->search_step_period_us / 1000000.0f,
                      settled ? "raw стабилен" : "таймаут подгона",
                      reg->filtered_pressure);
-            // В самом начале перебора давление падает (скорость отрицательная) ->
-            // запечатанный объём травит мимо иглы. Кричим капсом для диагностики.
-            if (reg->filtered_rate < 0.0f)
+            // Для НАБОРА падение давления в начале (скорость отрицательная) = запечатанный
+            // объём травит мимо иглы. Кричим капсом для диагностики. Для СБРОСА падение —
+            // это сама цель, не предупреждаем.
+            if (charging && reg->filtered_rate < 0.0f)
                 ESP_LOGW("PID", "УТЕЧКА: СКОРОСТЬ: %.3f кПа/с ШАГ: %ld",
-                         reg->filtered_rate, (long)reg->step_holding_charge);
+                         reg->filtered_rate, (long)*pos);
         }
         return reg->valve_flow_floor;
     }
 
     // --- фаза 2 ЕДЕМ ДО ЦЕЛИ: поток найден -> НЕ роняем в floor, ДЕРЖИМ иглу на
-    //     найденной позиции и даём давлению дорасти до цели; дошли -> в дозу с этой
-    //     же (текучей) позиции. Раньше тут была пауза в floor (давление утекало) +
-    //     доза доползала обратно к порогу — это и был самый долгий кусок. ---
+    //     найденной позиции и даём давлению дойти до цели (НАБОР — дорасти снизу,
+    //     СБРОС — спасть сверху); дошли -> в дозу с этой же (текучей) позиции. ---
     if (reg->search_phase == 2) {
-        float err_filt = reg->active_setpoint - reg->filtered_pressure;
-        if (err_filt <= reg->search_target_back ) {          // доехали почти до цели (цель - search_target_back):
+        // остаток до цели со стороны подхода: НАБОР снизу (цель−P), СБРОС сверху (P−цель)
+        float remaining = charging ? (reg->active_setpoint - reg->filtered_pressure)
+                                   : (reg->filtered_pressure - reg->active_setpoint);
+        if (remaining <= reg->search_target_back) {          // доехали почти до цели (∓search_target_back):
                                                             // остаток доведёт хвост давления, а калибровка
                                                             // фиксируется ЗДЕСЬ — раньше внешней проверки точной
-                                                            // цели в SERVO_CHARGING (иначе перебор повторится)
+                                                            // цели в HOLD (иначе перебор повторится)
             // Держим НЕ на самой флоу-позиции (там поток активен, хвоста search_target_back
             // хватает с перелётом), а на search_done_back шагов НИЖЕ: поток слабее -> остаток
             // давление добирает мягко, ниже порога потока доза догонит +dose_trim. Клампим в floor.
             int32_t hold_pos = reg->search_found_pos - reg->search_done_back;
             if (hold_pos < reg->valve_flow_floor) hold_pos = reg->valve_flow_floor;
-            reg->step_holding_charge    = hold_pos;       // с него держим (и сюда же сядет первый вход FINE)
-            reg->dose_charge_calibrated = true;
-            reg->dose_searching         = false;
+            *pos                = hold_pos;               // с него держим (и сюда же сядет первый вход FINE)
+            *calib              = true;
+            reg->dose_searching = false;
             dose_window_reset(reg, now_us);
-            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — финиш на (цель-%.2f) на игле %ld -> держим %ld (-%ld), калибровка зафиксирована",
-                     reg->search_target_back, (long)reg->search_found_pos, (long)hold_pos, (long)reg->search_done_back);
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — финиш у цели (остаток<=%.2f) на игле %ld -> держим %ld (-%ld), калибровка зафиксирована",
+                     dir_name, reg->search_target_back, (long)reg->search_found_pos, (long)hold_pos, (long)reg->search_done_back);
             return hold_pos;
         }
-        // страховка от застоя: если за ~1 с давление не подросло (поток на найденной
-        // позиции слабее утечки / ложный детект) — приоткрыть ещё, иначе зависнем ниже цели.
+        // страховка от застоя: если за ~1 с давление не двинулось к цели (поток на найденной
+        // позиции слабее утечки/подпора / ложный детект) — приоткрыть ещё, иначе зависнем.
         if (now_us - reg->search_step_t0_us >= 1000000ULL) {
-            if (reg->filtered_pressure < reg->dose_p0 + 0.02f) {
+            bool progressed = charging ? (reg->filtered_pressure > reg->dose_p0 + 0.02f)
+                                       : (reg->filtered_pressure < reg->dose_p0 - 0.02f);
+            if (!progressed) {
                 reg->search_found_pos += reg->search_step;
                 if (reg->search_found_pos > reg->valve_max) reg->search_found_pos = reg->valve_max;
-                ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — давление стоит, приоткрыл до %ld (едем до цели)",
-                         (long)reg->search_found_pos);
+                ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — давление стоит, приоткрыл до %ld (едем до цели)",
+                         dir_name, (long)reg->search_found_pos);
             }
             reg->search_step_t0_us = now_us;
             reg->dose_p0           = reg->filtered_pressure;
         }
-        return reg->search_found_pos;               // держим иглу, давление растёт к цели
+        return reg->search_found_pos;               // держим иглу, давление идёт к цели
     }
 
-    // --- фаза 1 ПЕРЕБОР: поток = P_filt поднялось на search_dp_flow над ЛЮБЫМ из
-    //     недавних чекпойнтов (лаги 0.25..1.0с). Проверяем КАЖДЫЙ тик -> реагируем
-    //     почти сразу, без ожидания закрытия одного длинного окна (раньше окно 1с
-    //     давало ΔP=0.27 и перелёт). ---
-    float max_rise = 0.0f;
+    // --- фаза 1 ПЕРЕБОР: поток = P_filt ушло на search_dp_flow В СТОРОНУ ЦЕЛИ над ЛЮБЫМ
+    //     из недавних чекпойнтов (лаги 0.25..1.0с): НАБОР — рост (P−hist), СБРОС — падение
+    //     (hist−P). Проверяем КАЖДЫЙ тик -> реагируем почти сразу. ---
+    float max_move = 0.0f;
     for (int i = 0; i < reg->search_hist_count; i++) {
-        float rise = reg->filtered_pressure - reg->search_hist[i];
-        if (rise > max_rise) max_rise = rise;
+        float move = charging ? (reg->filtered_pressure - reg->search_hist[i])
+                              : (reg->search_hist[i] - reg->filtered_pressure);
+        if (move > max_move) max_move = move;
     }
-    if (max_rise >= reg->search_dp_flow) {
-        reg->search_found_pos  = reg->step_holding_charge;
+    if (max_move >= reg->search_dp_flow) {
+        reg->search_found_pos  = *pos;
         reg->search_phase      = 2;                            // -> ЕДЕМ ДО ЦЕЛИ (не floor!)
         reg->search_step_t0_us = now_us;                       // таймер страховки от застоя в фазе 2
-        reg->dose_p0           = reg->filtered_pressure;       // опорное P_filt для проверки роста
-        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА — ПОТОК на игле %ld (P_filt +%.3f над лагом <=%.2fс) -> едем до цели",
-                 (long)reg->search_found_pos, max_rise,
+        reg->dose_p0           = reg->filtered_pressure;       // опорное P_filt для проверки движения
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — ПОТОК на игле %ld (P_filt %+.3f к цели над лагом <=%.2fс) -> едем до цели",
+                 dir_name, (long)reg->search_found_pos, max_move,
                  (float)(reg->search_hist_dt_us * SEARCH_HIST_N) / 1000000.0f);
         return reg->search_found_pos;
     }
@@ -557,19 +569,19 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us) {
 
     // --- перебор: приращение иглы раз в период ---
     if (now_us - reg->search_step_t0_us >= reg->search_step_period_us) {
-        reg->search_step_t0_us    = now_us;
-        reg->step_holding_charge += reg->search_step;
-        if (reg->step_holding_charge >= reg->valve_max) {
+        reg->search_step_t0_us = now_us;
+        *pos += reg->search_step;
+        if (*pos >= reg->valve_max) {
             // дошли до упора без потока -> калибруемся на максимуме (лучшее усилие)
-            reg->step_holding_charge    = reg->valve_max;
-            reg->dose_charge_calibrated = true;
-            reg->dose_searching         = false;
+            *pos                = reg->valve_max;
+            *calib              = true;
+            reg->dose_searching = false;
             dose_window_reset(reg, now_us);
-            ESP_LOGW("PID", "HOLD: ПОИСК ПОРОГА — перебор дошёл до valve_max=%ld без потока, калибровка на упоре",
-                     (long)reg->valve_max);
+            ESP_LOGW("PID", "HOLD: ПОИСК ПОРОГА %s — перебор дошёл до valve_max=%ld без потока, калибровка на упоре",
+                     dir_name, (long)reg->valve_max);
         }
     }
-    return reg->step_holding_charge;
+    return *pos;
 }
 
 // q2. FINE: дрейф-шаг иглы с защитой «не толкать прочь от цели». Падает (drift<0)
@@ -1142,21 +1154,31 @@ void pid_regulator_task(void *pvParameters) {
                         reg.fine_dir_known    = true;      // повторные входы в FINE не замеряют (до новой уставки/сброса)
 
                         if (dir == SERVO_CHARGING && !reg.dose_charge_calibrated) {
-                            // НЕЛОГИЧНОЕ ПОВЕДЕНИЕ: подходили СБРОСОМ (откачкой = сверху вниз), а
-                            // запечатанный объём за замер ПОТРАВИЛ (dP<0) -> держать надо НАБОРОМ,
-                            // но дозы НАБОРА нет (при сбросовом подходе калибровалась только
-                            // сбросовая, step_holding_charge=floor). «Забываем про сброс — теперь
-                            // мы в НАКАЧИВАНИИ»: серво в НАБОР, запускаем переборный поиск порога
-                            // потока (как при обычном наборе). Поиск выйдет на точку, и по
-                            // fine_dir_known=НАБОР провалимся в FINE-набор (флоу-поз − fine_seed_back).
-                            // Если поиск выведет ВЫШЕ точки — обычный HOLD (эпизод сброса) опустит к
-                            // цели, и FINE-набор включится уже на точке (SERVO_VENTING-дошли -> fine_dir).
+                            // Дрейф ВНИЗ (утечка), а дозы НАБОРА нет: либо подходили СБРОСОМ
+                            // (step_holding_charge=floor), либо это штатный замер на цель+offset
+                            // показал утечку. Держать надо НАБОРОМ -> «уходим в НАКАЧИВАНИЕ»: серво
+                            // в НАБОР, запускаем переборный поиск порога потока (как при наборе).
+                            // Поиск выйдет на точку, по fine_dir_known=НАБОР провалимся в FINE-набор
+                            // (флоу-поз − fine_seed_back). Перелетели выше — обычный HOLD (эпизод
+                            // сброса) опустит к цели, FINE-набор включится уже на точке.
                             reg.fine_holding = false;                  // не точный холдинг — сперва поиск/доводка дозой
                             apply_servo(&reg, SERVO_CHARGING);
                             dose_window_reset(&reg, now_us);
                             target_valve = reg.valve_flow_floor;       // поиск стартует из floor (фаза подгона фильтра)
-                            ESP_LOGW("PID", "FINE-SS: откачка, но дрейф ВНИЗ dP=%+.3f (нелогично) -> забываем сброс, "
-                                            "уходим в НАБОР: переборный поиск порога потока. P=%.2f", delta, pressure);
+                            ESP_LOGW("PID", "FINE-SS: дрейф ВНИЗ dP=%+.3f (утечка) -> держим НАБОРОМ: "
+                                            "переборный поиск порога потока. P=%.2f", delta, pressure);
+                        } else if (dir == SERVO_VENTING && !reg.dose_vent_calibrated) {
+                            // п.1: дрейф ВВЕРХ (объём подпирает), а готовой дозы СБРОСА нет ->
+                            // держать надо СБРОСОМ, ищем порог потока СБРОСА (ПОДГОНА УГЛА), как у
+                            // набора. Поиск выйдет на точку, по fine_dir_known=СБРОС провалимся в
+                            // FINE-сброс (флоу-поз − fine_seed_back). Перелетели ниже — обычный HOLD
+                            // (эпизод набора) поднимет к цели, FINE-сброс включится уже на точке.
+                            reg.fine_holding = false;                  // не точный холдинг — сперва поиск/доводка дозой
+                            apply_servo(&reg, SERVO_VENTING);
+                            dose_window_reset(&reg, now_us);
+                            target_valve = reg.valve_flow_floor;       // поиск стартует из floor (фаза подгона фильтра)
+                            ESP_LOGW("PID", "FINE-SS: дрейф ВВЕРХ dP=%+.3f -> держим СБРОСОМ: "
+                                            "переборный поиск порога потока. P=%.2f", delta, pressure);
                         } else {
                             apply_servo(&reg, dir);
                             reg.fine_pos          = fine_seed_for_dir(&reg, dir);  // дозовая позиция направления (Q2)
@@ -1265,10 +1287,19 @@ void pid_regulator_task(void *pvParameters) {
                 }
 
                 case SERVO_CHARGING:
-                    if (error_filt <= reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели  // поменял 0 на reg.sensor_noise_delta_filt (0.03) для компенсации перелета. Не уверен что надо именно эту переменную, но в целом как будто она подходит
-                        
+                    if (!reg.dose_charge_calibrated) {
+                        // порог потока ещё неизвестен -> быстрый перебор к нему (идея 3),
+                        // а не медленный +dose_trim за 5 с через весь мёртвый ход. Эта ветка
+                        // ВЫШЕ проверки «дошли»: при подходе СБРОСОМ + утечка серво переключается
+                        // в НАБОР, а P ещё ВЫШЕ цели (на +offset) — будь «дошли» первым, оно бы
+                        // перехватило и мы печатали бы вместо поиска. Запас +offset даёт время
+                        // поиску, пока утечка ведёт P к цели (п.2: утечка -> сразу ищем порог накачки).
+                        zone = "SEARCH";
+                        target_valve = hold_search_step(&reg, now_us, true);
+                    } else if (error_filt <= reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели  // поменял 0 на reg.sensor_noise_delta_filt (0.03) для компенсации перелета. Не уверен что надо именно эту переменную, но в целом как будто она подходит
+
                         reg.dose_searching = false;   // цель достигнута — быстрый поиск (если шёл) прекращаем
-                        if (reg.hold_fine_enable && reg.dose_charge_calibrated) {
+                        if (reg.hold_fine_enable) {   // dose_charge_calibrated уже true (внешнее условие)
                             // Вышли на точку и доза проверена делом -> НЕ печатаем.
                             reg.fine_holding = true;
                             if (reg.fine_dir_known) {
@@ -1294,46 +1325,60 @@ void pid_regulator_task(void *pvParameters) {
                             apply_servo(&reg, SERVO_NEUTRAL);   // печатаем как раньше
                             target_valve = reg.valve_flow_floor;
                         }
-                    } else if (!reg.dose_charge_calibrated) {
-                        // порог потока ещё неизвестен -> быстрый перебор к нему (идея 3),
-                        // а не медленный +dose_trim за 5 с через весь мёртвый ход
-                        zone = "SEARCH";
-                        target_valve = hold_search_step(&reg, now_us);
                     } else {
                         target_valve = hold_dose_step(&reg, now_us, true, pressure);
                     }
                     break;
 
                 case SERVO_VENTING:
-                    if (error_filt >= -reg.sensor_noise_delta_filt) {            // дошли РОВНО до цели
-                        reg.dose_searching = false;   // цель достигнута
-                        if (reg.hold_fine_enable && reg.dose_vent_calibrated) {
-                            // Вышли на точку СБРОСОМ -> НЕ печатаем.
-                            reg.fine_holding = true;
-                            if (reg.fine_dir_known) {
-                                // направление уже определено замером -> сразу удержание
-                                apply_servo(&reg, reg.fine_dir);
-                                reg.fine_pos         = fine_seed_for_dir(&reg, reg.fine_dir);
-                                reg.fine_grace_t0_us = now_us;
-                                dose_window_reset(&reg, now_us);
-                                target_valve = reg.fine_pos;
-                                ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.2f",
-                                         (reg.fine_dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg.fine_pos, pressure);
-                            } else {
-                                // ПЕРВЫЙ раз на этой уставке: серво в НЕЙТРАЛЬ, игла floor,
-                                // пауза 1с, затем замер дрейфа -> направление (запомнится).
-                                apply_servo(&reg, SERVO_NEUTRAL);
-                                target_valve = reg.valve_flow_floor;
-                                fix_time_for_delay = now_us;
-                                first_in_fine = true;
-                                ESP_LOGI("PID", "FINE(после СБРОСА): вход — направление ещё не определено: серво в нейтраль, пауза 1с, затем замер. P=%.2f", pressure);
-                            }
+                    if (reg.fine_dir_known) {
+                        // Направление удержания на эту уставку уже определено замером дрейфа.
+                        // Дозу СБРОСА ищем порогом (ПОДГОНА УГЛА), пока не калибрована (п.1) — эта
+                        // ветка ВЫШЕ проверки «дошли», чтобы поиск гарантированно завершился, а не
+                        // перехватывался ею при дрейфе P к цели; затем доводим дозой и РОВНО на цели
+                        // входим в точное удержание.
+                        if (!reg.dose_vent_calibrated) {
+                            zone = "SEARCH";
+                            target_valve = hold_search_step(&reg, now_us, false);  // п.1: поиск порога СБРОСА
+                        } else if (error_filt >= -reg.sensor_noise_delta_filt) {   // дошли РОВНО до цели
+                            reg.dose_searching = false;
+                            reg.fine_holding   = true;
+                            apply_servo(&reg, reg.fine_dir);
+                            reg.fine_pos         = fine_seed_for_dir(&reg, reg.fine_dir);
+                            reg.fine_grace_t0_us = now_us;
+                            dose_window_reset(&reg, now_us);
+                            target_valve = reg.fine_pos;
+                            ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.2f",
+                                     (reg.fine_dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg.fine_pos, pressure);
                         } else {
-                            apply_servo(&reg, SERVO_NEUTRAL);   // печатаем как раньше
+                            target_valve = hold_dose_step(&reg, now_us, false, pressure);
+                        }
+                    } else if (reg.hold_fine_enable) {
+                        // п.2: направление ещё НЕ определено -> опускаемся до (цель+offset) и
+                        // ТАМ замеряем дрейф (запас вниз на просадку за 1с+замер). На цели
+                        // замерять нельзя: утечка за время замера увела бы P ниже цели.
+                        if (error_filt >= -reg.fine_ss_vent_offset) {            // дошли до точки замера (цель+offset)
+                            reg.dose_searching       = false;
+                            reg.fine_holding         = true;
+                            reg.dose_vent_calibrated = false;   // провизорную дозу спуска отбрасываем — порог найдём поиском
+                            apply_servo(&reg, SERVO_NEUTRAL);
                             target_valve = reg.valve_flow_floor;
+                            fix_time_for_delay = now_us;
+                            first_in_fine = true;
+                            ESP_LOGI("PID", "FINE(после СБРОСА): дошли до цель+%.2f -> серво в нейтраль, пауза 1с, затем замер дрейфа. P=%.2f",
+                                     reg.fine_ss_vent_offset, pressure);
+                        } else {
+                            target_valve = hold_dose_step(&reg, now_us, false, pressure);  // спуск до точки замера
                         }
                     } else {
-                        target_valve = hold_dose_step(&reg, now_us, false, pressure);
+                        // hold_fine_enable=false -> старое поведение: печать РОВНО на цели
+                        if (error_filt >= -reg.sensor_noise_delta_filt) {
+                            reg.dose_searching = false;
+                            apply_servo(&reg, SERVO_NEUTRAL);
+                            target_valve = reg.valve_flow_floor;
+                        } else {
+                            target_valve = hold_dose_step(&reg, now_us, false, pressure);
+                        }
                     }
                     break;
             }
