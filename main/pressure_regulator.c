@@ -738,8 +738,12 @@ static void leak(PressureRegulator* reg) {
     ESP_LOGI("LEAK", "давление щас, устаканиваемся (P=%.2f)", pressure1_kPa);
     vTaskDelay(pdMS_TO_TICKS(10000));
     ESP_LOGI("LEAK", "давление щас, устаканиваемся (P=%.2f)", pressure1_kPa);
-    vTaskDelay(pdMS_TO_TICKS(10000));
-    ESP_LOGI("LEAK", "давление щас, считаем утечку (P=%.2f)", pressure1_kPa);
+    for(int i = 0; i < 20; i++){
+        vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGI("LEAK", "давление щас, считаем утечку (P=%.2f)", pressure1_kPa);
+    }
+    
+
 
     // -- 3. Окно 5 с: сколько давления потеряли --
     float p_start = pressure1_kPa;
