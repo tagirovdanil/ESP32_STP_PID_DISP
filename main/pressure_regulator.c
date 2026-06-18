@@ -135,7 +135,7 @@ void regulator_init(PressureRegulator* reg) {
     //  - в полосе error 0..2 это же значение = желаемая скорость подхода (ползём медленно).
     // Больше -> раньше останавливаемся (меньше перелёт, грубее точность); меньше -> точнее.
     reg->sensor_noise_delta = 0.22f;
-    reg->sensor_noise_delta_filt = 0.03f;
+    reg->sensor_noise_delta_filt = 0.01f;
 
     // --- лимиты привода (в шагах) ---
     reg->valve_max      = MAX_VALVE_STEPS; // полный ход иглы
@@ -235,11 +235,19 @@ void regulator_init(PressureRegulator* reg) {
     reg->fine_period_us   = 5000000ULL;  // окно оценки знака скорости: 5 с
     reg->fine_eq_band     = 0.01f;       // |dP| за окно меньше этого = «стоим», равновесие найдено
     reg->fine_eq_found    = false;       // сбрасывается на новой уставке (равновесие там другое)
-    reg->fine_corr_err    = 0.05f;       // мёртвая зона цели; меньше — дёргаемся от шума P_filt (~±0.02)
+    reg->fine_corr_err    = 0.02f;       // «стоим» (|dP за 5с| < eq_band), но мимо цели на СТОЛЬКО и больше ->
+                                         // сдвиг равновесия ±fine_trim к цели (999.98 и ниже -> +1; 1000.02 и
+                                         // выше -> -1). Только в 5с-окне; рост/падение рулит дрейф-ветка отдельно.
+                                         // было 0.05 (мёртвая зона); 0.02 = на уровне шума P_filt (~±0.02), но
+                                         // «стоим» уже требует плоского окна -> дребезг максимум ±1 шаг
     reg->fine_dev_guard   = 0.00f;       // было 0.05, потом 0.01 поставил - на 500 вышло, теперь пробую 0.00 q2: ниже цели на 0.01+ не прикрываем (−), выше на 0.01+ не приоткрываем (+)
     reg->fine_trim_fast   = 8;           // пока давление ещё активно движется — крупный шаг (вместо fine_trim=2)
     reg->fine_hold_change = 0.5f;        // |ΔP_filt| за ~5 с >= этого = «ещё движусь»: не отдаём в HOLD
     reg->fine_rate_t0_us  = 0;           // 0 -> трекер fine_change сам инициализируется на 1-м тике RUNNING
+    reg->fine_ss_period_us = 3000000ULL; // НОВЫЙ ЭТАП «поиск скорости»: замер дрейфа запечатанного объёма    // было 2с, как будто не успевало, поставил 3с
+                                         // 2 с после паузы -> направление удержания (dP<0 НАБОР / dP>=0 СБРОС)
+    reg->fine_ss_seal_band = 0.003f;     // |дрейф| меньше этого = объём держит сам -> без FINE, перекрываем
+                                         // всё (игла 0, серво нейтраль). На 50 кПа видели dP=-0.001 за 2с
     // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
     // слю ~2400 шаг/с, полный ход ~4 с). Если игла открывается слишком медленно —
@@ -580,6 +588,24 @@ static int32_t fine_drift_step(PressureRegulator* reg, float drift, float error_
     return sgn * phys;                                            // НАБОР: шаг=phys; СБРОС: зеркально
 }
 
+// Стартовое открытие иглы FINE для направления dir (Q2: дозовая позиция направления):
+// НАБОР -> step_holding_charge (с ±переучиванием fine_visited на повторном входе),
+// СБРОС -> step_holding_vent; если дозы у направления нет (floor) — FINE доищет равновесие
+// ±шагом. Клампим в [floor, valve_max]. Используется и при первом замере, и при повторных
+// входах в FINE с уже запомненным направлением.
+static int32_t fine_seed_for_dir(PressureRegulator* reg, ServoState dir) {
+    int32_t pos;
+    if (dir == SERVO_CHARGING) {
+        if (reg->fine_visited) pos = reg->fine_last_pos + reg->fine_seed_adj;  // повторный вход: ±переучивание
+        else                   pos = reg->step_holding_charge - reg->fine_seed_back;
+    } else {
+        pos = reg->step_holding_vent - reg->fine_seed_back;
+    }
+    if (pos < reg->valve_flow_floor) pos = reg->valve_flow_floor;
+    if (pos > reg->valve_max)        pos = reg->valve_max;
+    return pos;
+}
+
 // ============================================================================
 //  ТОЧНЫЙ ХОЛДИНГ: серво постоянно в НАБОРЕ, игла стоит на равновесном
 //  приоткрытии (приток компенсирует утечку). Раз в fine_period_us смотрим, куда
@@ -695,10 +721,13 @@ static void reset_controllers(PressureRegulator* reg) {
     reg->rate_integral = 0.0f;
     reg->holding       = false;
     reg->fine_holding  = false;
+    reg->fine_speed_search = false; // недоигранный замер дрейфа к новой уставке не относится
+    reg->fine_dir_known    = false; // направление (утечка/набор) определяем заново на новой уставке
     reg->fine_eq_found = false;   // на новой уставке равновесное открытие другое
     reg->fine_rate_t0_us = 0;     // сброс трекера fine_change (на новой уставке история не нужна)
     reg->dose_searching  = false; // начатый поиск порога потока к новой уставке не относится
     reg->fine_visited    = false; // переучивание FINE (±5 от прошлой позиции) — на новой уставке с чистого листа
+    reg->fine_after_speed_search = false; // щит «не переучивать на просадке замера» к новой уставке не относится
     first_in_fine        = false; // недоигранная пауза входа в FINE к новой уставке не относится
 }
                                                       //и только потом ждать минимально необходимую скорость (которая должна быть больше чем sensor_noise_delta)
@@ -1005,6 +1034,8 @@ void pid_regulator_task(void *pvParameters) {
                      error_filt, reg.hold_exit_err);
             reg.holding                = false;
             reg.fine_holding           = false;
+            reg.fine_speed_search      = false;  // прерываем замер дрейфа, если шёл
+            first_in_fine              = false;  // и недоигранную паузу входа в FINE
             reg.dose_searching         = false;
             reg.dose_charge_calibrated = false;
             reg.dose_vent_calibrated   = false;
@@ -1064,16 +1095,82 @@ void pid_regulator_task(void *pvParameters) {
             zone = "FINE";
 
             if (first_in_fine) {
-            // Пауза 1с в floor при входе в FINE (доза -> floor -> fine_pos): глушим
-            // перелив дозы, чтобы войти в равновесие без остаточного разгона давления.
-            // Серво остаётся в НАБОРЕ; floor ниже порога потока -> приток ~ноль, P оседает.
-                if (now_us - fix_time_for_delay >= 1000000ULL) {   // 1 с прошла
-                    first_in_fine = false;
-                    dose_window_reset(&reg, now_us);               // окно равновесия — с чистого листа после паузы
-                    target_valve = reg.fine_pos;
-                    ESP_LOGI("PID", "FINE: пауза 1с в floor окончена -> игла на %ld", (long)reg.fine_pos);
+            // Пауза 1с в floor при входе в FINE: глушим перелив дозы ПЕРЕД замером
+            // дрейфа. Серво уже в НЕЙТРАЛИ (объём запечатан), floor ниже порога потока.
+                if (now_us - fix_time_for_delay >= 1000000ULL) {   // 1 с прошла -> старт замера дрейфа
+                    first_in_fine          = false;
+                    reg.fine_speed_search  = true;                 // этап «поиск скорости»
+                    reg.fine_ss_t0_us      = now_us;
+                    reg.fine_ss_p0         = reg.filtered_pressure; // фиксируем P_filt
+                    target_valve           = reg.valve_flow_floor; // держим запечатано
+                    ESP_LOGI("PID", "FINE: пауза 1с окончена -> замер дрейфа %.1fс (P_filt=%.2f зафиксировано)",
+                             (float)reg.fine_ss_period_us / 1000000.0f, reg.fine_ss_p0);
                 } else {
                     target_valve = reg.valve_flow_floor;           // стоим в floor, ждём
+                }
+            } else if (reg.fine_speed_search) {
+            // ЭТАП «ПОИСК СКОРОСТИ»: объём ещё запечатан (серво нейтраль, игла floor).
+            // Ждём fine_ss_period_us и смотрим, КУДА САМ поплыл P_filt — это направление,
+            // ПРОТИВ которого надо удерживать:
+            //   dP < 0  (утекает)     -> удержание НАБОРОМ (серво CHARGING);
+            //   dP >= 0 (ползёт вверх) -> удержание СБРОСОМ (серво VENTING).
+            // Полярность ±шага иглы дальше берёт sgn из servo_state (hold_fine_step):
+            // НАБОР +1=быстрее/−1=медленнее, СБРОС +1=медленнее/−1=быстрее рост.
+                zone = "FINE-SS";
+                target_valve = reg.valve_flow_floor;               // всю длину замера держим запечатано
+                if (now_us - reg.fine_ss_t0_us >= reg.fine_ss_period_us) {
+                    float delta = reg.filtered_pressure - reg.fine_ss_p0;
+                    reg.fine_speed_search = false;
+
+                    if (fabsf(delta) < reg.fine_ss_seal_band) {
+                        // ДРЕЙФ ПРЕНЕБРЕЖИМО МАЛ: запечатанный объём держит давление САМ
+                        // (на 50 кПа видели dP=-0.001 за 2с). FINE тут не нужен — он бы зря
+                        // гонял иглу/серво, ища равновесие там, где и так равновесие. Просто
+                        // ПЕРЕКРЫВАЕМ ВСЁ: игла в 0, серво в нейтраль -> обычный HOLD (запечатано).
+                        // Направление НЕ фиксируем (fine_dir_known=false): если позже появится
+                        // реальный дрейф, эпизод HOLD выведет на точку и замер дрейфа повторится.
+                        reg.fine_holding   = false;
+                        reg.fine_dir_known = false;
+                        apply_servo(&reg, SERVO_NEUTRAL);
+                        target_valve = reg.valve_flow_floor;       // игла 0 (запечатано)
+                        dose_window_reset(&reg, now_us);
+                        ESP_LOGI("PID", "FINE-SS: дрейф пренебрежимо мал dP=%+.3f (|dP|<%.3f) -> перекрываем всё (игла 0, серво нейтраль), без FINE. P=%.2f",
+                                 delta, reg.fine_ss_seal_band, pressure);
+                    } else {
+                        ServoState dir = (delta < 0.0f) ? SERVO_CHARGING : SERVO_VENTING;
+                        reg.fine_dir          = dir;       // ЗАПОМИНАЕМ направление на эту уставку (замер 1 раз за уставку)
+                        reg.fine_dir_known    = true;      // повторные входы в FINE не замеряют (до новой уставки/сброса)
+
+                        if (dir == SERVO_CHARGING && !reg.dose_charge_calibrated) {
+                            // НЕЛОГИЧНОЕ ПОВЕДЕНИЕ: подходили СБРОСОМ (откачкой = сверху вниз), а
+                            // запечатанный объём за замер ПОТРАВИЛ (dP<0) -> держать надо НАБОРОМ,
+                            // но дозы НАБОРА нет (при сбросовом подходе калибровалась только
+                            // сбросовая, step_holding_charge=floor). «Забываем про сброс — теперь
+                            // мы в НАКАЧИВАНИИ»: серво в НАБОР, запускаем переборный поиск порога
+                            // потока (как при обычном наборе). Поиск выйдет на точку, и по
+                            // fine_dir_known=НАБОР провалимся в FINE-набор (флоу-поз − fine_seed_back).
+                            // Если поиск выведет ВЫШЕ точки — обычный HOLD (эпизод сброса) опустит к
+                            // цели, и FINE-набор включится уже на точке (SERVO_VENTING-дошли -> fine_dir).
+                            reg.fine_holding = false;                  // не точный холдинг — сперва поиск/доводка дозой
+                            apply_servo(&reg, SERVO_CHARGING);
+                            dose_window_reset(&reg, now_us);
+                            target_valve = reg.valve_flow_floor;       // поиск стартует из floor (фаза подгона фильтра)
+                            ESP_LOGW("PID", "FINE-SS: откачка, но дрейф ВНИЗ dP=%+.3f (нелогично) -> забываем сброс, "
+                                            "уходим в НАБОР: переборный поиск порога потока. P=%.2f", delta, pressure);
+                        } else {
+                            apply_servo(&reg, dir);
+                            reg.fine_pos          = fine_seed_for_dir(&reg, dir);  // дозовая позиция направления (Q2)
+                            reg.fine_grace_t0_us  = now_us;            // дать FINE одно окно отработать до гейта HOLD
+                            reg.fine_after_speed_search = true;        // недолёт до цели тут = просадка замера, не равновесие -> не переучивать
+                            dose_window_reset(&reg, now_us);           // окно равновесия — с чистого листа
+                            target_valve = reg.fine_pos;
+                            ESP_LOGI("PID", "FINE: дрейф за %.1fс dP=%+.3f -> %s, игла на %ld (%s). P=%.2f",
+                                     (float)reg.fine_ss_period_us / 1000000.0f, delta,
+                                     (dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg.fine_pos,
+                                     (dir == SERVO_CHARGING && reg.fine_visited) ? "±переуч." : "дозовая поз.",
+                                     pressure);
+                        }
+                    }
                 }
             } else {
             // Гейт FINE->HOLD с защитой от дёрганья у порога 0.1. Раньше любое
@@ -1086,12 +1183,34 @@ void pid_regulator_task(void *pvParameters) {
             //   успокоились и |err_filt| > 0.1 -> тонкая подстройка не вытянет,
             //       отдаём обычному HOLD (эпизоды), FINE включится сам после НАБОРА;
             //   успокоились и |err_filt| <= 0.1 -> остаёмся, штатный fine_trim.
+            // Просадка от 1с паузы + замера дрейфа «оплачена», как только P_filt
+            // вернулось к цели (|err_filt| <= 0.1): дальше выбросы уже диагностичны
+            // (равновесие), снимаем щит -> следующий хэндоф переучивает как обычно.
+            if (reg.fine_after_speed_search && fabsf(error_filt) <= 0.1)
+                reg.fine_after_speed_search = false;
             bool fast = (reg.fine_change >= reg.fine_hold_change);
-            if (!fast && fabsf(error_filt) > 0.1) {
+            // grace: только что выбрали направление в «поиске скорости» -> даём FINE одно
+            // окно (fine_period_us) отработать (вернуть P к цели открытием иглы), прежде
+            // чем гейт сочтёт нас «успокоились, но мимо» и отдаст в HOLD. Иначе дрейф за
+            // 1с паузы + 2с замера роняет P ниже цели > 0.1 и гейт хэндофил бы сразу.
+            bool grace = (now_us - reg.fine_grace_t0_us) < reg.fine_period_us;
+            if (!fast && !grace && fabsf(error_filt) > 0.1) {
                 // СБРОС-FINE: держать против утечки нечем (она тоже вниз) -> просто отдаём в
                 // обычный HOLD ниже; charge-переучивание (fine_visited/last_pos/мид-доза)
                 // пропускаем — это позиции НАБОРА (иной перепад на игле). НАБОР-FINE учится как раньше.
                 if (reg.servo_state != SERVO_VENTING) {
+                if (reg.fine_after_speed_search) {
+                    // Выброс ВНИЗ тут — недобранная ПРОСАДКА от 1с паузы + замера дрейфа
+                    // (объём был запечатан и травил), а НЕ «равновесие fine_pos низкое»:
+                    // игла ещё добирала (rate_filt>0), grace-окна не хватило догнать 0.18.
+                    // Переучивать (+relearn) и резать дозу НЕЛЬЗЯ — повторный вход идёт по
+                    // fine_dir_known БЕЗ паузы/замера, значит уже БЕЗ просадки, и сел бы на
+                    // fine_pos+2 -> перелёт. Отдаём в HOLD как есть: эпизод догонит просадку,
+                    // FINE вернётся на ту же позицию. Если она реально низкая — чистый
+                    // повторный вход просядет от цели и СЛЕДУЮЩИЙ хэндоф переучит (флаг снят).
+                    ESP_LOGW("PID", "FINE: выброс вниз спровоцирован замером дрейфа (просадка ещё добиралась) -> НЕ переучиваем, доза %ld без изменений",
+                             (long)reg.step_holding_charge);
+                } else {
                 // Учимся на ПОВТОРНЫЙ вход: запоминаем последнюю позицию FINE и сторону
                 // выброса. Выбросило ВНИЗ (P<цель, err_filt>0) -> в равновесии надо ОТКРЫТЬ
                 // больше (+fine_relearn_step); ВВЕРХ (P>цель) -> прикрыть (−). Следующий
@@ -1110,7 +1229,9 @@ void pid_regulator_task(void *pvParameters) {
                 // середину между ними — это ~равновесие, эпизод подкачает мягко.
                 if (error_filt > 0.0f)
                     reg.step_holding_charge = (reg.fine_pos + reg.step_holding_charge) / 2;
+                }
                 }   // конец «только НАБОР» (переучивание/мид-доза). Ниже — общий выход в HOLD.
+                reg.fine_after_speed_search = false;  // эпизод поиска-скорости отыгран (просадку догонит HOLD)
                 reg.fine_holding  = false;
                 apply_servo(&reg, SERVO_NEUTRAL);
                 target_valve = reg.valve_flow_floor;
@@ -1148,36 +1269,27 @@ void pid_regulator_task(void *pvParameters) {
                         
                         reg.dose_searching = false;   // цель достигнута — быстрый поиск (если шёл) прекращаем
                         if (reg.hold_fine_enable && reg.dose_charge_calibrated) {
-                            // НАБОРОМ вышли на точку и доза проверена делом ->
-                            // вместо печати точный холдинг: серво ОСТАЁТСЯ в
-                            // НАБОРЕ. Если равновесие уже найдено — игла сразу
-                            // на него; если нет — чуть ниже дозы и ищем
-                            // (+-fine_trim раз в окно по знаку скорости).
-                            reg.fine_holding  = true;
-                            if (reg.fine_visited) {
-                                // уже были в FINE этой уставкой -> ±fine_relearn_step от
-                                // последней позиции по стороне прошлого выброса (учимся)
-                                reg.fine_pos = reg.fine_last_pos + reg.fine_seed_adj;
+                            // Вышли на точку и доза проверена делом -> НЕ печатаем.
+                            reg.fine_holding = true;
+                            if (reg.fine_dir_known) {
+                                // направление для этой уставки уже определено замером ->
+                                // СРАЗУ удержание, без повторного запечатывания и замера
+                                apply_servo(&reg, reg.fine_dir);
+                                reg.fine_pos         = fine_seed_for_dir(&reg, reg.fine_dir);
+                                reg.fine_grace_t0_us = now_us;        // дать одно окно до гейта HOLD
+                                dose_window_reset(&reg, now_us);
+                                target_valve = reg.fine_pos;
+                                ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.2f",
+                                         (reg.fine_dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg.fine_pos, pressure);
                             } else {
-                                // первый вход: дозовая/флоу-позиция step_holding_charge ВЫШЕ равновесия
-                                // (доза переливает, чтобы ДОСТАТЬ цель), поэтому садимся на fine_seed_back
-                                // шагов НИЖЕ — ближе к точке, где приток = утечке. fine_seed_back держим
-                                // МАЛЕНЬКИМ (~4): большой откат (было 20) FINE потом долго отыгрывал вверх.
-                                reg.fine_pos = reg.step_holding_charge - reg.fine_seed_back;
+                                // ПЕРВЫЙ раз на этой уставке: серво в НЕЙТРАЛЬ, игла floor,
+                                // пауза 1с, затем замер дрейфа -> направление (запомнится).
+                                apply_servo(&reg, SERVO_NEUTRAL);
+                                target_valve = reg.valve_flow_floor;
+                                fix_time_for_delay = now_us;
+                                first_in_fine = true;
+                                ESP_LOGI("PID", "FINE: вход — направление ещё не определено: серво в нейтраль, пауза 1с, затем замер дрейфа. P=%.2f", pressure);
                             }
-                            if (reg.fine_pos < reg.valve_flow_floor) reg.fine_pos = reg.valve_flow_floor;
-                            if (reg.fine_pos > reg.valve_max)        reg.fine_pos = reg.valve_max;
-                            dose_window_reset(&reg, now_us);
-
-                            ESP_LOGI("PID", "FINE: вход, игла %ld (%s), серво остаётся в НАБОРЕ. P=%.2f",
-                                     (long)reg.fine_pos,
-                                     reg.fine_visited ? "±переучивание от прошлой"
-                                                      : "первый вход: на найденную флоу-позицию",
-                                     pressure);
-                            //target_valve = reg.fine_pos;
-                            target_valve = reg.valve_flow_floor;
-                            fix_time_for_delay = now_us; // фиксируем время для задержки в 1с перед тем как перейти к fine_pos
-                            first_in_fine = true; // это сделано чтоб секунду постоять (270 - 0 - 250 вот так сделать)
                         } else {
                             apply_servo(&reg, SERVO_NEUTRAL);   // печатаем как раньше
                             target_valve = reg.valve_flow_floor;
@@ -1196,25 +1308,26 @@ void pid_regulator_task(void *pvParameters) {
                     if (error_filt >= -reg.sensor_noise_delta_filt) {            // дошли РОВНО до цели
                         reg.dose_searching = false;   // цель достигнута
                         if (reg.hold_fine_enable && reg.dose_vent_calibrated) {
-                            // СБРОСОМ вышли на точку и доза проверена делом -> вместо печати
-                            // ТОЧНЫЙ ХОЛДИНГ, серво ОСТАЁТСЯ в СБРОСЕ (servo=2). hold_fine_step
-                            // берёт знак из servo_state и зеркалит: тут открытие иглы СТРАВЛИВАЕТ,
-                            // поэтому «выросло (тепловой подскок) -> приоткрыть, упало -> прикрыть».
-                            // Держать против УТЕЧКИ тут нечем (она тоже вниз): просадка ниже цели
-                            // уйдёт в обычный HOLD -> эпизод НАБОРА (гейт FINE->HOLD при |err|>0.1).
+                            // Вышли на точку СБРОСОМ -> НЕ печатаем.
                             reg.fine_holding = true;
-                            // первый вход: садимся на fine_seed_back НИЖЕ дозы (меньше сброса ->
-                            // не проскочим вниз). Переучивание (fine_visited) у СБРОСА не
-                            // используем — те позиции относятся к НАБОРУ (иной перепад на игле).
-                            reg.fine_pos = reg.step_holding_vent - reg.fine_seed_back;
-                            if (reg.fine_pos < reg.valve_flow_floor) reg.fine_pos = reg.valve_flow_floor;
-                            if (reg.fine_pos > reg.valve_max)        reg.fine_pos = reg.valve_max;
-                            dose_window_reset(&reg, now_us);
-                            ESP_LOGI("PID", "FINE(СБРОС): вход, игла %ld, серво остаётся в СБРОСЕ. P=%.2f",
-                                     (long)reg.fine_pos, pressure);
-                            target_valve = reg.valve_flow_floor;
-                            fix_time_for_delay = now_us;   // пауза 1с в floor перед fine_pos (как у НАБОРА)
-                            first_in_fine = true;
+                            if (reg.fine_dir_known) {
+                                // направление уже определено замером -> сразу удержание
+                                apply_servo(&reg, reg.fine_dir);
+                                reg.fine_pos         = fine_seed_for_dir(&reg, reg.fine_dir);
+                                reg.fine_grace_t0_us = now_us;
+                                dose_window_reset(&reg, now_us);
+                                target_valve = reg.fine_pos;
+                                ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.2f",
+                                         (reg.fine_dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg.fine_pos, pressure);
+                            } else {
+                                // ПЕРВЫЙ раз на этой уставке: серво в НЕЙТРАЛЬ, игла floor,
+                                // пауза 1с, затем замер дрейфа -> направление (запомнится).
+                                apply_servo(&reg, SERVO_NEUTRAL);
+                                target_valve = reg.valve_flow_floor;
+                                fix_time_for_delay = now_us;
+                                first_in_fine = true;
+                                ESP_LOGI("PID", "FINE(после СБРОСА): вход — направление ещё не определено: серво в нейтраль, пауза 1с, затем замер. P=%.2f", pressure);
+                            }
                         } else {
                             apply_servo(&reg, SERVO_NEUTRAL);   // печатаем как раньше
                             target_valve = reg.valve_flow_floor;
