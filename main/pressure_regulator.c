@@ -259,6 +259,11 @@ void regulator_init(PressureRegulator* reg) {
     reg->fine_min_setpoint = 489.0f;
     reg->hold_trig_band    = 0.04f;
     reg->hold_reseal_band  = 0.02f;
+    // СБРОС-эпизод (low_mode): выдержка между серво->VENT и открытием иглы, чтобы штуцер
+    // успел стравиться (иначе игла распахивается раньше серво и штуцер дампит в объём).
+    reg->hold_vent_arming    = false;
+    reg->hold_vent_arm_t0_us = 0;
+    reg->hold_vent_settle_us = 350000ULL;  // 0.35 с: ход серво 90°->VENT + стравливание штуцера
 
     // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
@@ -751,6 +756,7 @@ static void reset_controllers(PressureRegulator* reg) {
     reg->dose_searching  = false; // начатый поиск порога потока к новой уставке не относится
     reg->fine_visited    = false; // переучивание FINE (±5 от прошлой позиции) — на новой уставке с чистого листа
     reg->fine_after_speed_search = false; // щит «не переучивать на просадке замера» к новой уставке не относится
+    reg->hold_vent_arming = false; // недоигранная выдержка серво->игла перед сбросом к новой уставке не относится
     first_in_fine        = false; // недоигранная пауза входа в FINE к новой уставке не относится
 }
                                                       //и только потом ждать минимально необходимую скорость (которая должна быть больше чем sensor_noise_delta)
@@ -1074,6 +1080,7 @@ void pid_regulator_task(void *pvParameters) {
             reg.dose_charge_calibrated = false;
             reg.dose_vent_calibrated   = false;
             reg.fine_visited           = false;  // большой выброс — переучивание FINE начинаем заново
+            reg.hold_vent_arming       = false;  // прерываем выдержку серво->игла, если шла
             reg.rate_integral          = 0.0f;   // чистый старт контура скорости
         }
 
@@ -1097,6 +1104,7 @@ void pid_regulator_task(void *pvParameters) {
                 int32_t seed = current_valve_position - reg.dose_step_back;
                 if (seed < reg.valve_flow_floor) seed = reg.valve_flow_floor;
                 if (reg.servo_state == SERVO_VENTING) {        // подходили сбросом
+                    if(seed > 200) seed = 200; // ХАРДКОД, потому что когда сетпоинт 50, этих -30 по дефолту вообще не хватает когда оно 500 шаг фигачит и тупо перелетает
                     reg.step_holding_vent      = seed;       // = старт перебора поиска порога СБРОСА (подсказка RATE)
                     // Симметрично НАБОРУ: seed (= позиция RATE - dose_step_back) НЕ доверяем
                     // как готовой дозе — он НИЖЕ реального порога потока. Снимаем калибровку
@@ -1304,11 +1312,22 @@ void pid_regulator_task(void *pvParameters) {
                     if (dir != SERVO_NEUTRAL) {
                         apply_servo(&reg, dir);
                         dose_window_reset(&reg, now_us);
-                        target_valve = (dir == SERVO_CHARGING) ? reg.step_holding_charge
-                                                               : reg.step_holding_vent;
-                        ESP_LOGI("PID", "HOLD: эпизод %s, игла на %ld, err_filt=%.2f",
-                                 (dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС",
-                                 (long)target_valve, error_filt);
+                        if (low_mode && dir == SERVO_VENTING) {
+                            // Сначала серво в VENT, игла ждёт во floor: иначе игла распахнётся
+                            // раньше серво и заряженный штуцер дампит в объём (заброс вверх).
+                            // На дозу откроем после выдержки (см. начало case SERVO_VENTING).
+                            reg.hold_vent_arming    = true;
+                            reg.hold_vent_arm_t0_us = now_us;
+                            target_valve = reg.valve_flow_floor;
+                            ESP_LOGI("PID", "HOLD: эпизод СБРОС — серво в VENT, игла ждёт %.0f мс (стравить штуцер), err_filt=%.2f",
+                                     (float)reg.hold_vent_settle_us / 1000.0f, error_filt);
+                        } else {
+                            target_valve = (dir == SERVO_CHARGING) ? reg.step_holding_charge
+                                                                   : reg.step_holding_vent;
+                            ESP_LOGI("PID", "HOLD: эпизод %s, игла на %ld, err_filt=%.2f",
+                                     (dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС",
+                                     (long)target_valve, error_filt);
+                        }
                     }
                     break;
                 }
@@ -1353,6 +1372,19 @@ void pid_regulator_task(void *pvParameters) {
                     break;
 
                 case SERVO_VENTING:
+                    if (reg.hold_vent_arming) {
+                        // Выдержка серво->игла (low_mode СБРОС): держим иглу во floor, пока
+                        // серво доезжает в VENT и штуцер стравливается на атмосферу. Без неё
+                        // игла открывается раньше серво и штуцер дампит в объём (+1.8 на 50).
+                        if (now_us - reg.hold_vent_arm_t0_us < reg.hold_vent_settle_us) {
+                            target_valve = reg.valve_flow_floor;
+                            break;
+                        }
+                        reg.hold_vent_arming = false;
+                        dose_window_reset(&reg, now_us);   // прогресс дозы — от реального старта стравливания
+                        ESP_LOGI("PID", "HOLD: СБРОС — серво осело (%.0f мс), открываю иглу. P=%.2f",
+                                 (float)reg.hold_vent_settle_us / 1000.0f, pressure);
+                    }
                     if (!reg.dose_vent_calibrated) {
                         // Порог потока СБРОСА ещё неизвестен -> быстрый перебор-поиск от seed
                         // вверх под откачивание до потока (симметрично НАБОРУ). Ветка ВЫШЕ
