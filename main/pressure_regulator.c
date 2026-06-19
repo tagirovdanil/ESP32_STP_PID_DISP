@@ -244,11 +244,22 @@ void regulator_init(PressureRegulator* reg) {
     reg->fine_trim_fast   = 8;           // пока давление ещё активно движется — крупный шаг (вместо fine_trim=2)
     reg->fine_hold_change = 0.5f;        // |ΔP_filt| за ~5 с >= этого = «ещё движусь»: не отдаём в HOLD
     reg->fine_rate_t0_us  = 0;           // 0 -> трекер fine_change сам инициализируется на 1-м тике RUNNING
-    reg->fine_ss_period_us = 3000000ULL; // НОВЫЙ ЭТАП «поиск скорости»: замер дрейфа запечатанного объёма    // было 2с, как будто не успевало, поставил 3с
+    reg->fine_ss_period_us = 5000000ULL; // НОВЫЙ ЭТАП «поиск скорости»: замер дрейфа запечатанного объёма    // было 2с, как будто не успевало, поставил 3с // тока на откачивание, поэтому пусть 5с
                                          // 2 с после паузы -> направление удержания (dP<0 НАБОР / dP>=0 СБРОС)
     reg->fine_ss_seal_band = 0.003f;     // |дрейф| меньше этого = объём держит сам -> без FINE, перекрываем
                                          // всё (игла 0, серво нейтраль). На 50 кПа видели dP=-0.001 за 2с
     reg->fine_ss_vent_offset = 0.3f;     // подход СБРОСОМ: замер дрейфа запечатываем на (цель+0.3), не на цели (п.2)
+
+    // --- ВЫБОР РЕЖИМА ПО УСТАВКЕ + полосы СЕРВО-ОТСЕЧКИ (низкая уставка) ---
+    // 489: на 500 FINE держит, на 400 равновесие не находится (pos уползает в floor,
+    // давление дрейфует) -> ниже 489 точный холдинг выключаем и держим серво-отсечкой.
+    // Полосы узкие (фильтрация давления это тянет): срабатывание из покоя при |err_filt|
+    // > 0.04, возврат-запечатывание при подходе ближе 0.02 к цели. trig>reseal — снимаем
+    // коррекцию на той же стороне от цели (P не пересекает уставку) -> нет пинг-понга.
+    reg->fine_min_setpoint = 489.0f;
+    reg->hold_trig_band    = 0.04f;
+    reg->hold_reseal_band  = 0.02f;
+
     // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
     // слю ~2400 шаг/с, полный ход ~4 с). Если игла открывается слишком медленно —
@@ -1036,6 +1047,17 @@ void pid_regulator_task(void *pvParameters) {
         int32_t target_valve = current_valve_position;   // по умолчанию — стоим
         const char* zone;
 
+        // -------- Режим удержания по уставке: FINE (точный холдинг) или СЕРВО-ОТСЕЧКА --------
+        // Ниже fine_min_setpoint FINE не сходится (равновесия нет, pos уползает в floor) ->
+        // держим bang-bang'ом: запечатано (нейтраль, игла floor); уход за hold_trig от цели
+        // -> импульс предкалиброванным шагом набора/сброса до возврата в hold_reseal, затем
+        // снова запечатано. В зоне >= fine_min_setpoint полосы прежние (0.1 /
+        // sensor_noise_delta_filt) и use_fine=hold_fine_enable -> поведение FINE не меняется.
+        bool  low_mode    = reg.active_setpoint < reg.fine_min_setpoint;
+        bool  use_fine    = reg.hold_fine_enable && !low_mode;
+        float hold_trig   = low_mode ? reg.hold_trig_band   : 0.1f;
+        float hold_reseal = low_mode ? reg.hold_reseal_band : reg.sensor_noise_delta_filt;
+
         // Возврат HOLD->RATE, если ошибка уехала далеко (ложный вход на спайке или
         // сильная просадка): микродозой 17 кПа не наберёшь. Гистерезис: вошли в HOLD
         // при |error|<=hold_enter_err(0.5), выходим при |err_filt|>hold_exit_err(5).
@@ -1277,8 +1299,8 @@ void pid_regulator_task(void *pvParameters) {
                 case SERVO_NEUTRAL: {
                     target_valve = reg.valve_flow_floor;     // запечатано: игла закрыта
                     ServoState dir = SERVO_NEUTRAL;
-                    if      (error_filt >  0.1f) dir = SERVO_CHARGING; // упало -> набрать     // пробую фильт * 2 // маловато, решил 0.1 поставить
-                    else if (error_filt < -0.1f) dir = SERVO_VENTING;  // выросло -> стравить
+                    if      (error_filt >  hold_trig) dir = SERVO_CHARGING; // упало -> набрать  (low_mode: ±hold_trig_band, иначе 0.1)
+                    else if (error_filt < -hold_trig) dir = SERVO_VENTING;  // выросло -> стравить
                     if (dir != SERVO_NEUTRAL) {
                         apply_servo(&reg, dir);
                         dose_window_reset(&reg, now_us);
@@ -1301,10 +1323,10 @@ void pid_regulator_task(void *pvParameters) {
                         // поиску, пока утечка ведёт P к цели (п.2: утечка -> сразу ищем порог накачки).
                         zone = "SEARCH";
                         target_valve = hold_search_step(&reg, now_us, true);
-                    } else if (error_filt <= reg.sensor_noise_delta_filt) {             // дошли РОВНО до цели  // поменял 0 на reg.sensor_noise_delta_filt (0.03) для компенсации перелета. Не уверен что надо именно эту переменную, но в целом как будто она подходит
+                    } else if (error_filt <= hold_reseal) {             // дошли до цели (low_mode: цель−hold_reseal_band; иначе sensor_noise_delta_filt для компенсации перелёта)
 
                         reg.dose_searching = false;   // цель достигнута — быстрый поиск (если шёл) прекращаем
-                        if (reg.hold_fine_enable) {   // dose_charge_calibrated уже true (внешнее условие)
+                        if (use_fine) {   // dose_charge_calibrated уже true; low_mode -> FINE выключен (else: печать/серво-отсечка)
                             // Вышли на точку НАБОРОМ -> НЕ печатаем. Дрейф 3с НЕ замеряем:
                             // раз дошли накачкой, объём травит вниз (утечка) — удержание
                             // ВСЕГДА НАБОРОМ, берём утечку за правду. Замер дрейфа оставлен
@@ -1355,7 +1377,7 @@ void pid_regulator_task(void *pvParameters) {
                         } else {
                             target_valve = hold_dose_step(&reg, now_us, false, pressure);
                         }
-                    } else if (reg.hold_fine_enable) {
+                    } else if (use_fine) {
                         // Порог СБРОСА найден (поиск выше уже калибровал дозу), но направление
                         // удержания ещё НЕ определено -> опускаемся до (цель+offset) и ТАМ замеряем
                         // дрейф (запас вниз на просадку за 1с+замер). На цели замерять нельзя:
@@ -1374,8 +1396,8 @@ void pid_regulator_task(void *pvParameters) {
                             target_valve = hold_dose_step(&reg, now_us, false, pressure);  // спуск до точки замера
                         }
                     } else {
-                        // hold_fine_enable=false -> старое поведение: печать РОВНО на цели
-                        if (error_filt >= -reg.sensor_noise_delta_filt) {
+                        // low_mode (серво-отсечка) или hold_fine_enable=false: запечатываем у цели
+                        if (error_filt >= -hold_reseal) {   // low_mode: цель+hold_reseal_band; иначе sensor_noise_delta_filt
                             reg.dose_searching = false;
                             apply_servo(&reg, SERVO_NEUTRAL);
                             target_valve = reg.valve_flow_floor;
