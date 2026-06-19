@@ -1075,8 +1075,13 @@ void pid_regulator_task(void *pvParameters) {
                 int32_t seed = current_valve_position - reg.dose_step_back;
                 if (seed < reg.valve_flow_floor) seed = reg.valve_flow_floor;
                 if (reg.servo_state == SERVO_VENTING) {        // подходили сбросом
-                    reg.step_holding_vent      = seed;
-                    reg.dose_vent_calibrated   = true;
+                    reg.step_holding_vent      = seed;       // = старт перебора поиска порога СБРОСА (подсказка RATE)
+                    // Симметрично НАБОРУ: seed (= позиция RATE - dose_step_back) НЕ доверяем
+                    // как готовой дозе — он НИЖЕ реального порога потока. Снимаем калибровку
+                    // СБРОСА, чтобы в HOLD запустился быстрый перебор-поиск порога (идея 3):
+                    // он переберёт от seed вверх под откачивание и найдёт реальный порог у
+                    // цели (раньше прыгали сразу на seed + медленная доза, "75 -> 45").
+                    reg.dose_vent_calibrated   = false;
                     reg.step_holding_charge    = reg.valve_flow_floor;
                     reg.dose_charge_calibrated = false;
                 } else {                                       // подходили набором
@@ -1092,7 +1097,7 @@ void pid_regulator_task(void *pvParameters) {
                 }
                 dose_window_reset(&reg, now_us);
                 target_valve = seed;              // серво НЕ трогаем — доводим в текущую сторону
-                // (набор -> дальше быстрый ПОИСК ПОРОГА от seed; сброс -> доводим струйкой)
+                // (и НАБОР, и СБРОС -> дальше быстрый ПОИСК ПОРОГА от seed: калибровка снята выше)
                 ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed). P=%.2f",
                          (long)current_valve_position, (long)seed, pressure);
             } else {
@@ -1300,27 +1305,22 @@ void pid_regulator_task(void *pvParameters) {
 
                         reg.dose_searching = false;   // цель достигнута — быстрый поиск (если шёл) прекращаем
                         if (reg.hold_fine_enable) {   // dose_charge_calibrated уже true (внешнее условие)
-                            // Вышли на точку и доза проверена делом -> НЕ печатаем.
-                            reg.fine_holding = true;
-                            if (reg.fine_dir_known) {
-                                // направление для этой уставки уже определено замером ->
-                                // СРАЗУ удержание, без повторного запечатывания и замера
-                                apply_servo(&reg, reg.fine_dir);
-                                reg.fine_pos         = fine_seed_for_dir(&reg, reg.fine_dir);
-                                reg.fine_grace_t0_us = now_us;        // дать одно окно до гейта HOLD
-                                dose_window_reset(&reg, now_us);
-                                target_valve = reg.fine_pos;
-                                ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.2f",
-                                         (reg.fine_dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg.fine_pos, pressure);
-                            } else {
-                                // ПЕРВЫЙ раз на этой уставке: серво в НЕЙТРАЛЬ, игла floor,
-                                // пауза 1с, затем замер дрейфа -> направление (запомнится).
-                                apply_servo(&reg, SERVO_NEUTRAL);
-                                target_valve = reg.valve_flow_floor;
-                                fix_time_for_delay = now_us;
-                                first_in_fine = true;
-                                ESP_LOGI("PID", "FINE: вход — направление ещё не определено: серво в нейтраль, пауза 1с, затем замер дрейфа. P=%.2f", pressure);
-                            }
+                            // Вышли на точку НАБОРОМ -> НЕ печатаем. Дрейф 3с НЕ замеряем:
+                            // раз дошли накачкой, объём травит вниз (утечка) — удержание
+                            // ВСЕГДА НАБОРОМ, берём утечку за правду. Замер дрейфа оставлен
+                            // только для подхода СБРОСОМ (там поведение запечатанного объёма
+                            // заранее неясно). Фиксируем направление = НАБОР и сразу в точное
+                            // удержание (как при уже известном направлении, без запечатывания).
+                            reg.fine_holding     = true;
+                            reg.fine_dir         = SERVO_CHARGING;
+                            reg.fine_dir_known   = true;
+                            apply_servo(&reg, reg.fine_dir);
+                            reg.fine_pos         = fine_seed_for_dir(&reg, reg.fine_dir);
+                            reg.fine_grace_t0_us = now_us;        // дать одно окно до гейта HOLD
+                            dose_window_reset(&reg, now_us);
+                            target_valve = reg.fine_pos;
+                            ESP_LOGI("PID", "FINE: вход НАБОРОМ -> сразу удержание (дрейф не замеряем, утечка за правду), игла на %ld. P=%.2f",
+                                     (long)reg.fine_pos, pressure);
                         } else {
                             apply_servo(&reg, SERVO_NEUTRAL);   // печатаем как раньше
                             target_valve = reg.valve_flow_floor;
@@ -1331,16 +1331,18 @@ void pid_regulator_task(void *pvParameters) {
                     break;
 
                 case SERVO_VENTING:
-                    if (reg.fine_dir_known) {
-                        // Направление удержания на эту уставку уже определено замером дрейфа.
-                        // Дозу СБРОСА ищем порогом (ПОДГОНА УГЛА), пока не калибрована (п.1) — эта
-                        // ветка ВЫШЕ проверки «дошли», чтобы поиск гарантированно завершился, а не
-                        // перехватывался ею при дрейфе P к цели; затем доводим дозой и РОВНО на цели
-                        // входим в точное удержание.
-                        if (!reg.dose_vent_calibrated) {
-                            zone = "SEARCH";
-                            target_valve = hold_search_step(&reg, now_us, false);  // п.1: поиск порога СБРОСА
-                        } else if (error_filt >= -reg.sensor_noise_delta_filt) {   // дошли РОВНО до цели
+                    if (!reg.dose_vent_calibrated) {
+                        // Порог потока СБРОСА ещё неизвестен -> быстрый перебор-поиск от seed
+                        // вверх под откачивание до потока (симметрично НАБОРУ). Ветка ВЫШЕ
+                        // выбора направления и проверки «дошли»: поиск должен гарантированно
+                        // завершиться и привести P к цели, а не перехватываться ими при дрейфе
+                        // P к цели. После него доза СБРОСА калибрована реальным порогом.
+                        zone = "SEARCH";
+                        target_valve = hold_search_step(&reg, now_us, false);  // поиск порога СБРОСА
+                    } else if (reg.fine_dir_known) {
+                        // Направление удержания на эту уставку уже определено замером дрейфа ->
+                        // доводим дозой и РОВНО на цели входим в точное удержание.
+                        if (error_filt >= -reg.sensor_noise_delta_filt) {   // дошли РОВНО до цели
                             reg.dose_searching = false;
                             reg.fine_holding   = true;
                             apply_servo(&reg, reg.fine_dir);
@@ -1354,13 +1356,14 @@ void pid_regulator_task(void *pvParameters) {
                             target_valve = hold_dose_step(&reg, now_us, false, pressure);
                         }
                     } else if (reg.hold_fine_enable) {
-                        // п.2: направление ещё НЕ определено -> опускаемся до (цель+offset) и
-                        // ТАМ замеряем дрейф (запас вниз на просадку за 1с+замер). На цели
-                        // замерять нельзя: утечка за время замера увела бы P ниже цели.
+                        // Порог СБРОСА найден (поиск выше уже калибровал дозу), но направление
+                        // удержания ещё НЕ определено -> опускаемся до (цель+offset) и ТАМ замеряем
+                        // дрейф (запас вниз на просадку за 1с+замер). На цели замерять нельзя:
+                        // утечка за время замера увела бы P ниже цели. Дозу СБРОСА НЕ сбрасываем —
+                        // она уже калибрована поиском (раньше тут был провизорный спуск seed'ом).
                         if (error_filt >= -reg.fine_ss_vent_offset) {            // дошли до точки замера (цель+offset)
                             reg.dose_searching       = false;
                             reg.fine_holding         = true;
-                            reg.dose_vent_calibrated = false;   // провизорную дозу спуска отбрасываем — порог найдём поиском
                             apply_servo(&reg, SERVO_NEUTRAL);
                             target_valve = reg.valve_flow_floor;
                             fix_time_for_delay = now_us;
