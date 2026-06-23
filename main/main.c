@@ -150,14 +150,14 @@ static void handle_command(char *str) {
     }
 
     // ==========================================================================
-    // ОБРАБОТКА КОМАНДЫ "RESET"
+    // ОБРАБОТКА КОМАНДЫ "VENT"
     // ==========================================================================
-    char *reset_ptr = strstr(str, "reset");
-    if (reset_ptr == NULL) {
-        reset_ptr = strstr(str, "RESET");
+    char *vent_ptr = strstr(str, "vent");
+    if (vent_ptr == NULL) {
+        vent_ptr = strstr(str, "VENT");
     }
-
-    if (reset_ptr != NULL) {
+    
+    if (vent_ptr != NULL) {
         // Запускаем процедуру физического сброса давления
         start_pressure_homing();
         respond("\r\n>> [OK] Physical pressure reset started...\r\n");
@@ -222,6 +222,26 @@ static void handle_command(char *str) {
     if (cmd_ptr != NULL) {
         // Извлекаем числовое значение уставки, идущее после ключевого слова "set "
         float target = strtof(cmd_ptr + 4, NULL);
+
+        // Передаем новое значение напрямую в наш ПИД-регулятор через безопасную обертку
+        update_setpoint(target);
+
+        // Отправляем эхо-ответ обратно (в терминал ПК и WiFi-клиенту)
+        char response_msg[64];
+        snprintf(response_msg, sizeof(response_msg), "\r\n>> Target updated to: %.1f kPa\r\n", setpoint_kPa);
+        respond(response_msg);
+    }
+
+    // ОБРАБОТКА КОМАНДЫ "PSS X" == set X
+
+    char *pss_ptr = strstr(str, "pss ");
+    if (pss_ptr == NULL) {
+        pss_ptr = strstr(str, "PSS ");
+    }
+
+    if (pss_ptr != NULL) {
+        // Извлекаем числовое значение уставки, идущее после ключевого слова "pss "
+        float target = strtof(pss_ptr + 4, NULL);
 
         // Передаем новое значение напрямую в наш ПИД-регулятор через безопасную обертку
         update_setpoint(target);

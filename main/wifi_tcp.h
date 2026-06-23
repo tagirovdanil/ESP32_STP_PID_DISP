@@ -26,12 +26,12 @@
 // --- Параметры AP (если WIFI_TCP_MODE_AP == 1) ---------------------------------
 // Это имя сети, которое увидит телефон / вторая ESP32.
 // IP сервера в этом режиме всегда 192.168.4.1.
-#define WIFI_TCP_AP_SSID   "ESP32_PID"
+#define WIFI_TCP_AP_SSID   "ControllerN"
 #define WIFI_TCP_AP_PASS   "12345678"      // минимум 8 символов для WPA2
 #define WIFI_TCP_AP_CHAN   1
 
 // --- Параметры STA (если WIFI_TCP_MODE_AP == 0) --------------------------------
-#define WIFI_TCP_STA_SSID  "ESP32_PID"
+#define WIFI_TCP_STA_SSID  "ControllerN"
 #define WIFI_TCP_STA_PASS  "12345678"
 
 // --- Общие параметры -----------------------------------------------------------

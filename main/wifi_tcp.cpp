@@ -315,6 +315,47 @@ static void server_task(void* arg)
     }
 }
 
+// ============================ Перехват логов -> WiFi =========================
+// По умолчанию ВСЕ ESP_LOGx уходят только в USB-консоль. Чтобы те же строки
+// летели ещё и всем TCP-клиентам, ставим свой обработчик логов через
+// esp_log_set_vprintf(). IDF вызывает его на КАЖДЫЙ лог: мы пишем строку в
+// консоль (прежним обработчиком) и дублируем её копию в WiFi.
+//
+// Менять сами ESP_LOGx по коду не нужно — перехват глобальный.
+static vprintf_like_t s_orig_log_vprintf = NULL;
+
+// Страховка от рекурсии: если что-то ВНУТРИ отправки само залогирует, второй
+// заход в этом же таске уйдёт только в консоль, без WiFi (иначе — зацикливание).
+// __thread = своя копия флага у каждого таска, поэтому логи разных тасков
+// не мешают друг другу.
+static __thread bool s_in_log_hook = false;
+
+static int wifi_log_vprintf(const char* fmt, va_list ap)
+{
+    // va_list можно «прочитать» только один раз, поэтому делаем копию заранее:
+    // ap   -> для обычного вывода в консоль, ap2 -> для нашей копии в WiFi.
+    va_list ap2;
+    va_copy(ap2, ap);
+
+    // 1) Обычный вывод в USB-консоль (как было до перехвата).
+    int ret = s_orig_log_vprintf ? s_orig_log_vprintf(fmt, ap) : vprintf(fmt, ap);
+
+    // 2) Ту же строку шлём всем WiFi/TCP-клиентам.
+    if (!s_in_log_hook) {
+        s_in_log_hook = true;
+        char buf[256];
+        int n = vsnprintf(buf, sizeof(buf), fmt, ap2);   // длиннее 255 — обрежется
+        if (n > 0) {
+            // У строки лога уже есть '\n' в конце, wifi_tcp_send его не задвоит.
+            wifi_tcp_send(buf);
+        }
+        s_in_log_hook = false;
+    }
+
+    va_end(ap2);
+    return ret;
+}
+
 // ============================ Публичные функции ==============================
 void wifi_tcp_init(void)
 {
@@ -336,6 +377,11 @@ void wifi_tcp_init(void)
 #endif
 
     xTaskCreate(server_task, "tcp_srv", 4096, NULL, 5, NULL);
+
+    // Перенаправляем ВСЕ логи (ESP_LOGx) ещё и в WiFi. Ставим последним, чтобы
+    // сообщения самой инициализации выше ушли только в консоль. Возвращённый
+    // прежний обработчик сохраняем — через него продолжаем писать в USB-консоль.
+    s_orig_log_vprintf = esp_log_set_vprintf(wifi_log_vprintf);
 }
 
 void wifi_tcp_send(const char* msg)
