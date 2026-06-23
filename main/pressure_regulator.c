@@ -241,7 +241,7 @@ void regulator_init(PressureRegulator* reg) {
                                          // было 0.05 (мёртвая зона); 0.02 = на уровне шума P_filt (~±0.02), но
                                          // «стоим» уже требует плоского окна -> дребезг максимум ±1 шаг
     reg->fine_dev_guard   = 0.00f;       // было 0.05, потом 0.01 поставил - на 500 вышло, теперь пробую 0.00 q2: ниже цели на 0.01+ не прикрываем (−), выше на 0.01+ не приоткрываем (+)
-    reg->fine_trim_fast   = 8;           // пока давление ещё активно движется — крупный шаг (вместо fine_trim=2)
+    reg->fine_trim_fast   = 4;           // пока давление ещё активно движется — крупный шаг (вместо fine_trim=2)
     reg->fine_hold_change = 0.5f;        // |ΔP_filt| за ~5 с >= этого = «ещё движусь»: не отдаём в HOLD
     reg->fine_rate_t0_us  = 0;           // 0 -> трекер fine_change сам инициализируется на 1-м тике RUNNING
     reg->fine_ss_period_us = 5000000ULL; // НОВЫЙ ЭТАП «поиск скорости»: замер дрейфа запечатанного объёма    // было 2с, как будто не успевало, поставил 3с // тока на откачивание, поэтому пусть 5с
@@ -249,6 +249,10 @@ void regulator_init(PressureRegulator* reg) {
     reg->fine_ss_seal_band = 0.003f;     // |дрейф| меньше этого = объём держит сам -> без FINE, перекрываем
                                          // всё (игла 0, серво нейтраль). На 50 кПа видели dP=-0.001 за 2с
     reg->fine_ss_vent_offset = 0.3f;     // подход СБРОСОМ: замер дрейфа запечатываем на (цель+0.3), не на цели (п.2)
+    reg->fine_ss_charge_offset = 0.3f;   // подход НАБОРОМ: зеркально — замер запечатываем на (цель−0.3)
+    reg->ss_from_charge        = false;
+    reg->fine_ss_charge_precheck_us = 2500000ULL; // НАКАЧКА: 2.5с чистой паузы, потом доп.проверка направления
+    reg->ss_check_p0           = 0.0f;
 
     // --- ВЫБОР РЕЖИМА ПО УСТАВКЕ + полосы СЕРВО-ОТСЕЧКИ (низкая уставка) ---
     // 489: на 500 FINE держит, на 400 равновесие не находится (pos уползает в floor,
@@ -611,6 +615,7 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
 // на sgn: на наборе шаг=phys, на сбросе зеркальный (−phys).
 static int32_t fine_drift_step(PressureRegulator* reg, float drift, float error_filt, int32_t trim, int sgn) {
     int32_t phys = (drift < 0.0f) ? trim : -trim;                 // знак нужного ВОЗДЕЙСТВИЯ на давление
+    if(trim <= -4) trim = -3; // ЭТО ОТВРАТИТЕЛЬНЫЙ ХАРДКОД, надо бы переделать. Зачем это нужно, чтоб не было туда сюда +4 -4, а сводилось немного
     if (phys < 0 && error_filt >=  reg->fine_dev_guard) phys = 0;  // ниже цели -> не толкаем вниз
     if (phys > 0 && error_filt <= -reg->fine_dev_guard) phys = 0;  // выше цели -> не толкаем вверх
     return sgn * phys;                                            // НАБОР: шаг=phys; СБРОС: зеркально
@@ -757,6 +762,7 @@ static void reset_controllers(PressureRegulator* reg) {
     reg->fine_visited    = false; // переучивание FINE (±5 от прошлой позиции) — на новой уставке с чистого листа
     reg->fine_after_speed_search = false; // щит «не переучивать на просадке замера» к новой уставке не относится
     reg->hold_vent_arming = false; // недоигранная выдержка серво->игла перед сбросом к новой уставке не относится
+    reg->ss_from_charge  = false; // недоигранная доп.проверка/замер накачки к новой уставке не относится
     first_in_fine        = false; // недоигранная пауза входа в FINE к новой уставке не относится
 }
                                                       //и только потом ждать минимально необходимую скорость (которая должна быть больше чем sensor_noise_delta)
@@ -1144,16 +1150,48 @@ void pid_regulator_task(void *pvParameters) {
             if (first_in_fine) {
             // Пауза 5с в floor при входе в FINE: глушим перелив дозы ПЕРЕД замером
             // дрейфа. Серво уже в НЕЙТРАЛИ (объём запечатан), floor ниже порога потока.
-                if (now_us - fix_time_for_delay >= 5000000ULL) {   // 5 с прошла -> старт замера дрейфа
+                target_valve = reg.valve_flow_floor;               // всю паузу запечатано
+                if (reg.ss_from_charge) {
+                    // НАКАЧИВАНИЕ: первые fine_ss_charge_precheck_us — чистая пауза, остаток
+                    // 5с-паузы — ДОП.ПРОВЕРКА направления. Падаем (утечка) -> сразу НАБОР, в
+                    // замер дрейфа НЕ идём; растём -> обычный замер дрейфа (как при СБРОСЕ).
+                    uint64_t elapsed = now_us - fix_time_for_delay;
+                    if (elapsed < reg.fine_ss_charge_precheck_us) {
+                        reg.ss_check_p0 = reg.filtered_pressure;   // тянем опорное P до старта проверки (= P на 2.5с)
+                    } else if (elapsed < 5000000ULL) {
+                        // фаза доп.проверки: опорное P зафиксировано, ждём конца окна
+                    } else {
+                        float dp_check = reg.filtered_pressure - reg.ss_check_p0;
+                        float check_s  = (float)(5000000ULL - reg.fine_ss_charge_precheck_us) / 1000000.0f;
+                        first_in_fine  = false;
+                        if (dp_check < 0.0f) {
+                            // ПАДАЕМ -> утечка, держим НАБОРОМ. Замер дрейфа пропускаем.
+                            reg.fine_dir         = SERVO_CHARGING;
+                            reg.fine_dir_known   = true;
+                            apply_servo(&reg, SERVO_CHARGING);
+                            reg.fine_pos         = fine_seed_for_dir(&reg, SERVO_CHARGING);
+                            reg.fine_grace_t0_us = now_us;
+                            reg.fine_after_speed_search = true;
+                            dose_window_reset(&reg, now_us);
+                            target_valve = reg.fine_pos;
+                            ESP_LOGI("PID", "FINE(накачка): доп.проверка %.1fс ПАДАЕМ dP=%+.3f -> сразу НАБОР, игла на %ld. P=%.2f",
+                                     check_s, dp_check, (long)reg.fine_pos, pressure);
+                        } else {
+                            // РАСТЁМ -> обычный замер дрейфа (как было), решаем там.
+                            reg.fine_speed_search = true;
+                            reg.fine_ss_t0_us     = now_us;
+                            reg.fine_ss_p0        = reg.filtered_pressure;
+                            ESP_LOGI("PID", "FINE(накачка): доп.проверка %.1fс РАСТЁМ dP=%+.3f -> замер дрейфа %.1fс (P_filt=%.2f)",
+                                     check_s, dp_check, (float)reg.fine_ss_period_us / 1000000.0f, reg.fine_ss_p0);
+                        }
+                    }
+                } else if (now_us - fix_time_for_delay >= 5000000ULL) {   // СБРОС: 5 с пауза -> старт замера дрейфа
                     first_in_fine          = false;
                     reg.fine_speed_search  = true;                 // этап «поиск скорости»
                     reg.fine_ss_t0_us      = now_us;
                     reg.fine_ss_p0         = reg.filtered_pressure; // фиксируем P_filt
-                    target_valve           = reg.valve_flow_floor; // держим запечатано
                     ESP_LOGI("PID", "FINE: пауза 5с окончена -> замер дрейфа %.1fс (P_filt=%.2f зафиксировано)",
                              (float)reg.fine_ss_period_us / 1000000.0f, reg.fine_ss_p0);
-                } else {
-                    target_valve = reg.valve_flow_floor;           // стоим в floor, ждём
                 }
             } else if (reg.fine_speed_search) {
             // ЭТАП «ПОИСК СКОРОСТИ»: объём ещё запечатан (серво нейтраль, игла floor).
@@ -1342,30 +1380,43 @@ void pid_regulator_task(void *pvParameters) {
                         // поиску, пока утечка ведёт P к цели (п.2: утечка -> сразу ищем порог накачки).
                         zone = "SEARCH";
                         target_valve = hold_search_step(&reg, now_us, true);
-                    } else if (error_filt <= hold_reseal) {             // дошли до цели (low_mode: цель−hold_reseal_band; иначе sensor_noise_delta_filt для компенсации перелёта)
-
-                        reg.dose_searching = false;   // цель достигнута — быстрый поиск (если шёл) прекращаем
-                        if (use_fine) {   // dose_charge_calibrated уже true; low_mode -> FINE выключен (else: печать/серво-отсечка)
-                            // Вышли на точку НАБОРОМ -> НЕ печатаем. Дрейф 3с НЕ замеряем:
-                            // раз дошли накачкой, объём травит вниз (утечка) — удержание
-                            // ВСЕГДА НАБОРОМ, берём утечку за правду. Замер дрейфа оставлен
-                            // только для подхода СБРОСОМ (там поведение запечатанного объёма
-                            // заранее неясно). Фиксируем направление = НАБОР и сразу в точное
-                            // удержание (как при уже известном направлении, без запечатывания).
-                            reg.fine_holding     = true;
-                            reg.fine_dir         = SERVO_CHARGING;
-                            reg.fine_dir_known   = true;
+                    } else if (reg.fine_dir_known) {
+                        // Направление удержания на эту уставку УЖЕ определено замером (как в
+                        // СБРОСЕ) -> больше НЕ замеряем и НЕ запечатываем: доводим дозой и РОВНО
+                        // на цели входим в точное удержание тем же направлением. Замер/доп.проверка
+                        // делаются ОДИН раз на уставку, дальше — сразу к точке.
+                        if (error <= reg.sensor_noise_delta_filt) {   // дошли РОВНО до цели
+                            reg.dose_searching = false;
+                            reg.fine_holding   = true;
                             apply_servo(&reg, reg.fine_dir);
                             reg.fine_pos         = fine_seed_for_dir(&reg, reg.fine_dir);
-                            reg.fine_grace_t0_us = now_us;        // дать одно окно до гейта HOLD
+                            reg.fine_grace_t0_us = now_us;
                             dose_window_reset(&reg, now_us);
                             target_valve = reg.fine_pos;
-                            ESP_LOGI("PID", "FINE: вход НАБОРОМ -> сразу удержание (дрейф не замеряем, утечка за правду), игла на %ld. P=%.2f",
-                                     (long)reg.fine_pos, pressure);
+                            ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.2f",
+                                     (reg.fine_dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg.fine_pos, pressure);
                         } else {
-                            apply_servo(&reg, SERVO_NEUTRAL);   // печатаем как раньше
-                            target_valve = reg.valve_flow_floor;
+                            target_valve = hold_dose_step(&reg, now_us, true, pressure);
                         }
+                    } else if (use_fine && error <= reg.fine_ss_charge_offset) {  // ПЕРВЫЙ замер на уставку: дошли до точки замера (цель − offset), зеркально СБРОСУ (цель + offset)
+                        // Симметрично подходу СБРОСОМ: дошли до (цель − fine_ss_charge_offset)
+                        // НАБОРОМ -> запечатываем объём (серво нейтраль, игла floor), пауза +
+                        // доп.проверка направления (только для накачки), затем при необходимости
+                        // замер дрейфа. Сами решат: вниз (утечка) -> НАБОР; вверх -> СБРОС.
+                        // ОДИН раз на уставку: после замера fine_dir_known -> ветка выше (без замера).
+                        reg.dose_searching = false;
+                        reg.fine_holding   = true;
+                        apply_servo(&reg, SERVO_NEUTRAL);
+                        target_valve       = reg.valve_flow_floor;
+                        fix_time_for_delay = now_us;
+                        first_in_fine      = true;
+                        reg.ss_from_charge = true;            // паузу/замер запустил приход НАБОРОМ -> доп.проверка
+                        ESP_LOGI("PID", "FINE(после НАБОРА): дошли до цель−%.2f -> серво в нейтраль, пауза + доп.проверка/замер. P=%.2f",
+                                 reg.fine_ss_charge_offset, pressure);
+                    } else if (!use_fine && error <= hold_reseal) {   // low_mode/печать: запечатываем у цели как раньше
+                        reg.dose_searching = false;
+                        apply_servo(&reg, SERVO_NEUTRAL);
+                        target_valve = reg.valve_flow_floor;
                     } else {
                         target_valve = hold_dose_step(&reg, now_us, true, pressure);
                     }
@@ -1396,7 +1447,7 @@ void pid_regulator_task(void *pvParameters) {
                     } else if (reg.fine_dir_known) {
                         // Направление удержания на эту уставку уже определено замером дрейфа ->
                         // доводим дозой и РОВНО на цели входим в точное удержание.
-                        if (error_filt >= -reg.sensor_noise_delta_filt) {   // дошли РОВНО до цели
+                        if (error >= -reg.sensor_noise_delta_filt) {   // дошли РОВНО до цели    // было: error_filt <= hold_reseal
                             reg.dose_searching = false;
                             reg.fine_holding   = true;
                             apply_servo(&reg, reg.fine_dir);
@@ -1415,13 +1466,14 @@ void pid_regulator_task(void *pvParameters) {
                         // дрейф (запас вниз на просадку за 1с+замер). На цели замерять нельзя:
                         // утечка за время замера увела бы P ниже цели. Дозу СБРОСА НЕ сбрасываем —
                         // она уже калибрована поиском (раньше тут был провизорный спуск seed'ом).
-                        if (error_filt >= -reg.fine_ss_vent_offset) {            // дошли до точки замера (цель+offset)
+                        if (error >= -reg.fine_ss_vent_offset) {            // дошли до точки замера (цель+offset)   // было: error_filt <= hold_reseal
                             reg.dose_searching       = false;
                             reg.fine_holding         = true;
                             apply_servo(&reg, SERVO_NEUTRAL);
                             target_valve = reg.valve_flow_floor;
                             fix_time_for_delay = now_us;
                             first_in_fine = true;
+                            reg.ss_from_charge = false;   // приход СБРОСОМ -> обычная 5с пауза, без доп.проверки
                             ESP_LOGI("PID", "FINE(после СБРОСА): дошли до цель+%.2f -> серво в нейтраль, пауза 5с, затем замер дрейфа. P=%.2f",
                                      reg.fine_ss_vent_offset, pressure);
                         } else {
