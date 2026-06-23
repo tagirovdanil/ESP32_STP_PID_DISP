@@ -256,7 +256,7 @@ void regulator_init(PressureRegulator* reg) {
     // Полосы узкие (фильтрация давления это тянет): срабатывание из покоя при |err_filt|
     // > 0.04, возврат-запечатывание при подходе ближе 0.02 к цели. trig>reseal — снимаем
     // коррекцию на той же стороне от цели (P не пересекает уставку) -> нет пинг-понга.
-    reg->fine_min_setpoint = 489.0f;
+    reg->fine_min_setpoint = 689.0f; // поменял на 689, т.к. 700 норм, 600 никак, 650 плохо держит удерданием основным
     reg->hold_trig_band    = 0.04f;
     reg->hold_reseal_band  = 0.02f;
     // СБРОС-эпизод (low_mode): выдержка между серво->VENT и открытием иглы, чтобы штуцер
@@ -1142,15 +1142,15 @@ void pid_regulator_task(void *pvParameters) {
             zone = "FINE";
 
             if (first_in_fine) {
-            // Пауза 1с в floor при входе в FINE: глушим перелив дозы ПЕРЕД замером
+            // Пауза 5с в floor при входе в FINE: глушим перелив дозы ПЕРЕД замером
             // дрейфа. Серво уже в НЕЙТРАЛИ (объём запечатан), floor ниже порога потока.
-                if (now_us - fix_time_for_delay >= 1000000ULL) {   // 1 с прошла -> старт замера дрейфа
+                if (now_us - fix_time_for_delay >= 5000000ULL) {   // 5 с прошла -> старт замера дрейфа
                     first_in_fine          = false;
                     reg.fine_speed_search  = true;                 // этап «поиск скорости»
                     reg.fine_ss_t0_us      = now_us;
                     reg.fine_ss_p0         = reg.filtered_pressure; // фиксируем P_filt
                     target_valve           = reg.valve_flow_floor; // держим запечатано
-                    ESP_LOGI("PID", "FINE: пауза 1с окончена -> замер дрейфа %.1fс (P_filt=%.2f зафиксировано)",
+                    ESP_LOGI("PID", "FINE: пауза 5с окончена -> замер дрейфа %.1fс (P_filt=%.2f зафиксировано)",
                              (float)reg.fine_ss_period_us / 1000000.0f, reg.fine_ss_p0);
                 } else {
                     target_valve = reg.valve_flow_floor;           // стоим в floor, ждём
@@ -1184,7 +1184,7 @@ void pid_regulator_task(void *pvParameters) {
                         ESP_LOGI("PID", "FINE-SS: дрейф пренебрежимо мал dP=%+.3f (|dP|<%.3f) -> перекрываем всё (игла 0, серво нейтраль), без FINE. P=%.2f",
                                  delta, reg.fine_ss_seal_band, pressure);
                     } else {
-                        ServoState dir = (delta < 0.0f) ? SERVO_CHARGING : SERVO_VENTING;
+                        ServoState dir = (delta < 0.038f) ? SERVO_CHARGING : SERVO_VENTING;   // ХАРДКОД: ему надо накачивание когда шумит у нуля. Поэтому пробую 0.038 а не 0. До этого набора - ставлю все таки накачивание
                         reg.fine_dir          = dir;       // ЗАПОМИНАЕМ направление на эту уставку (замер 1 раз за уставку)
                         reg.fine_dir_known    = true;      // повторные входы в FINE не замеряют (до новой уставки/сброса)
 
@@ -1422,7 +1422,7 @@ void pid_regulator_task(void *pvParameters) {
                             target_valve = reg.valve_flow_floor;
                             fix_time_for_delay = now_us;
                             first_in_fine = true;
-                            ESP_LOGI("PID", "FINE(после СБРОСА): дошли до цель+%.2f -> серво в нейтраль, пауза 1с, затем замер дрейфа. P=%.2f",
+                            ESP_LOGI("PID", "FINE(после СБРОСА): дошли до цель+%.2f -> серво в нейтраль, пауза 5с, затем замер дрейфа. P=%.2f",
                                      reg.fine_ss_vent_offset, pressure);
                         } else {
                             target_valve = hold_dose_step(&reg, now_us, false, pressure);  // спуск до точки замера
