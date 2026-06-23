@@ -866,6 +866,13 @@ void pid_regulator_task(void *pvParameters) {
     uint32_t last_log_ms  = 0;
     const uint32_t LOG_PERIOD_MS = 500;
 
+    // Замер скорости давления в IDLE: dP/dt по окну ~1 с (контроль дрейфа/утечки в покое).
+    float    idle_speed         = 0.0f;                  // последняя измеренная скорость, кПа/с
+    float    idle_speed_prev_p  = pressure1_kPa;         // давление на начало окна
+    uint64_t idle_speed_prev_us = esp_timer_get_time();  // время начала окна
+    uint32_t idle_speed_last_ms = 0;                     // когда последний раз считали
+    const uint32_t IDLE_SPEED_PERIOD_MS = 1000;
+
     while (1) {
 
         // -------- 0. Реальный шаг цикла dt (точная скорость + честные I-члены) --------
@@ -954,9 +961,24 @@ void pid_regulator_task(void *pvParameters) {
                 apply_servo(&reg, SERVO_NEUTRAL);
                 if (current_valve_position != 0) move_valve_absolute(0, VALVE_STEP_US);
                 reset_controllers(&reg);
+
+                // Замер скорости раз в ~1 с (только в IDLE): dP за окно / длину окна.
+                uint32_t now_ms_idle = esp_timer_get_time() / 1000;
+                if (now_ms_idle - idle_speed_last_ms >= IDLE_SPEED_PERIOD_MS) {
+                    float dt_s = (float)(now_us - idle_speed_prev_us) / 1000000.0f;
+                    // Если окно «протухло» (только что вошли в IDLE после активной фазы) —
+                    // не считаем скорость по огромному dt, а просто открываем свежее окно.
+                    idle_speed = (dt_s > 0.0f && dt_s <= 2.0f)
+                               ? (pressure - idle_speed_prev_p) / dt_s
+                               : 0.0f;
+                    idle_speed_prev_p  = pressure;
+                    idle_speed_prev_us = now_us;
+                    idle_speed_last_ms = now_ms_idle;
+                }
+
                 if (esp_timer_get_time()/1000 - last_log_ms > LOG_PERIOD_MS) {
-                    ESP_LOGI("PID", "Idle | P=%.2f kPa | Pos=%ld",
-                             pressure, (long)current_valve_position);
+                    ESP_LOGI("PID", "Idle | P=%.2f kPa | Pos=%ld | speed=%.3f kpa/s",
+                             pressure, (long)current_valve_position, idle_speed);
                     last_log_ms = esp_timer_get_time()/1000;
                 }
                 vTaskDelay(pdMS_TO_TICKS(20));
@@ -1222,7 +1244,13 @@ void pid_regulator_task(void *pvParameters) {
                         ESP_LOGI("PID", "FINE-SS: дрейф пренебрежимо мал dP=%+.3f (|dP|<%.3f) -> перекрываем всё (игла 0, серво нейтраль), без FINE. P=%.2f",
                                  delta, reg.fine_ss_seal_band, pressure);
                     } else {
-                        ServoState dir = (delta < 0.038f) ? SERVO_CHARGING : SERVO_VENTING;   // ХАРДКОД: ему надо накачивание когда шумит у нуля. Поэтому пробую 0.038 а не 0. До этого набора - ставлю все таки накачивание
+                        // Порог направления зависит от ПОДХОДА (ss_from_charge):
+                        //  - приход СБРОСОМ (откачивание), ss_from_charge=false: 0.038 — биас в
+                        //    НАБОР, когда дрейф шумит у нуля (как было раньше, ему надо накачивание);
+                        //  - приход НАБОРОМ (накачка), ss_from_charge=true: ЖЁСТКО 0 — растём/флэт
+                        //    (delta>=0) -> СБРОС, только реальная утечка (delta<0) -> НАБОР.
+                        float ss_dir_thresh = reg.ss_from_charge ? 0.03f : 0.038f;
+                        ServoState dir = (delta < ss_dir_thresh) ? SERVO_CHARGING : SERVO_VENTING;
                         reg.fine_dir          = dir;       // ЗАПОМИНАЕМ направление на эту уставку (замер 1 раз за уставку)
                         reg.fine_dir_known    = true;      // повторные входы в FINE не замеряют (до новой уставки/сброса)
 
