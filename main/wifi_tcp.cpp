@@ -25,6 +25,7 @@ static const char* TAG = "WIFI_TCP";
 #define CMD_QUEUE_LEN   16
 #define CMD_MAX_LEN     256
 #define RX_CHUNK        512
+#define TX_QUEUE_LEN    24      // глубина очереди исходящих строк (логи + ответы)
 
 // --- TCP keepalive: мёртвый клиент будет обнаружен за ~11 с -------------------
 #define KEEPALIVE_IDLE_S    5   // начать пробы после 5 с тишины
@@ -33,8 +34,15 @@ static const char* TAG = "WIFI_TCP";
 
 typedef struct { char data[CMD_MAX_LEN]; } cmd_msg_t;
 
+// Исходящая строка для рассылки клиентам (лог-хук и ответы на команды кладут сюда).
+// Шлём по длине m.len, поэтому нуль-терминатор не обязателен.
+typedef struct { uint16_t len; char data[256]; } tx_msg_t;
+
 // --- Очередь принятых команд (заберёт основной цикл) --------------------------
 static QueueHandle_t s_cmd_queue = NULL;
+
+// --- Очередь исходящих строк (разгребает tcp_tx_task) -------------------------
+static QueueHandle_t s_tx_queue = NULL;
 
 // --- Список активных клиентов + mutex ----------------------------------------
 static int s_client_socks[WIFI_TCP_MAX_CLIENTS];
@@ -127,6 +135,12 @@ static void wifi_init_softap(void)
     wc.ap.max_connection = 4;
     wc.ap.authmode       = (strlen(WIFI_TCP_AP_PASS) >= 8)
                            ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    // PMF (802.11w) выключаем: телефон в power-save не отвечает на SA Query, и AP
+    // выкидывает его каждые пару секунд (reason 209 = SA_QUERY_TIMEOUT). Для
+    // локальной точки «телефон↔контроллер» защита management-кадров не нужна,
+    // а связь без неё стабильнее. capable=false + required=false = PMF полностью off.
+    wc.ap.pmf_cfg.capable  = false;
+    wc.ap.pmf_cfg.required = false;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
@@ -315,6 +329,32 @@ static void server_task(void* arg)
     }
 }
 
+// ============================ TCP отправка (одна задача на всю рассылку) =======
+// Единственное место, которое реально пишет в клиентские сокеты. Берёт строки из
+// очереди (туда их кладут wifi_tcp_send / лог-хук / ответы на команды) и шлёт
+// всем клиентам. send() делаем БЕЗ удержания s_clients_mutex — мьютекс нужен
+// лишь на миг, чтобы снять снимок списка сокетов. Так сетевые потоки (tcpip/wifi)
+// больше никогда не блокируются на нашем мьютексе и не вызывают send() из лог-хука.
+static void tcp_tx_task(void* arg)
+{
+    tx_msg_t m;
+    while (true) {
+        if (xQueueReceive(s_tx_queue, &m, portMAX_DELAY) != pdTRUE) continue;
+        if (m.len == 0) continue;
+
+        int socks[WIFI_TCP_MAX_CLIENTS];
+        xSemaphoreTake(s_clients_mutex, portMAX_DELAY);
+        memcpy(socks, s_client_socks, sizeof(socks));
+        xSemaphoreGive(s_clients_mutex);
+
+        for (int i = 0; i < WIFI_TCP_MAX_CLIENTS; i++) {
+            // MSG_DONTWAIT — не виснем на тормозном клиенте; ошибки игнорируем,
+            // упавший клиент закроется сам в своём recv-цикле.
+            if (socks[i] != -1) send(socks[i], m.data, m.len, MSG_DONTWAIT);
+        }
+    }
+}
+
 // ============================ Перехват логов -> WiFi =========================
 // По умолчанию ВСЕ ESP_LOGx уходят только в USB-консоль. Чтобы те же строки
 // летели ещё и всем TCP-клиентам, ставим свой обработчик логов через
@@ -368,6 +408,7 @@ void wifi_tcp_init(void)
     ESP_ERROR_CHECK(r);
 
     s_cmd_queue = xQueueCreate(CMD_QUEUE_LEN, sizeof(cmd_msg_t));
+    s_tx_queue  = xQueueCreate(TX_QUEUE_LEN,  sizeof(tx_msg_t));
     clients_init();
 
 #if WIFI_TCP_MODE_AP
@@ -377,6 +418,9 @@ void wifi_tcp_init(void)
 #endif
 
     xTaskCreate(server_task, "tcp_srv", 4096, NULL, 5, NULL);
+    // Задача рассылки. Приоритет НИЖЕ tcpip(18) — ей торопиться некуда, она лишь
+    // разгребает очередь исходящих строк и пишет их в клиентские сокеты.
+    xTaskCreate(tcp_tx_task, "tcp_tx", 4096, NULL, 4, NULL);
 
     // Перенаправляем ВСЕ логи (ESP_LOGx) ещё и в WiFi. Ставим последним, чтобы
     // сообщения самой инициализации выше ушли только в консоль. Возвращённый
@@ -384,22 +428,30 @@ void wifi_tcp_init(void)
     s_orig_log_vprintf = esp_log_set_vprintf(wifi_log_vprintf);
 }
 
+// Кладёт строку в очередь на рассылку. САМ в сокеты НЕ пишет и s_clients_mutex
+// НЕ берёт — поэтому безопасно вызывать из ЛЮБОГО потока, включая tcpip/wifi
+// (через лог-хук). Реальную отправку делает tcp_tx_task.
+//
+// Раньше здесь под мьютексом вызывался send(): лог-хук из потока tcpip брал
+// мьютекс и звал send(), а другая задача в это же время держала мьютекс и спала
+// в send(), ожидая поток tcpip (core locking выключен). Получалась взаимная
+// блокировка, и при шторме переподключений вся система намертво вешалась.
 void wifi_tcp_send(const char* msg)
 {
-    if (!msg || !s_clients_mutex) return;
-    size_t len = strlen(msg);
-    bool   add_nl = (len == 0) || (msg[len - 1] != '\n');
+    if (!msg || !s_tx_queue) return;
 
-    xSemaphoreTake(s_clients_mutex, portMAX_DELAY);
-    for (int i = 0; i < WIFI_TCP_MAX_CLIENTS; i++) {
-        int s = s_client_socks[i];
-        if (s == -1) continue;
-        // MSG_DONTWAIT — чтобы основной цикл не вис, если клиент тормозит.
-        // Ошибки send игнорируем: упавший клиент закроется в своём recv-цикле.
-        if (len > 0) send(s, msg, len, MSG_DONTWAIT);
-        if (add_nl)  send(s, "\n", 1, MSG_DONTWAIT);
+    tx_msg_t m;
+    size_t len = strlen(msg);
+    if (len >= sizeof(m.data)) len = sizeof(m.data) - 1;     // длинное обрежем
+    memcpy(m.data, msg, len);
+    if (len == 0 || m.data[len - 1] != '\n') {               // гарантируем '\n'
+        if (len < sizeof(m.data) - 1) m.data[len++] = '\n';
     }
-    xSemaphoreGive(s_clients_mutex);
+    m.len = (uint16_t)len;
+
+    // timeout 0 — логгер НИКОГДА не блокируется. Очередь полна → теряем строку
+    // телеметрии (не критично), но систему не вешаем.
+    xQueueSend(s_tx_queue, &m, 0);
 }
 
 void wifi_tcp_sendf(const char* fmt, ...)
