@@ -17,6 +17,7 @@
 // Инициализация аппаратного ШИМ для Серво //
 
 volatile float setpoint_kPa = 0;
+volatile bool fast_mode = false;
 volatile float pressure1_kPa = 0;
 volatile bool is_homing = false;
 volatile bool is_calibrating = false;             
@@ -149,11 +150,12 @@ volatile int32_t current_valve_position = 0;
 }
 
 
-void update_setpoint(float new_setpoint) {
+void update_setpoint(float new_setpoint, bool new_fast_mode) {
     if (new_setpoint < 0.0f) new_setpoint = 0.0f;
     if (new_setpoint > 4000.0f) new_setpoint = 4000.0f;
     setpoint_kPa = new_setpoint;
-    printf("PID: Новая уставка давления принята: %.1f кПа\n", setpoint_kPa);
+    fast_mode = new_fast_mode;
+    printf("PID: Новая уставка давления принята: %.1f кПа, режим: %s\n", setpoint_kPa, new_fast_mode ? "быстрый" : "медленный");
 }
 
 // Служебная функция аппаратного сброса драйвера после аварии упора

@@ -224,7 +224,7 @@ static void handle_command(char *str) {
         float target = strtof(cmd_ptr + 4, NULL);
 
         // Передаем новое значение напрямую в наш ПИД-регулятор через безопасную обертку
-        update_setpoint(target);
+        update_setpoint(target, false);
 
         // Отправляем эхо-ответ обратно (в терминал ПК и WiFi-клиенту)
         char response_msg[64];
@@ -244,7 +244,25 @@ static void handle_command(char *str) {
         float target = strtof(pss_ptr + 4, NULL);
 
         // Передаем новое значение напрямую в наш ПИД-регулятор через безопасную обертку
-        update_setpoint(target);
+        update_setpoint(target, false);
+
+        // Отправляем эхо-ответ обратно (в терминал ПК и WiFi-клиенту)
+        char response_msg[64];
+        snprintf(response_msg, sizeof(response_msg), "\r\n>> Target updated to: %.1f kPa\r\n", setpoint_kPa);
+        respond(response_msg);
+    }
+
+    char *psf_ptr = strstr(str, "psf ");
+    if (psf_ptr == NULL) {
+        psf_ptr = strstr(str, "PSF ");
+    }
+
+    if (psf_ptr != NULL) {
+        // Извлекаем числовое значение уставки, идущее после ключевого слова "psf "
+        float target = strtof(psf_ptr + 4, NULL);
+
+        // Передаем новое значение напрямую в наш ПИД-регулятор через безопасную обертку
+        update_setpoint(target, true);
 
         // Отправляем эхо-ответ обратно (в терминал ПК и WiFi-клиенту)
         char response_msg[64];

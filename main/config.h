@@ -20,6 +20,7 @@
 
 // 3. Объявляем глобальные переменные через extern (чтобы не было дубликатов)
 extern volatile float setpoint_kPa;
+extern volatile bool fast_mode;
 extern volatile float pressure1_kPa;
 
 extern volatile bool is_homing;
@@ -31,6 +32,6 @@ void set_servo_angle(float angle);
 void move_valve_absolute(int32_t target_position, uint32_t speed_us);
 void start_pressure_homing(void);
 void hardware_setup_and_calibrate(void);
-void update_setpoint(float new_setpoint);
+void update_setpoint(float new_setpoint, bool new_fast_mode);
 void init_servo(void);
 void calibrate_valve_home(void);

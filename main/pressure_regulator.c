@@ -243,6 +243,9 @@ void regulator_init(PressureRegulator* reg) {
                                               // калибровка фиксируется РАНЬШЕ внешней проверки «дошли» (см. .h)
     reg->search_done_back      = 10;          // после финиша держать иглу на (найденная - 10), а не на самой
                                               // флоу-позиции: мягкий добор хвоста без перелёта (0 = на найденной)
+    reg->search_slow_step_band = 0.5f;        // шаг до цели < 0.5 кПа -> свип втрое медленнее (только НАБОР)
+    reg->search_slow_step_mult = 3;           // во столько раз реже приращение иглы на малом шаге
+    reg->search_small_step     = false;
 
     // --- ВТОРОЙ (ТОЧНЫЙ) ХОЛДИНГ: равновесное приоткрытие вместо подкачек ---
     // После выхода на точку НАБОРОМ (доза подобрана делом) серво НЕ печатаем,
@@ -281,7 +284,8 @@ void regulator_init(PressureRegulator* reg) {
     reg->fine_rate_t0_us  = 0;           // 0 -> трекер fine_change сам инициализируется на 1-м тике RUNNING
     reg->fine_ss_period_us = 5000000ULL; // НОВЫЙ ЭТАП «поиск скорости»: замер дрейфа запечатанного объёма    // было 2с, как будто не успевало, поставил 3с // тока на откачивание, поэтому пусть 5с
                                          // 2 с после паузы -> направление удержания (dP<0 НАБОР / dP>=0 СБРОС)
-    reg->fine_ss_seal_band = 0.003f;     // |дрейф| меньше этого = объём держит сам -> без FINE, перекрываем
+    reg->fine_ss_seal_band = 0.000f;     // |дрейф| меньше этого = объём держит сам -> без FINE, перекрываем    // БЫЛО 0.003f, но поставил 0, ПОТОМУ ЧТО ВСЁ РАВНО ДЕРЖАТЬ НАДО, от 683кпа
+    // возможно надо переделать расчет скорости, или включать удержание если упали сильно
                                          // всё (игла 0, серво нейтраль). На 50 кПа видели dP=-0.001 за 2с
     reg->fine_ss_vent_offset = 0.3f;     // подход СБРОСОМ: замер дрейфа запечатываем на (цель+0.3), не на цели (п.2)
     reg->fine_ss_charge_offset = 0.3f;   // подход НАБОРОМ: зеркально — замер запечатываем на (цель−0.3)
@@ -310,6 +314,10 @@ void regulator_init(PressureRegulator* reg) {
     reg->hold_vent_arming    = false;
     reg->hold_vent_arm_t0_us = 0;
     reg->hold_vent_settle_us = 350000ULL;  // 0.35 с: ход серво 90°->VENT + стравливание штуцера
+    // fast_mode: на приходе к цели даём давлению отстояться ПЕРЕД выбором набор/сброс
+    reg->hold_presettle      = false;
+    reg->hold_presettle_t0_us = 0;
+    reg->hold_presettle_us   = 3000000ULL; // 3 с пред-выдержки на приходе (только fast_mode, любое давление)
 
     // макс. сдвиг иглы за тик. При VALVE_STEP_US=400 один тик блокирует задачу
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
@@ -336,9 +344,9 @@ static float desired_rate_from_error(float error, float near_rate, float very_ne
     else if (e >  80.0f) rate = 20.0f;
     else if (e >  30.0f) rate = 10.0f;
     else if (e >   16.0f) rate = 3.0f;
-    else if (e >   5.0f) rate = 1.0f;        // полоса 2..8 кПа
-    else if (e >   1.0)                 rate = near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
-    else rate = very_near_rate;
+    else if (e >   5.0f) rate = fast_mode ? 2.0f : 1.0f; 
+    else if (e >   1.0)                 rate = fast_mode ? 1.0 : near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
+    else rate = fast_mode ? 0.5 : very_near_rate;
     return (error >= 0.0f) ? rate : -rate;
 }
 
@@ -556,9 +564,19 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
             reg->search_hist_t0_us = now_us;
             reg->search_hist_idx   = 0;
             reg->search_hist_count = 0;
-            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — старт ПЕРЕБОРА с %ld (+%ld за %.2fс, %s). P_filt прибит к raw=%.2f",
+            // Малый шаг уставки на НАБОРЕ (до цели < search_slow_step_band): открываем
+            // иглу втрое медленнее, иначе к старту потока угол уже с запасом и крошечная
+            // цель подлетает с перелётом. P_filt только что прибит к raw -> разница с
+            // целью = реальный шаг. Большой шаг и СБРОС свипуем как обычно.
+            reg->search_small_step = charging &&
+                (reg->active_setpoint - reg->filtered_pressure) < reg->search_slow_step_band;
+            uint64_t step_period = reg->search_small_step
+                ? reg->search_step_period_us * reg->search_slow_step_mult
+                : reg->search_step_period_us;
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — старт ПЕРЕБОРА с %ld (+%ld за %.2fс%s, %s). P_filt прибит к raw=%.2f",
                      dir_name, (long)*pos, (long)reg->search_step,
-                     (float)reg->search_step_period_us / 1000000.0f,
+                     (float)step_period / 1000000.0f,
+                     reg->search_small_step ? ", МАЛЫЙ ШАГ — медленно" : "",
                      settled ? "raw стабилен" : "таймаут подгона",
                      reg->filtered_pressure);
             // Для НАБОРА падение давления в начале (скорость отрицательная) = запечатанный
@@ -639,8 +657,11 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
         if (reg->search_hist_count < SEARCH_HIST_N) reg->search_hist_count++;
     }
 
-    // --- перебор: приращение иглы раз в период ---
-    if (now_us - reg->search_step_t0_us >= reg->search_step_period_us) {
+    // --- перебор: приращение иглы раз в период (на малом шаге НАБОРА — втрое реже) ---
+    uint64_t step_period = reg->search_small_step
+        ? reg->search_step_period_us * reg->search_slow_step_mult
+        : reg->search_step_period_us;
+    if (now_us - reg->search_step_t0_us >= step_period) {
         reg->search_step_t0_us = now_us;
         *pos += reg->search_step;
         if (*pos >= reg->valve_max) {
@@ -809,6 +830,7 @@ static void apply_servo(PressureRegulator* reg, ServoState s) {
 static void reset_controllers(PressureRegulator* reg) {
     reg->rate_integral = 0.0f;
     reg->holding       = false;
+    reg->rate_approach_sign = 0;    // сторону подхода (быстрый режим) зафиксируем заново на новой уставке
     reg->fine_holding  = false;
     reg->fine_speed_search = false; // недоигранный замер дрейфа к новой уставке не относится
     reg->fine_dir_known    = false; // направление (утечка/набор) определяем заново на новой уставке
@@ -818,6 +840,7 @@ static void reset_controllers(PressureRegulator* reg) {
     reg->fine_visited    = false; // переучивание FINE (±5 от прошлой позиции) — на новой уставке с чистого листа
     reg->fine_after_speed_search = false; // щит «не переучивать на просадке замера» к новой уставке не относится
     reg->hold_vent_arming = false; // недоигранная выдержка серво->игла перед сбросом к новой уставке не относится
+    reg->hold_presettle   = false; // недоигранная пред-выдержка на приходе к новой уставке не относится
     reg->ss_from_charge  = false; // недоигранная доп.проверка/замер накачки к новой уставке не относится
     first_in_fine        = false; // недоигранная пауза входа в FINE к новой уставке не относится
 }
@@ -944,7 +967,29 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
     // ---- ФАЗА ПОДХОДА (RATE): рулим ШАГОВИКОМ по скорости ----
     *zone = "RATE";
 
-    if (fabsf(error) <= reg->hold_enter_err && fabsf(error_filt) <= reg->hold_enter_err) {
+    // Сторону подхода фиксируем на ПЕРВОМ тике подхода (нужно быстрому режиму): знак
+    // error_filt = направление (+1 шли снизу/НАБОР, −1 сверху/СБРОС). Никогда не 0
+    // (ровно на цели считаем +1), иначе пересечение не словить. Захват один раз за
+    // уставку: после передачи/отскока HOLD->RATE rate_approach_sign снова обнуляется.
+    if (reg->rate_approach_sign == 0)
+        reg->rate_approach_sign = (error_filt >= 0.0f) ? +1 : -1;
+
+    // «Дошли до цели» -> отдать управление из RATE в HOLD/FINE.
+    //  • ОБЫЧНЫЙ режим: попали в узкую полосу ±hold_enter_err И по сырому, И по фильтру
+    //    (двойная проверка отсекает транзиентный спайк датчика — было: ложный вход за 17 кПа).
+    //  • БЫСТРЫЙ режим: RATE ведёт ДО САМОЙ ТОЧКИ. Отдаём, ТОЛЬКО когда давление
+    //    ПЕРЕСЕКЛО цель со стороны подхода (знак error_filt сменился) — НИКАКОЙ ранней
+    //    полосы 0.8 (иначе передавали бы за 0.8 кПа до цели — вход на ~499.2 вместо 500).
+    //    Перелёт допустим: маленький (< hold_trig) запечатается сам в нейтрали, крупный
+    //    подберёт обратный HOLD-эпизод. error_filt (фильтр не спайкует) -> анти-спайк не нужен.
+    bool reached;
+    if (fast_mode) {
+        reached = (reg->rate_approach_sign > 0 && error_filt <= 0.0f) ||  // шли снизу -> P достигло/прошло цель
+                  (reg->rate_approach_sign < 0 && error_filt >= 0.0f);    // шли сверху -> P опустилось до/ниже цели
+    } else {
+        reached = fabsf(error) <= reg->hold_enter_err && fabsf(error_filt) <= reg->hold_enter_err;
+    }
+    if (reached) {
         // И сырое, И фильтр у цели -> это НЕ транзиентный спайк (видели заброс
         // сырого до 1000.49 при реальных P_filt=988 -> ложный вход в HOLD за 17
         // кПа от цели, потом 40 с поиска впустую). На спайке P_filt далеко -> ждём.
@@ -959,33 +1004,69 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
         reg->holding = true;
         int32_t seed = current_valve_position - reg->dose_step_back;
         if (seed < reg->valve_flow_floor) seed = reg->valve_flow_floor;
-        if (reg->servo_state == SERVO_VENTING) {        // подходили сбросом
-            if(seed > 200) seed = 200; // ХАРДКОД, потому что когда сетпоинт 50, этих -30 по дефолту вообще не хватает когда оно 500 шаг фигачит и тупо перелетает
-            reg->step_holding_vent      = seed;       // = старт перебора поиска порога СБРОСА (подсказка RATE)
-            // Симметрично НАБОРУ: seed (= позиция RATE - dose_step_back) НЕ доверяем
-            // как готовой дозе — он НИЖЕ реального порога потока. Снимаем калибровку
-            // СБРОСА, чтобы в HOLD запустился быстрый перебор-поиск порога (идея 3):
-            // он переберёт от seed вверх под откачивание и найдёт реальный порог у
-            // цели (раньше прыгали сразу на seed + медленная доза, "75 -> 45").
+
+        // Сторону коррекции берём по тому, С КАКОЙ СТОРОНЫ цели мы сейчас (по
+        // сглаженному давлению), а НЕ по остаточному servo_state. Иначе мелкий
+        // сдвиг уставки прямо во время удержания оставляет серво в ПРОШЛОМ
+        // направлении: стояли в НАБОРЕ, цель опустили на 0.1 -> оказались ВЫШЕ
+        // цели, а код лез в "ПОИСК ПОРОГА НАБОР" (стоя выше цели).
+        bool need_charge = (error_filt > 0.0f);   // ниже цели -> НАБОР, выше -> СБРОС
+        // seed (= позиция RATE − dose_step_back) — осмысленная подсказка порога
+        // ТОЛЬКО для направления, которым реально ехали иглой из RATE (серво уже
+        // там). При чистом подходе RATE входит в HOLD, ещё НЕ дойдя до цели
+        // (|error|<=hold_enter_err со стороны подхода), поэтому направление всегда
+        // совпадает и берётся прежняя ветка — поведение не меняется.
+        bool dir_matches = (need_charge  && reg->servo_state == SERVO_CHARGING) ||
+                           (!need_charge && reg->servo_state == SERVO_VENTING);
+
+        if (!dir_matches) {
+            // Серво осталось от прошлого удержания и смотрит НЕ в ту сторону
+            // относительно (новой) цели. Не сеем порог в стале-направлении:
+            // запечатываем (нейтраль), а сторону выберет case SERVO_NEUTRAL по знаку
+            // error_filt уже на следующем тике — там же живут выдержка серво->игла
+            // для СБРОСА, поиск порога и вход в FINE.
+            apply_servo(reg, SERVO_NEUTRAL);
+            reg->step_holding_charge    = reg->valve_flow_floor;
+            reg->step_holding_vent      = reg->valve_flow_floor;
+            reg->dose_charge_calibrated = false;
+            reg->dose_vent_calibrated   = false;
+            target_valve = reg->valve_flow_floor;
+            // fast_mode: на приходе к цели тут транзиент пересечения (перелёт по сырому +
+            // импульс скорости). Сторону набор/сброс выбираем НЕ сразу — армируем
+            // пред-выдержку: HOLD простоит запечатанным hold_presettle_us и решит по
+            // ОТСТОЯВШЕМУСЯ давлению (см. case SERVO_NEUTRAL). Иначе ловили ложный СБРОС
+            // на транзиенте, который с утечкой проваливал далеко вниз.
+            if (fast_mode) {
+                reg->hold_presettle       = true;
+                reg->hold_presettle_t0_us = now_us;
+            }
+            ESP_LOGI("PID", "HOLD: вход у цели, серво не в ту сторону (err_filt=%+.2f) -> нейтраль%s. P=%.2f",
+                     error_filt,
+                     fast_mode ? ", пред-выдержка перед выбором стороны" : ", сторону выберем на след. тике",
+                     pressure);
+        } else if (reg->servo_state == SERVO_VENTING) {  // подходили сбросом
+            if (seed > 200) seed = 200; // ХАРДКОД: на низкой уставке (50) дефолтного −30 мало — 500-шаговый RATE перелетает
+            reg->step_holding_vent      = seed;       // старт перебора поиска порога СБРОСА (подсказка RATE)
+            // seed НИЖЕ реального порога потока -> снимаем калибровку, чтобы в HOLD
+            // запустился быстрый перебор-поиск порога, а не медленная доза.
             reg->dose_vent_calibrated   = false;
             reg->step_holding_charge    = reg->valve_flow_floor;
             reg->dose_charge_calibrated = false;
-        } else {                                       // подходили набором
-            reg->step_holding_charge    = seed;       // = старт перебора поиска порога (подсказка RATE)
-            // Доверять seed как готовой дозе нельзя: у этой иглы порог потока
-            // ~ позиции RATE (RATE до него и доводил), а seed = RATE - dose_step_back
-            // НИЖЕ порога -> сразу медленная доза +2/5с через мёртвую зону (видели
-            // 259->59 -> ползёт обратно ~250 с). Поэтому ВСЕГДА запускаем быстрый
-            // поиск порога (идея 3): он переберет от seed вверх и найдёт реальный порог.
+            target_valve = seed;       // серво уже в нужную сторону — доводим
+            ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed, СБРОС). P=%.2f",
+                     (long)current_valve_position, (long)seed, pressure);
+        } else {                                          // подходили набором
+            reg->step_holding_charge    = seed;       // старт перебора поиска порога НАБОРА (подсказка RATE)
+            // seed НИЖЕ реального порога -> снимаем калибровку, в HOLD пойдёт быстрый
+            // перебор-поиск порога (иначе медленная доза +2/5с через мёртвую зону).
             reg->dose_charge_calibrated = false;
             reg->step_holding_vent      = reg->valve_flow_floor;
             reg->dose_vent_calibrated   = false;
+            target_valve = seed;       // серво уже в нужную сторону — доводим
+            ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed, НАБОР). P=%.2f",
+                     (long)current_valve_position, (long)seed, pressure);
         }
         dose_window_reset(reg, now_us);
-        target_valve = seed;              // серво НЕ трогаем — доводим в текущую сторону
-        // (и НАБОР, и СБРОС -> дальше быстрый ПОИСК ПОРОГА от seed: калибровка снята выше)
-        ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed). P=%.2f",
-                 (long)current_valve_position, (long)seed, pressure);
     } else {
         float desired = desired_rate_from_error(error_filt, reg->sensor_noise_delta * 1.5, 0.15); // знаковая желаемая скорость  // 0.22 и 0.03 для 25мпа // *1.5 взял когда аварийное понижение лонастроил, потому что пофакут скорость нужна по хорошему чтобы побольше чем шум иначе почти не растет (чень долго растет)
         // было в конце reg->sensor_noise_delta_filt * 1.5, но решил поставить 0.15 чтоб росло хоть как то
@@ -1244,6 +1325,25 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
     switch (reg->servo_state) {
         case SERVO_NEUTRAL: {
             target_valve = reg->valve_flow_floor;     // запечатано: игла закрыта
+
+            // fast_mode: ПРЕД-ВЫДЕРЖКА на приходе к цели, ПЕРЕД выбором набор/сброс. RATE в
+            // fast_mode отдаёт в HOLD ровно на пересечении цели — с транзиентом (перелёт по
+            // сырому, импульс скорости). Решать сторону по нему рано: ловили ложный СБРОС,
+            // который с утечкой проваливал далеко вниз. Держим ЗАПЕЧАТАННЫМ (серво нейтраль,
+            // игла floor) hold_presettle_us — пусть давление отстоится — и только потом по
+            // отстоявшемуся err_filt выбираем сторону (обычной логикой ниже). Армируется на
+            // входе в HOLD (run_rate_phase), одноразово на приход; снимается на новой
+            // уставке / HOLD->RATE. Работает в любом режиме давления (low_mode тоже).
+            if (reg->hold_presettle) {
+                if (now_us - reg->hold_presettle_t0_us < reg->hold_presettle_us) {
+                    target_valve = reg->valve_flow_floor;   // ждём запечатанным — сторону НЕ выбираем
+                    break;
+                }
+                reg->hold_presettle = false;                // выдержка прошла -> падаем в обычный выбор стороны ниже
+                ESP_LOGI("PID", "HOLD: пред-выдержка %.1fс окончена -> выбираем сторону по отстоявшемуся err_filt=%.2f. P=%.2f",
+                         (float)reg->hold_presettle_us / 1000000.0f, error_filt, pressure);
+            }
+
             ServoState dir = SERVO_NEUTRAL;
             if      (error_filt >  hold_trig) dir = SERVO_CHARGING; // упало -> набрать  (low_mode: ±hold_trig_band, иначе 0.1)
             else if (error_filt < -hold_trig) dir = SERVO_VENTING;  // выросло -> стравить
@@ -1461,6 +1561,19 @@ void pid_regulator_task(void *pvParameters) {
             // ходу) — не опускаем.
             if (current_valve_position < reg.valve_flow_floor)
                 move_valve_absolute(reg.valve_flow_floor, VALVE_STEP_US);
+            
+            if(fast_mode){
+                reg.dose_dp_fast = 0.20f;
+                reg.dose_dp_slow = 0.10f;
+                reg.dose_dp_VERYslow    = -0.08f;
+                reg.dose_dp_runaway = 0.40f;
+            }
+            else{
+                reg.dose_dp_fast = 0.10f;
+                reg.dose_dp_slow = 0.05f;
+                reg.dose_dp_VERYslow    = -0.04f;
+                reg.dose_dp_runaway = 0.20f;
+            }
         }
 
         // -------- 5. Измерения: давление и его (отфильтрованная) скорость --------
@@ -1535,19 +1648,41 @@ void pid_regulator_task(void *pvParameters) {
             case REG_STATE_HOMING: {
                 ESP_LOGW("PID", "Homing: сброс давления...");
                 apply_servo(&reg, SERVO_VENTING);
+                // Первая строка СРАЗУ (t=0), до открытия иглы — иначе ~2 с открытия идут
+                // в тишине. Метка "P_filt" — для гошиного парсера; значение тут СЫРОЕ
+                // pressure1_kPa: настоящий P_filt (reg.filtered_pressure) в блокирующем
+                // HOMING заморожен — основной цикл, который его считает, стоит.
+                ESP_LOGI("VENT", "VENT старт | P_filt=%.2f kPa | Pos=%ld",
+                         pressure1_kPa, (long)current_valve_position);
 
-                // Открываем иглу большими кусками до упора
+                // Открываем иглу кусками до упора, логируя КАЖДЫЙ кусок. Размер куска
+                // задаёт частоту логов: move_valve_absolute — busy-wait ~0.2 с на 1000
+                // шагов (×~200 мкс), внутри он не логирует. Было 2000 (~0.4 с/кусок) ->
+                // между "VENT старт" и первой строкой зиял ~0.4 с. 1000 -> первая строка
+                // через ~0.2 с и шаг логов ~0.2 с (хочешь ещё плавнее — ставь 500).
+                // Серво уже в VENT, по мере открытия иглы давление уже падает — это видно.
                 int32_t chunk = current_valve_position;
-                const int32_t STEP_CHUNK = 2000;
+                const int32_t STEP_CHUNK = 1000;
                 while (current_valve_position < MAX_VALVE_STEPS) {
                     chunk += STEP_CHUNK;
                     if (chunk > MAX_VALVE_STEPS) chunk = MAX_VALVE_STEPS;
                     move_valve_absolute(chunk, 190);
                     vTaskDelay(1);
+                    ESP_LOGI("VENT", "VENT откр | P_filt=%.2f kPa | Pos=%ld",
+                             pressure1_kPa, (long)current_valve_position);
                 }
-                // Ждём, пока давление реально упадёт
-                while (pressure1_kPa > 0.2f) vTaskDelay(pdMS_TO_TICKS(10));
-                // Закрываем иглу обратно
+                // Ждём, пока давление реально упадёт (игла настежь). pressure1_kPa
+                // читаем напрямую — это живой глобал от задачи датчика (pressure и
+                // reg.filtered_pressure тут заморожены: основной цикл стоит). Шаг ~0.5 с.
+                int vent_log = 0;
+                while (pressure1_kPa > 0.2f) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    if (++vent_log % 20 == 0)            // ~0.5 с
+                        ESP_LOGI("VENT", "VENT | P_filt=%.2f kPa | Pos=%ld",
+                                 pressure1_kPa, (long)current_valve_position);
+                }
+                ESP_LOGI("VENT", "VENT конец | P_filt=%.2f kPa", pressure1_kPa);
+                // Закрываем иглу обратно (давление уже сброшено — логировать нечего)
                 chunk = current_valve_position;
                 while (current_valve_position > 0) {
                     chunk -= STEP_CHUNK;
@@ -1643,7 +1778,9 @@ void pid_regulator_task(void *pvParameters) {
             reg.dose_vent_calibrated   = false;
             reg.fine_visited           = false;  // большой выброс — переучивание FINE начинаем заново
             reg.hold_vent_arming       = false;  // прерываем выдержку серво->игла, если шла
+            reg.hold_presettle         = false;  // и пред-выдержку на приходе, если шла
             reg.rate_integral          = 0.0f;   // чистый старт контура скорости
+            reg.rate_approach_sign     = 0;      // подход начинается заново -> сторону зафиксируем заново
         }
 
         if (!reg.holding)          target_valve = run_rate_phase(&reg, now_us, dt, error, error_filt, pressure, &zone);
