@@ -67,6 +67,14 @@ volatile RegulatorState requested_reg_state = REG_STATE_NONE;
 // уменьшай это число постепенно и смотри, чтобы мотор не срывался в свист.
 #define VALVE_STEP_US   400
 
+// Время полного хода отсечного серво 0°->180° (в СБРОС). RC-серво едет физически
+// ~0.7 с (замерено по аварийному логу: давление начинало падать только через ~690 мс
+// после команды VENT). В аварийном сбросе ЖДЁМ это время с ЗАКРЫТОЙ иглой, прежде чем
+// открыть её на стравливание: иначе откроем иглу, пока серво ещё не отрезало подачу, и
+// заряженный штуцер серво->игла хлынет в бак (ловили заброс 66 -> 86). Подкрути вверх,
+// если при открытии иглы всё ещё виден бугор давления.
+#define SERVO_VENT_SETTLE_MS  700
+
 // Защита фильтров от глюков датчика. Битый UART-кадр иногда раскодируется в
 // «валидное» давление (проходит проверку диапазона в pressure_sensor.c), и один
 // такой отсчёт при alpha=0.8 надолго отравляет EMA (P_filt проваливался до ~184
@@ -544,7 +552,7 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
         if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
         if (*pos > reg->valve_max)        *pos = reg->valve_max;
         reg->search_settle_t0_us = now_us;                  // таймер фазы (тут — Подгон)
-        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — вход, фаза ПОДГОНА УГЛА (игла в floor, ждём P_filt; перебор начнётся с %ld). P_filt=%.2f rate_filt=%.2f",
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — вход, фаза ПОДГОНА УГЛА (игла в floor, ждём P_filt; перебор начнётся с %ld). P_filt=%.3f rate_filt=%.3f",
                  dir_name, (long)*pos, reg->filtered_pressure, reg->filtered_rate);
     }
 
@@ -1121,7 +1129,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
                     reg->fine_speed_search = true;
                     reg->fine_ss_t0_us     = now_us;
                     reg->fine_ss_p0        = reg->filtered_pressure;
-                    ESP_LOGI("PID", "FINE(накачка): доп.проверка %.1fс РАСТЁМ dP=%+.3f -> замер дрейфа %.1fс (P_filt=%.2f)",
+                    ESP_LOGI("PID", "FINE(накачка): доп.проверка %.1fс РАСТЁМ dP=%+.3f -> замер дрейфа %.1fс (P_filt=%.3f)",
                              check_s, dp_check, (float)reg->fine_ss_period_us / 1000000.0f, reg->fine_ss_p0);
                 }
             }
@@ -1130,7 +1138,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
             reg->fine_speed_search  = true;                 // этап «поиск скорости»
             reg->fine_ss_t0_us      = now_us;
             reg->fine_ss_p0         = reg->filtered_pressure; // фиксируем P_filt
-            ESP_LOGI("PID", "FINE: пауза 5с окончена -> замер дрейфа %.1fс (P_filt=%.2f зафиксировано)",
+            ESP_LOGI("PID", "FINE: пауза 5с окончена -> замер дрейфа %.1fс (P_filt=%.3f зафиксировано)",
                      (float)reg->fine_ss_period_us / 1000000.0f, reg->fine_ss_p0);
         }
     } else if (reg->fine_speed_search) {
@@ -1610,6 +1618,20 @@ void pid_regulator_task(void *pvParameters) {
         float error      = reg.active_setpoint - pressure;              // сырое: фаза RATE и вход в HOLD
         float error_filt = reg.active_setpoint - reg.filtered_pressure; // сглаженное: bang-bang серво в HOLD
 
+        // -------- 6. ЗАЩИТА ПО МАКСИМАЛЬНОМУ ДАВЛЕНИЮ (аппаратный потолок) --------
+        // Тригерим по ПРОГНОЗУ на ~1 с вперёд: текущее давление + последняя dP/dt
+        // (filtered_rate, кПа/с). Реакция (ход серво + механика) не мгновенна, и по
+        // голому `pressure > P_MAX` мы ловим уже на перелёте (видели набор 11 кПа/с ->
+        // 66 при пороге 63). Прибавка rate_filt опускает порог тем сильнее, чем быстрее
+        // растём: медленный подход тригерит у самого потолка, быстрый — заранее; на
+        // сбросе rate_filt < 0 -> ложно не сработает. Базу берём deglitch'нутую
+        // `pressure` (не сырой pressure1_kPa): одиночный выброс датчика не ронял бы в
+        // аварию. Только из RUNNING — HOMING/LEAK блокирующие и сами стравливают, в
+        // IDLE привод и так перекрыт.
+        if (pressure + reg.filtered_rate > P_MAX_KPA && reg.state == REG_STATE_RUNNING) {
+            reg.state = REG_STATE_OVERPRESSURE;
+        }
+
         // ======================= АВТОМАТ СОСТОЯНИЙ =======================
         switch (reg.state) {
 
@@ -1636,7 +1658,7 @@ void pid_regulator_task(void *pvParameters) {
                 }
 
                 if (esp_timer_get_time()/1000 - last_log_ms > LOG_PERIOD_MS) {
-                    ESP_LOGI("PID", "Idle | P=%.2f kPa | P_filt=%.2f kPa | Pos=%ld | speed=%.3f kpa/s",
+                    ESP_LOGI("PID", "Idle | P=%.2f kPa | P_filt=%.3f kPa | Pos=%ld | speed=%.3f kpa/s",
                              pressure, reg.filtered_pressure, (long)current_valve_position, idle_speed);
                     last_log_ms = esp_timer_get_time()/1000;
                 }
@@ -1652,7 +1674,7 @@ void pid_regulator_task(void *pvParameters) {
                 // в тишине. Метка "P_filt" — для гошиного парсера; значение тут СЫРОЕ
                 // pressure1_kPa: настоящий P_filt (reg.filtered_pressure) в блокирующем
                 // HOMING заморожен — основной цикл, который его считает, стоит.
-                ESP_LOGI("VENT", "VENT старт | P_filt=%.2f kPa | Pos=%ld",
+                ESP_LOGI("VENT", "VENT старт | P_filt=%.3f kPa | Pos=%ld",
                          pressure1_kPa, (long)current_valve_position);
 
                 // Открываем иглу кусками до упора, логируя КАЖДЫЙ кусок. Размер куска
@@ -1668,7 +1690,7 @@ void pid_regulator_task(void *pvParameters) {
                     if (chunk > MAX_VALVE_STEPS) chunk = MAX_VALVE_STEPS;
                     move_valve_absolute(chunk, 190);
                     vTaskDelay(1);
-                    ESP_LOGI("VENT", "VENT откр | P_filt=%.2f kPa | Pos=%ld",
+                    ESP_LOGI("VENT", "VENT откр | P_filt=%.3f kPa | Pos=%ld",
                              pressure1_kPa, (long)current_valve_position);
                 }
                 // Ждём, пока давление реально упадёт (игла настежь). pressure1_kPa
@@ -1678,10 +1700,10 @@ void pid_regulator_task(void *pvParameters) {
                 while (pressure1_kPa > 0.2f) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                     if (++vent_log % 20 == 0)            // ~0.5 с
-                        ESP_LOGI("VENT", "VENT | P_filt=%.2f kPa | Pos=%ld",
+                        ESP_LOGI("VENT", "VENT | P_filt=%.3f kPa | Pos=%ld",
                                  pressure1_kPa, (long)current_valve_position);
                 }
-                ESP_LOGI("VENT", "VENT конец | P_filt=%.2f kPa", pressure1_kPa);
+                ESP_LOGI("VENT", "VENT конец | P_filt=%.3f kPa", pressure1_kPa);
                 // Закрываем иглу обратно (давление уже сброшено — логировать нечего)
                 chunk = current_valve_position;
                 while (current_valve_position > 0) {
@@ -1708,6 +1730,79 @@ void pid_regulator_task(void *pvParameters) {
                 reg.active_setpoint = 0.0f;
                 reset_controllers(&reg);
                 reg.state = REG_STATE_IDLE;
+                continue;
+            }
+
+            // ---------- АВАРИЙНЫЙ СБРОС ПО ПРЕВЫШЕНИЮ ДАВЛЕНИЯ ----------
+            // P (с прогнозом по rate_filt) перевалило за P_MAX_KPA. Главная тонкость —
+            // отсечной серво МЕДЛЕННЫЙ (ход 0°->180° ~SERVO_VENT_SETTLE_MS): пока он едет,
+            // подача ещё не отрезана. Поэтому порядок такой:
+            //   1) серво -> СБРОС (запускаем долгий ход);
+            //   2) иглу -> 0 быстро (изолируем бак от заряженного штуцера серво->игла);
+            //   3) ЖДЁМ ход серво с ЗАКРЫТОЙ иглой (серво доезжает до VENT, штуцер
+            //      стравливается в АТМОСФЕРУ через серво, а не в бак);
+            //   4) и только ТЕПЕРЬ открываем иглу настежь — бак стравливается без заброса.
+            // Раньше открывали иглу сразу -> штуцер хлынул в бак за время хода серво
+            // (ловили заброс 66 -> 86). По окончании латчим аварию: всё стравлено,
+            // уставка 0, уходим в IDLE (повторный пуск — только новой командой оператора).
+            case REG_STATE_OVERPRESSURE: {
+                const int32_t STEP_CHUNK = 1000;   // ход иглы кусками — кормим watchdog
+                int32_t chunk;
+
+                ESP_LOGE("PID", "АВАРИЯ:ПРЕВЫШЕНИЕ - давление %.2f кПа -> превышен потолок %.1f кПа, аварийный сброс!",
+                         pressure1_kPa, (float)P_MAX_KPA);
+
+                // 1) Серво -> СБРОС немедленно: запускаем долгий физический ход 0°->180°.
+                apply_servo(&reg, SERVO_VENTING);
+
+                // 2) Иглу -> 0 СРАЗУ и быстро: изолируем бак от штуцера серво->игла (он под
+                //    давлением подачи), пока серво не доехало до VENT. Иначе штуцер хлынет
+                //    через иглу в бак. Серво при этом уже едет — его ход накладывается на закрытие.
+                chunk = current_valve_position;
+                while (current_valve_position > 0) {
+                    chunk -= STEP_CHUNK;
+                    if (chunk < 0) chunk = 0;
+                    move_valve_absolute(chunk, 190);
+                    vTaskDelay(1);
+                }
+                ESP_LOGW("PID", "АВАРИЯ: игла закрыта, серво едет в СБРОС — ждём %d мс хода серво. P=%.2f Pos=%ld",
+                         SERVO_VENT_SETTLE_MS, pressure1_kPa, (long)current_valve_position);
+
+                // 3) Ждём, пока серво ФИЗИЧЕСКИ доедет до VENT (и штуцер стравится в
+                //    атмосферу). Игла закрыта -> давление замерло у точки срабатывания, не лезет вверх.
+                vTaskDelay(pdMS_TO_TICKS(SERVO_VENT_SETTLE_MS));
+
+                // 4) Серво в VENT, штуцер пуст -> открываем иглу настежь и стравливаем бак.
+                chunk = current_valve_position;
+                while (current_valve_position < MAX_VALVE_STEPS) {
+                    chunk += STEP_CHUNK;
+                    if (chunk > MAX_VALVE_STEPS) chunk = MAX_VALVE_STEPS;
+                    move_valve_absolute(chunk, 190);
+                    vTaskDelay(1);
+                    ESP_LOGW("PID", "АВАРИЯ: стравливаю | P=%.2f кПа | Pos=%ld",
+                             pressure1_kPa, (long)current_valve_position);
+                }
+
+                // 5) Ждём падения давления (игла настежь), но не вечно (~30 с макс).
+                for (int g = 0; pressure1_kPa > 0.2f && g < 3000; g++)
+                    vTaskDelay(pdMS_TO_TICKS(10));
+
+                // 6) Закрываем иглу обратно, отсечной серво в нейтраль.
+                chunk = current_valve_position;
+                while (current_valve_position > 0) {
+                    chunk -= STEP_CHUNK;
+                    if (chunk < 0) chunk = 0;
+                    move_valve_absolute(chunk, 190);
+                    vTaskDelay(1);
+                }
+                apply_servo(&reg, SERVO_NEUTRAL);
+
+                // 7) Латчим аварию: уставка 0, контроллеры сброшены, в покой.
+                setpoint_kPa        = 0.0f;
+                reg.active_setpoint = 0.0f;
+                reset_controllers(&reg);
+                reg.state = REG_STATE_IDLE;
+                ESP_LOGE("PID", "АВАРИЯ: сброс завершён, уставка обнулена -> IDLE. P=%.2f кПа", pressure1_kPa);
                 continue;
             }
 
@@ -1799,7 +1894,7 @@ void pid_regulator_task(void *pvParameters) {
         uint32_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - last_log_ms >= LOG_PERIOD_MS) {
             ESP_LOGI("PID",
-                "%s | P=%.2f P_filt=%.2f set=%.1f err=%.2f rate=%.2f rate_filt=%.2f kPa/s | servo=%d pos=%ld ch5=%.2f",
+                "%s | P=%.2f P_filt=%.3f set=%.1f err=%.2f rate=%.2f rate_filt=%.3f kPa/s | servo=%d pos=%ld ch5=%.2f",
                 zone, pressure, reg.filtered_pressure, reg.active_setpoint, error, reg.raw_rate, reg.filtered_rate,
                 reg.servo_state, (long)current_valve_position, reg.fine_change);
             last_log_ms = now_ms;
