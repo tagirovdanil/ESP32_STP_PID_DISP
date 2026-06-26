@@ -152,7 +152,7 @@ volatile int32_t current_valve_position = 0;
 
 void update_setpoint(float new_setpoint, bool new_fast_mode) {
     if (new_setpoint < 0.0f) new_setpoint = 0.0f;
-    if (new_setpoint > 4000.0f) new_setpoint = 4000.0f;
+    if (new_setpoint > P_MAX_KPA) new_setpoint = P_MAX_KPA;   // потолок уставки = полная шкала датчика (P_MAX_KPA)
     setpoint_kPa = new_setpoint;
     fast_mode = new_fast_mode;
     printf("PID: Новая уставка давления принята: %.1f кПа, режим: %s\n", setpoint_kPa, new_fast_mode ? "быстрый" : "медленный");

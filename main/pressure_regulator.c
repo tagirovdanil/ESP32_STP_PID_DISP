@@ -75,6 +75,12 @@ volatile RegulatorState requested_reg_state = REG_STATE_NONE;
 // если при открытии иглы всё ещё виден бугор давления.
 #define SERVO_VENT_SETTLE_MS  700
 
+// Минимальная выдержка стравливания в команде vent. Даже если давление по датчику
+// упало до ~0 раньше (условие выхода выполнилось), держим иглу открытой не меньше
+// этого времени, отсчитывая от ПОЛНОГО открытия иглы. Один низкий отсчёт датчика ≠
+// реально пустой бак, поэтому гарантируем настоящие 5 с продувки.
+#define VENT_MIN_OPEN_MS  5000
+
 // Защита фильтров от глюков датчика. Битый UART-кадр иногда раскодируется в
 // «валидное» давление (проходит проверку диапазона в pressure_sensor.c), и один
 // такой отсчёт при alpha=0.8 надолго отравляет EMA (P_filt проваливался до ~184
@@ -176,7 +182,7 @@ void regulator_init(PressureRegulator* reg) {
     //  - в полосе error 0..2 это же значение = желаемая скорость подхода (ползём медленно).
     // Больше -> раньше останавливаемся (меньше перелёт, грубее точность); меньше -> точнее.
     reg->sensor_noise_delta = 0.22f;
-    reg->sensor_noise_delta_filt = 0.01f;
+    reg->sensor_noise_delta_filt = 0.01f * P_SCALE;
 
     // --- лимиты привода (в шагах) ---
     reg->valve_max      = MAX_VALVE_STEPS; // полный ход иглы
@@ -185,8 +191,8 @@ void regulator_init(PressureRegulator* reg) {
     // держался вниз до ~3600 -> ставим floor около нижней границы потока. Регулятор
     // никогда не опускает иглу ниже floor во время работы, поэтому уходит мёртвое
     // время ~3 с на старте и тонкая зона реально может дать поток.
-    reg->valve_flow_floor = 0;// 3600 * 0.9; // на всякий случай умножил на 0.8, чтоб наверняка 0 был
-                                        // (он же — парковка иглы в HOLD: запечатано, но близко к зоне потока)
+    reg->valve_flow_floor = 30; // 0;// 3600 * 0.9; // на всякий случай умножил на 0.8, чтоб наверняка 0 был          // ВНИМАНИЕ: этот параметр настраиваемый под каждый прибор. 
+                                        // (он же — парковка иглы в HOLD: запечатано, но близко к зоне потока)        // Щас у меня оно по факту где то от 60, ставлю 30 чтоб с запасом было
 
     // --- HOLD: МИКРОДОЗЫ ---
     // У цели контур по скорости не работает: нужные 0.01-0.02 кПа/с не видны в
@@ -199,8 +205,12 @@ void regulator_init(PressureRegulator* reg) {
     //   прошло > dose_dp_runaway -> -dose_trim_big  (разогнались)
     //   прошло > dose_dp_fast    -> -dose_trim      (чуть быстрее нужного)
     // Полоса dose_dp_slow..dose_dp_fast — «хорошо», открытие не трогаем.
-    reg->hold_enter_err  = 0.8f;        // |error| <= этого -> PID выключается, дальше HOLD-струйка
-    reg->hold_exit_err   = 5.0f;        // в HOLD |err_filt| больше -> микродозой не вытянуть, назад в RATE качать.
+    // RATE отдаёт управление в HOLD за 1 кПа до цели (база 63; крупнее -> ×SCALE_for_slow_holding),
+    // а точную доводку до точки делает HOLD ступенчатыми дозами (см. hold_dose_step).
+    // На крупном датчике (>300) slow-holding выключен -> прежняя узкая полоса 0.8×P_SCALE.
+    reg->hold_enter_err  = 0.8f;  //SLOW_HOLDING_ENABLED ? (1.0f * SCALE_for_slow_holding) : (0.8f * P_SCALE);
+    reg->hold_exit_err   = 5.0f;  //SLOW_HOLDING_ENABLED ? (5.0f * SCALE_for_slow_holding) : (5.0f * P_SCALE);
+                                        // в HOLD |err_filt| больше -> микродозой не вытянуть, назад в RATE качать.
                                         // >>hold_enter_err: гистерезис, чтоб не дёргалось RATE<->HOLD у цели
     reg->dose_step_back  = 30;          // вход в HOLD набором: СТАРТ ПЕРЕБОРА поиска = позиция RATE минус это
                                         // (было 60; на высоком давлении порог ВЫШЕ позиции RATE, отступ вниз
@@ -208,21 +218,43 @@ void regulator_init(PressureRegulator* reg) {
                                         // (было 200 для старой иглы; у новой порог ~позиции RATE, нужен
                                         //  малый отступ — перебор стартует чуть ниже порога и быстро доходит)
     reg->dose_period_us  = 5000000ULL;  // окно проверки прогресса дозы: 5 с
-    reg->dose_dp_slow    = 0.05f;       // кПа за окно
-    reg->dose_dp_VERYslow    = -0.04f;  // прогресс хуже этого (явная утечка/мимо за окно) -> крупный добор
+    // Дефолтные пороги «набора» за окно. На мелком датчике (<=300 кПа) их ПЕРЕКРЫВАЕТ
+    // ступенчатый slow-holding в hold_dose_step (зависит от близости к цели); эти
+    // значения работают только на крупном датчике (>300).
+    reg->dose_dp_slow    = 0.05f * P_SCALE;     // кПа за окно
+    reg->dose_dp_VERYslow    = -0.04f * P_SCALE;// прогресс хуже этого (явная утечка/мимо за окно) -> крупный добор
                                         // (было -0.05: утечку -0.047 не ловило, падало в «медленно» +2)
-    reg->dose_dp_fast    = 0.10f;
-    reg->dose_dp_runaway = 0.20f;
+    reg->dose_dp_fast    = 0.10f * P_SCALE;
+    reg->dose_dp_runaway = 0.20f * P_SCALE;
     reg->dose_trim       = 2;          // шаги иглы     // было 10
     reg->dose_trim_big   = 5;    // было 10; «большой» шаг при дрейфе <dose_dp_VERYslow и при разгоне >runaway.
                                  // На 1000 кПа +10 переливал (280->290 -> подскок до 1000.18) -> 5
     reg->dose_trim_very_big   = 10; // было 100, но решил поставить 50, так как на 100 бывает перескакивает     // было 50
-    reg->dose_big_min_err = 0.5f;       // п.1: ближе 0.5 кПа к цели (по СЫРОМУ давлению) big/very_big не применяем
+    // СБРОС (откачивание) на низком давлении — крупный шаг: слабый поток через иглу
+    // не выгрести по 2/5. Только при charging==false и P(СЫРОЕ) < dose_lowvent_max.
+    reg->dose_trim_lowvent     = 20;       // вместо dose_trim (2)
+    reg->dose_trim_big_lowvent = 50;       // вместо dose_trim_big (5)
+    reg->dose_lowvent_max      = 300.0f;   // абсолютные кПа (НЕ ×P_SCALE: на 63-датчике сброс всегда крупным шагом)
+    reg->dose_big_min_err = 0.5f * P_SCALE;     // п.1: ближе 0.5 кПа к цели (по СЫРОМУ давлению) big/very_big не применяем
     // п.2: кольцо лагов мультиоконной проверки HOLD/FINE (как окно поиска порога, но на 5с-масштаб)
     reg->dose_hist_dt_us = 1250000ULL;  // 1.25 с -> лаги 1.25/2.5/3.75/5.0 с
     reg->dose_hist_idx   = 0;
     reg->dose_hist_count = 0;
     reg->dose_hist_t0_us = 0;
+    // --- пробой мёртвого хода прыжком + сторож подскока ---
+    reg->dose_deadtravel_jump = 10;       // +10 вместо +2, когда 2 окна дозы подряд без изменений (мёртвый ход)
+    reg->dose_flat_run        = 0;
+    reg->dose_jump_armed      = false;
+    reg->dose_jump_back_pos   = 0;
+    reg->dose_jump_t0_us      = 0;
+    reg->dose_jump_spike_dp   = 0.2f * P_SCALE;  // ГЛАВНЫЙ ПОДБОРНЫЙ ПОРОГ: P рвануло к цели на это (по любому
+                                                 // короткому лагу 0.15..0.60с) после прыжка -> мёртвый ход пробит, ОТКАТ.
+                                                 // Больше -> позже ловит/больше перелёт; меньше -> чувствительнее
+                                                 // (риск откатить даже мягкий ПОЛЕЗНЫЙ поток). Тюнить на железе.
+    reg->jump_hist_idx        = 0;
+    reg->jump_hist_count      = 0;
+    reg->jump_hist_dt_us      = 150000ULL;       // 0.15 с -> короткие лаги 0.15/0.30/0.45/0.60 с
+    reg->jump_hist_t0_us      = 0;
     reg->step_holding_charge = reg->valve_flow_floor;  // безопасный дефолт; засеется при входе в HOLD
     reg->step_holding_vent   = reg->valve_flow_floor;
     reg->dose_charge_calibrated = false; // флаги ставятся при входе в HOLD: направление подхода
@@ -242,16 +274,16 @@ void regulator_init(PressureRegulator* reg) {
     reg->search_hist_idx       = 0;
     reg->search_hist_count     = 0;
     reg->search_hist_t0_us     = 0;
-    reg->search_dp_flow        = 0.05f;       // P_filt выросло на это над лагом = поток (>шум)
-    reg->search_warmup_rate    = 0.10f;       // |rate_filt|<0.1 кПа/с = давление устаканилось
+    reg->search_dp_flow        = 0.05f * P_SCALE;     // P_filt выросло на это над лагом = поток (>шум)
+    reg->search_warmup_rate    = 0.10f * P_SCALE;     // |rate_filt|<0.1 кПа/с = давление устаканилось
     reg->search_warmup_max_us  = 2500000ULL;  // но подгон не дольше 2.5 с
     reg->search_settle_t0_us   = 0;           // таймер фазы Подгон
     reg->search_found_pos      = 0;
-    reg->search_target_back    = 1.0f;        // финиш фазы 2 на (цель - 1.0): хвост доводит без перелёта +
+    reg->search_target_back    = 1.0f;      // финиш фазы 2 на (цель - 1.0): хвост доводит без перелёта +       // клод делал * P_SCALE но я думаю не надо
                                               // калибровка фиксируется РАНЬШЕ внешней проверки «дошли» (см. .h)
     reg->search_done_back      = 10;          // после финиша держать иглу на (найденная - 10), а не на самой
                                               // флоу-позиции: мягкий добор хвоста без перелёта (0 = на найденной)
-    reg->search_slow_step_band = 0.5f;        // шаг до цели < 0.5 кПа -> свип втрое медленнее (только НАБОР)
+    reg->search_slow_step_band = 0.5f;        // шаг до цели < 0.5 кПа -> свип втрое медленнее (только НАБОР)   // клод делал * P_SCALE но я думаю не надо
     reg->search_slow_step_mult = 3;           // во столько раз реже приращение иглы на малом шаге
     reg->search_small_step     = false;
 
@@ -277,26 +309,26 @@ void regulator_init(PressureRegulator* reg) {
     reg->fine_relearn_step = 2;          // повторный вход: ±2 к позиции прошлого выхода по стороне выброса
     reg->fine_trim        = 1;           // +-шаг подстройки открытия за окно
     reg->fine_period_us   = 5000000ULL;  // окно оценки знака скорости: 5 с
-    reg->fine_eq_band     = 0.01f;       // |dP| за окно меньше этого = «стоим», равновесие найдено
+    reg->fine_eq_band     = 0.01f * P_SCALE;       // |dP| за окно меньше этого = «стоим», равновесие найдено
     reg->fine_eq_found    = false;       // сбрасывается на новой уставке (равновесие там другое)
-    reg->fine_corr_err    = 0.02f;       // «стоим» (|dP за 5с| < eq_band), но мимо цели на СТОЛЬКО и больше ->
+    reg->fine_corr_err    = 0.02f * P_SCALE;       // «стоим» (|dP за 5с| < eq_band), но мимо цели на СТОЛЬКО и больше ->
                                          // сдвиг равновесия ±fine_trim к цели (999.98 и ниже -> +1; 1000.02 и
                                          // выше -> -1). Только в 5с-окне; рост/падение рулит дрейф-ветка отдельно.
                                          // было 0.05 (мёртвая зона); 0.02 = на уровне шума P_filt (~±0.02), но
                                          // «стоим» уже требует плоского окна -> дребезг максимум ±1 шаг
-    reg->fine_dev_guard   = 0.00f;       // было 0.05, потом 0.01 поставил - на 500 вышло, теперь пробую 0.00 q2: ниже цели на 0.01+ не прикрываем (−), выше на 0.01+ не приоткрываем (+)
+    reg->fine_dev_guard   = 0.00f * P_SCALE;       // было 0.05, потом 0.01 поставил - на 500 вышло, теперь пробую 0.00 q2: ниже цели на 0.01+ не прикрываем (−), выше на 0.01+ не приоткрываем (+)
     reg->fine_trim_fast   = 4;           // пока давление ещё активно движется — крупный шаг (вместо fine_trim=2)
-    reg->fine_hold_change = 0.5f;        // |ΔP_filt| за ~5 с >= этого = «ещё движусь»: не отдаём в HOLD
+    reg->fine_hold_change = 0.5f * P_SCALE;        // |ΔP_filt| за ~5 с >= этого = «ещё движусь»: не отдаём в HOLD
     reg->fine_flip_floor  = 40;          // FINE: игла прикрылась ниже этого -> разворот направления (НАБОР<->СБРОС)
                                          // и старт FINE заново с этого же открытия, БЕЗ поиска порога (растит дрейф-алгоритм)
     reg->fine_rate_t0_us  = 0;           // 0 -> трекер fine_change сам инициализируется на 1-м тике RUNNING
     reg->fine_ss_period_us = 5000000ULL; // НОВЫЙ ЭТАП «поиск скорости»: замер дрейфа запечатанного объёма    // было 2с, как будто не успевало, поставил 3с // тока на откачивание, поэтому пусть 5с
                                          // 2 с после паузы -> направление удержания (dP<0 НАБОР / dP>=0 СБРОС)
-    reg->fine_ss_seal_band = 0.000f;     // |дрейф| меньше этого = объём держит сам -> без FINE, перекрываем    // БЫЛО 0.003f, но поставил 0, ПОТОМУ ЧТО ВСЁ РАВНО ДЕРЖАТЬ НАДО, от 683кпа
+    reg->fine_ss_seal_band = 0.000f * P_SCALE;     // |дрейф| меньше этого = объём держит сам -> без FINE, перекрываем    // БЫЛО 0.003f, но поставил 0, ПОТОМУ ЧТО ВСЁ РАВНО ДЕРЖАТЬ НАДО, от 683кпа
     // возможно надо переделать расчет скорости, или включать удержание если упали сильно
                                          // всё (игла 0, серво нейтраль). На 50 кПа видели dP=-0.001 за 2с
-    reg->fine_ss_vent_offset = 0.3f;     // подход СБРОСОМ: замер дрейфа запечатываем на (цель+0.3), не на цели (п.2)
-    reg->fine_ss_charge_offset = 0.3f;   // подход НАБОРОМ: зеркально — замер запечатываем на (цель−0.3)
+    reg->fine_ss_vent_offset = 0.3f * P_SCALE;     // подход СБРОСОМ: замер дрейфа запечатываем на (цель+0.3), не на цели (п.2)
+    reg->fine_ss_charge_offset = 0.3f * P_SCALE;   // подход НАБОРОМ: зеркально — замер запечатываем на (цель−0.3)
     reg->ss_from_charge        = false;
     reg->fine_ss_charge_precheck_us = 2500000ULL; // НАКАЧКА: 2.5с чистой паузы, потом доп.проверка направления
     reg->ss_check_p0           = 0.0f;
@@ -315,8 +347,11 @@ void regulator_init(PressureRegulator* reg) {
     // СЫРОМУ error и латчилось на шуме -> сразу повторный эпизод (это и была дрожь).
     // Если на железе полезет пинг-понг (P проскакивает цель) — верни reseal к 0.005..0.01.
     reg->fine_min_setpoint = 689.0f; // поменял на 689, т.к. 700 норм, 600 никак, 650 плохо держит удерданием основным
-    reg->hold_trig_band    = 0.04f;  // |err_filt| больше -> импульс набора/сброса
-    reg->hold_reseal_band  = 0.00f;  // err_filt вернулся к 0 (дошли до цели) -> снова запечатано «ровно»
+    reg->hold_trig_band    = 0.04f * P_SCALE;  // |err_filt| больше -> импульс набора/сброса
+    if(reg->hold_trig_band < 0.0015)
+        reg->hold_trig_band = 0.0015; // зачем я это сделал: на 6 мпа оно +- норм на 0.04. Но на 63кпа его прям сильно колбасит, потому что 0.0004кпа (0.4па) это очень-очень мало. Решил сделать хотябы 1.5па 
+        // 1.5па это норм даже на 63кпа, потому что 63кпа это 3.7па макс погрешность, запас больше чем х2
+    reg->hold_reseal_band  = 0.00f * P_SCALE;  // err_filt вернулся к 0 (дошли до цели) -> снова запечатано «ровно»
     // СБРОС-эпизод (low_mode): выдержка между серво->VENT и открытием иглы, чтобы штуцер
     // успел стравиться (иначе игла распахивается раньше серво и штуцер дампит в объём).
     reg->hold_vent_arming    = false;
@@ -354,7 +389,7 @@ static float desired_rate_from_error(float error, float near_rate, float very_ne
     else if (e >   16.0f) rate = 3.0f;
     else if (e >   5.0f) rate = fast_mode ? 2.0f : 1.0f; 
     else if (e >   1.0)                 rate = fast_mode ? 1.0 : near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
-    else rate = fast_mode ? 0.5 : very_near_rate;
+    else rate = fast_mode ? 0.5 : very_near_rate;   // у самой цели — скорость уровня шума; точную доводку до точки делает HOLD-доза
     return (error >= 0.0f) ? rate : -rate;
 }
 
@@ -380,7 +415,7 @@ static int32_t rate_control_step(PressureRegulator* reg, float desired, float dt
     // интегратор синхронизируем с фактической позицией, иначе после отпускания
     // тормоза PI вернул бы иглу обратно вверх.
     float koef_for_big_error = (setpoint_kPa > 200) ? 4.5 : 3; // было - float koef_for_big_error = (setpoint_kPa > 200) ? 3.5 : 2;
-    if (measured_toward > koef_for_big_error * fabsf(desired) && (measured_toward - fabsf(desired)) > 0.2f) {  // было > 1.5f, не смогло замедлится на 50
+    if (measured_toward > koef_for_big_error * fabsf(desired) && (measured_toward - fabsf(desired)) > (0.2f * P_SCALE)) {  // было > 1.5f, не смогло замедлится на 50
         int32_t out_brake = current_valve_position - reg->max_step;
         if (out_brake < reg->valve_flow_floor) out_brake = reg->valve_flow_floor;
         reg->rate_integral = ((float)out_brake - (float)reg->valve_flow_floor
@@ -430,6 +465,8 @@ static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
     reg->dose_hist_count = 0;
     reg->dose_hist_idx   = 0;
     reg->dose_hist_t0_us = now_us;
+    reg->dose_flat_run   = 0;       // новое окно/эпизод -> память «пустых окон» с нуля
+    reg->dose_jump_armed = false;   // смена фазы / откат отменяют сторож подскока
 }
 //
 // ============================================================================
@@ -445,14 +482,87 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
     int32_t* pos   = charging ? &reg->step_holding_charge    : &reg->step_holding_vent;
     bool*    calib = charging ? &reg->dose_charge_calibrated : &reg->dose_vent_calibrated;
 
+    // --- СТОРОЖ ПОДСКОКА ПОСЛЕ ПРЫЖКА (пробой мёртвого хода) -----------------------
+    // Сразу после крупного прыжка иглы (+dose_deadtravel_jump) поток может рвануть и
+    // «улететь» мимо цели. Пока сторожим — НИЧЕГО больше не трогаем (return *pos),
+    // только набираем кольцо коротких лагов 0.15/0.30/0.45/0.60с (опора jump_hist[0] =
+    // давление в момент прыжка) и ловим подскок к цели по ЛЮБОМУ из них. Рвануло
+    // (toward_max >= dose_jump_spike_dp) -> МГНОВЕННО откат иглы на до-прыжковую позицию
+    // и сброс памяти «пустых окон» (dose_window_reset), чтобы тут же не прыгнуть снова —
+    // дальше доводят ползучие +dose_trim. Прошли все короткие лаги без подскока -> прыжок
+    // был безопасен, снимаем сторож и в этом же тике продолжаем обычную дозу.
+    if (reg->dose_jump_armed) {
+        if (now_us - reg->jump_hist_t0_us >= reg->jump_hist_dt_us) {
+            reg->jump_hist_t0_us = now_us;
+            reg->jump_hist[reg->jump_hist_idx] = reg->filtered_pressure;
+            reg->jump_hist_idx = (reg->jump_hist_idx + 1) % JUMP_HIST_N;
+            if (reg->jump_hist_count < JUMP_HIST_N) reg->jump_hist_count++;
+        }
+        float toward_max = -1e9f;   // макс. подскок В СТОРОНУ ЦЕЛИ по всем коротким лагам
+        for (int i = 0; i < reg->jump_hist_count; i++) {
+            float toward_i = charging ? (reg->filtered_pressure - reg->jump_hist[i])
+                                      : (reg->jump_hist[i] - reg->filtered_pressure);
+            if (toward_i > toward_max) toward_max = toward_i;
+        }
+        if (reg->jump_hist_count > 0 && toward_max >= reg->dose_jump_spike_dp) {
+            *pos = reg->dose_jump_back_pos;          // откат на 70 (если прыгали 70->80)
+            reg->dose_jump_armed = false;
+            dose_window_reset(reg, now_us);          // сброс «прошлого/позапрошлого» + кольца + окна
+            ESP_LOGI("PID", "HOLD: доза %s ОТКАТ ПОСЛЕ ПРЫЖКА -> %ld (подскок %+.3f по лагам<=%.0f мс, память сброшена)",
+                     charging ? "НАБОР" : "СБРОС", (long)*pos, toward_max,
+                     (float)(reg->jump_hist_dt_us * JUMP_HIST_N) / 1000.0f);
+            return *pos;
+        }
+        if (now_us - reg->dose_jump_t0_us >= reg->jump_hist_dt_us * JUMP_HIST_N)
+            reg->dose_jump_armed = false;            // все короткие лаги прошли, рывка не было -> прыжок безопасен
+        else
+            return *pos;                             // пока сторожим — держим прыжковую позицию
+    }
+
+    // Базовый шаг дозы. СБРОС (откачивание) на низком давлении — особый случай:
+    // поток через иглу слабый, мелким шагом дозу не выгрести -> крупный шаг. Весь
+    // особый случай живёт ЗДЕСЬ; ниже всё считает по trim/trim_big и про него не знает.
+    int32_t trim     = reg->dose_trim;       // обычно 2
+    int32_t trim_big = reg->dose_trim_big;   // обычно 5
+    if (!charging && pressure_raw < reg->dose_lowvent_max) {
+        trim     = reg->dose_trim_lowvent;       // 20
+        trim_big = reg->dose_trim_big_lowvent;   // 50
+    }
+
     // п.1: близко к цели (по СЫРОМУ давлению) крупный шаг переливает -> big/very_big
-    // заменяем обычным dose_trim. Далеко от цели — штатные крупные шаги.
+    // заменяем обычным trim. Далеко от цели — штатные крупные шаги.
     bool    far      = fabsf(reg->active_setpoint - pressure_raw) >= reg->dose_big_min_err;
-    int32_t big      = far ? reg->dose_trim_big      : reg->dose_trim;
-    int32_t very_big = far ? reg->dose_trim_very_big : reg->dose_trim;
+    int32_t big      = far ? trim_big                : trim;
+    int32_t very_big = far ? reg->dose_trim_very_big : trim;
 
     // п.2: кольцо чекпойнтов P_filt -> лаги 1.25..5с (статичные пороги, как в поиске).
     dose_hist_tick(reg, now_us);
+
+    // --- «НЕОБХОДИМЫЙ НАБОР» дозы: пороги прогресса давления за окно --------------
+    // На мелком датчике (<=300 кПа) делаем их СТУПЕНЧАТЫМИ по близости к цели: далеко
+    // разрешаем заметный прогресс (грубая доза), у самой точки — почти нулевой (ползучая
+    // доза, без перелёта). База порогов — 63 кПа, на крупнее домножаем SCALE_for_slow_holding:
+    //    |до цели| > 0.2  -> набор 0.05..0.10  (как было)
+    //    |до цели| > 0.02 -> набор 0.005..0.01
+    //    |до цели| <=0.02 -> набор 0.0005..0.001
+    // Защитные пороги (разгон/утечка) держим в прежней пропорции к fast/slow: runaway = 2×fast,
+    // veryslow = −0.8×slow -> на грубой ступени выходит старое 0.20 / −0.04.
+    // На крупном датчике (>300) slow-holding выключен -> берём фиксированные пороги из init.
+    float dp_slow, dp_fast, dp_runaway, dp_veryslow;
+    if (SLOW_HOLDING_ENABLED) {
+        const float S = SCALE_for_slow_holding;
+        float err_to_target = fabsf(reg->active_setpoint - reg->filtered_pressure);
+        if      (err_to_target > 0.05f  * S) { dp_slow = 0.05f   * S; dp_fast = 0.10f  * S; }  // типо на сет 40 до 39.95 идем по 0.05, 
+        else if (err_to_target > 0.005f * S) { dp_slow = 0.005f  * S; dp_fast = 0.01f  * S; }  // до 39.995 идем по 0.005
+        else                                { dp_slow = 0.0005f * S; dp_fast = 0.0015f * S; }   // до 40.000 идем по 0.0005. Так надо чтоб ровненько подойти, а то погрешность 3.7кпа максимально допустимая
+        dp_runaway  =  dp_fast * 2.0f;
+        dp_veryslow = -dp_slow * 0.8f;
+    } else {
+        dp_slow     = reg->dose_dp_slow;
+        dp_fast     = reg->dose_dp_fast;
+        dp_runaway  = reg->dose_dp_runaway;
+        dp_veryslow = reg->dose_dp_VERYslow;
+    }
 
     // --- ЗАЩИТНЫЕ / CLOSE направления — по ЛЮБОМУ лагу СРАЗУ (не ждём 5с) ---
     //   разгон      (прогресс к цели за какой-то лаг > runaway) -> прикрыть big
@@ -473,9 +583,9 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
         }
         int32_t old = *pos;
         bool fired = true;
-        if      (toward_max > reg->dose_dp_runaway)  *pos -= big;                      // где-то сильно разогнались
-        else if (toward_max > reg->dose_dp_fast)     *pos -= reg->dose_trim;           // q1.3: где-то чуть быстро -> прикрыть по ЛЮБОМУ лагу
-        else if (toward_min < reg->dose_dp_VERYslow) *pos += *calib ? big : very_big;  // где-то течёт/мимо
+        if      (toward_max > dp_runaway)  *pos -= big;                      // где-то сильно разогнались
+        else if (toward_max > dp_fast)     *pos -= trim;                     // q1.3: где-то чуть быстро -> прикрыть по ЛЮБОМУ лагу
+        else if (toward_min < dp_veryslow) *pos += *calib ? big : very_big;  // где-то течёт/мимо
         else                                         fired = false;
         if (fired) {
             if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
@@ -494,28 +604,66 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
         float dp     = reg->filtered_pressure - reg->dose_p0;  // изменение давления за окно
         float toward = charging ? dp : -dp;                    // прогресс в сторону цели
         int32_t old  = *pos;
+        bool    jumped = false;                                // этот шаг — прыжок через мёртвый ход (для лога)
 
         // Некалиброванное направление (засеяно floor'ом при входе в HOLD) впервые
         // дало нормальный поток -> доза найдена, дальше обычная тонкая подстройка.
-        if (!*calib && toward >= reg->dose_dp_slow) {
+        if (!*calib && toward >= dp_slow) {
             *calib = true;
             ESP_LOGI("PID", "HOLD: доза %s откалибрована на %ld (прогресс %.3f за окно)",
                      charging ? "НАБОР" : "СБРОС", (long)*pos, toward);
         }
 
-        if      (toward < reg->dose_dp_VERYslow) *pos += *calib ? big : very_big;  // явно вниз/мимо (резерв длинного окна)
-        else if (toward < reg->dose_dp_slow)     *pos += *calib ? reg->dose_trim   // штатный добор
-                                                               : very_big;         // разгон с floor: ищем порог потока быстрее
-        else if (toward > reg->dose_dp_runaway)  *pos -= big;                      // сильно разогнались (резерв длинного окна)
-        else if (toward > reg->dose_dp_fast)     *pos -= reg->dose_trim;           // чуть быстрее нужного
+        if (toward < dp_veryslow) {                            // явно вниз/мимо (резерв длинного окна)
+            *pos += *calib ? big : very_big;
+            reg->dose_flat_run = 0;                            // давление двинулось (вниз) — это не «мёртвый ход»
+        } else if (toward < dp_slow) {                         // слишком медленно = стоим на месте (мёртвый ход)
+            // ДВА окна подряд без изменений (dose_flat_run >= 2) -> пробиваем мёртвый ход
+            // крупным прыжком (+dose_deadtravel_jump) вместо ползучего +dose_trim и ВЗВОДИМ
+            // СТОРОЖ ПОДСКОКА (см. блок вверху функции). Только на калиброванной дозе с обычным
+            // мелким шагом: с floor мёртвый ход и так выгребает быстрый поиск порога + very_big,
+            // а на низком сбросе (trim=lowvent=20/50) штатный шаг и так крупнее прыжка.
+            if (*calib && reg->dose_flat_run >= 2 && trim == reg->dose_trim) {
+                *pos += reg->dose_deadtravel_jump;
+                jumped = true;
+                reg->dose_jump_armed    = true;                // взвести сторож
+                reg->dose_jump_back_pos = old;                 // куда откатываемся, если рванёт
+                reg->dose_jump_t0_us    = now_us;
+                reg->jump_hist[0]       = reg->filtered_pressure; // опора кольца = P в момент прыжка
+                reg->jump_hist_count    = 1;
+                reg->jump_hist_idx      = 1;
+                reg->jump_hist_t0_us    = now_us;
+            } else {
+                *pos += *calib ? trim : very_big;              // штатный добор / разгон с floor
+            }
+            reg->dose_flat_run++;                              // ещё одно «пустое» окно
+        } else if (toward > dp_runaway) {                      // сильно разогнались (резерв длинного окна)
+            *pos -= big;  reg->dose_flat_run = 0;
+        } else if (toward > dp_fast) {                         // чуть быстрее нужного
+            *pos -= trim; reg->dose_flat_run = 0;
+        } else {
+            reg->dose_flat_run = 0;                            // «хорошо» — прогресс в норме
+        }
         if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
         if (*pos > reg->valve_max)        *pos = reg->valve_max;
-        if (*pos != old)
-            ESP_LOGI("PID", "HOLD: доза %s %ld -> %ld (прогресс %.3f: P_filt %.3f->%.3f за 5с)",
-                     charging ? "НАБОР" : "СБРОС", (long)old, (long)*pos, toward,
-                     reg->dose_p0, reg->filtered_pressure);
+        if (*pos != old) {
+            if (jumped)
+                ESP_LOGI("PID", "HOLD: доза %s ПРЫЖОК %ld -> %ld (2 окна без изменений, +%ld; сторожу подскок %.0f мс)",
+                         charging ? "НАБОР" : "СБРОС", (long)old, (long)*pos,
+                         (long)reg->dose_deadtravel_jump,
+                         (float)(reg->jump_hist_dt_us * JUMP_HIST_N) / 1000.0f);
+            else
+                ESP_LOGI("PID", "HOLD: доза %s %ld -> %ld (прогресс %.3f: P_filt %.3f->%.3f за 5с)",
+                         charging ? "НАБОР" : "СБРОС", (long)old, (long)*pos, toward,
+                         reg->dose_p0, reg->filtered_pressure);
+        }
         reg->dose_t0_us = now_us;
         reg->dose_p0    = reg->filtered_pressure;
+        if (jumped) {                                          // прогресс после прыжка мерим с чистого длинного кольца
+            reg->dose_hist_count = 0;
+            reg->dose_hist_idx   = 0;
+            reg->dose_hist_t0_us = now_us;
+        }
     }
     return *pos;
 }
@@ -552,7 +700,7 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
         if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
         if (*pos > reg->valve_max)        *pos = reg->valve_max;
         reg->search_settle_t0_us = now_us;                  // таймер фазы (тут — Подгон)
-        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — вход, фаза ПОДГОНА УГЛА (игла в floor, ждём P_filt; перебор начнётся с %ld). P_filt=%.3f rate_filt=%.3f",
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — вход, фаза ПОДГОНА УГЛА (игла в floor, ждём P_filt; перебор начнётся с %ld). P_filt=%.4f rate_filt=%.3f",
                  dir_name, (long)*pos, reg->filtered_pressure, reg->filtered_rate);
     }
 
@@ -581,7 +729,7 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
             uint64_t step_period = reg->search_small_step
                 ? reg->search_step_period_us * reg->search_slow_step_mult
                 : reg->search_step_period_us;
-            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — старт ПЕРЕБОРА с %ld (+%ld за %.2fс%s, %s). P_filt прибит к raw=%.2f",
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — старт ПЕРЕБОРА с %ld (+%ld за %.2fс%s, %s). P_filt прибит к raw=%.3f",
                      dir_name, (long)*pos, (long)reg->search_step,
                      (float)step_period / 1000000.0f,
                      reg->search_small_step ? ", МАЛЫЙ ШАГ — медленно" : "",
@@ -617,15 +765,15 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
             *calib              = true;
             reg->dose_searching = false;
             dose_window_reset(reg, now_us);
-            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — финиш у цели (остаток<=%.2f) на игле %ld -> держим %ld (-%ld), калибровка зафиксирована",
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — финиш у цели (остаток<=%.3f) на игле %ld -> держим %ld (-%ld), калибровка зафиксирована",
                      dir_name, reg->search_target_back, (long)reg->search_found_pos, (long)hold_pos, (long)reg->search_done_back);
             return hold_pos;
         }
         // страховка от застоя: если за ~1 с давление не двинулось к цели (поток на найденной
         // позиции слабее утечки/подпора / ложный детект) — приоткрыть ещё, иначе зависнем.
         if (now_us - reg->search_step_t0_us >= 1000000ULL) {
-            bool progressed = charging ? (reg->filtered_pressure > reg->dose_p0 + 0.02f)
-                                       : (reg->filtered_pressure < reg->dose_p0 - 0.02f);
+            bool progressed = charging ? (reg->filtered_pressure > reg->dose_p0 + 0.02f * P_SCALE)
+                                       : (reg->filtered_pressure < reg->dose_p0 - 0.02f * P_SCALE);
             if (!progressed) {
                 reg->search_found_pos += reg->search_step;
                 if (reg->search_found_pos > reg->valve_max) reg->search_found_pos = reg->valve_max;
@@ -871,7 +1019,7 @@ static void leak(PressureRegulator* reg) {
                                          // ~10с. 190 (~5кГц) homing тянет без срыва.
     int32_t chunk;
 
-    ESP_LOGW("PID", "LEAK: тест утечки — НАЧАЛО (P=%.2f)", pressure1_kPa);
+    ESP_LOGW("PID", "LEAK: тест утечки — НАЧАЛО (P=%.3f)", pressure1_kPa);
 
     // -- 1. Накачка: серво в НАБОР, игла настежь, ждём 2 с --
     apply_servo(reg, SERVO_CHARGING);
@@ -894,14 +1042,14 @@ static void leak(PressureRegulator* reg) {
         vTaskDelay(1);
     }
     apply_servo(reg, SERVO_NEUTRAL);
-    ESP_LOGI("LEAK", "LEAK: запечатано (игла 0, серво нейтраль), устаканиваемся 30с (P=%.2f)", pressure1_kPa);
+    ESP_LOGI("LEAK", "LEAK: запечатано (игла 0, серво нейтраль), устаканиваемся 30с (P=%.3f)", pressure1_kPa);
     vTaskDelay(pdMS_TO_TICKS(10000));
-    ESP_LOGI("LEAK", "давление щас, устаканиваемся (P=%.2f)", pressure1_kPa);
+    ESP_LOGI("LEAK", "давление щас, устаканиваемся (P=%.3f)", pressure1_kPa);
     vTaskDelay(pdMS_TO_TICKS(10000));
-    ESP_LOGI("LEAK", "давление щас, устаканиваемся (P=%.2f)", pressure1_kPa);
+    ESP_LOGI("LEAK", "давление щас, устаканиваемся (P=%.3f)", pressure1_kPa);
     for(int i = 0; i < 20; i++){
         vTaskDelay(pdMS_TO_TICKS(500));
-        ESP_LOGI("LEAK", "давление щас, считаем утечку (P=%.2f)", pressure1_kPa);
+        ESP_LOGI("LEAK", "давление щас, считаем утечку (P=%.3f)", pressure1_kPa);
     }
     
 
@@ -911,7 +1059,7 @@ static void leak(PressureRegulator* reg) {
     vTaskDelay(pdMS_TO_TICKS(5000));
     float p_end = pressure1_kPa;
     float lost  = p_start - p_end;      // >0 = давление упало (утечка)
-    ESP_LOGW("PID", "LEAK: за 5с потеряно %.3f кПа -> УТЕЧКА %.4f кПа/с (P %.2f -> %.2f)",
+    ESP_LOGW("PID", "LEAK: за 5с потеряно %.3f кПа -> УТЕЧКА %.4f кПа/с (P %.3f -> %.3f)",
              lost, lost / 5.0f, p_start, p_end);
 
     // -- 4. Стравить всё: серво СБРОС, игла настежь, ждём падения, закрыть --
@@ -934,7 +1082,7 @@ static void leak(PressureRegulator* reg) {
         vTaskDelay(1);
     }
     apply_servo(reg, SERVO_NEUTRAL);
-    ESP_LOGW("PID", "LEAK: тест утечки — КОНЕЦ (P=%.2f)", pressure1_kPa);
+    ESP_LOGW("PID", "LEAK: тест утечки — КОНЕЦ (P=%.3f)", pressure1_kPa);
 }
 
 // ============================================================================
@@ -1048,7 +1196,7 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
                 reg->hold_presettle       = true;
                 reg->hold_presettle_t0_us = now_us;
             }
-            ESP_LOGI("PID", "HOLD: вход у цели, серво не в ту сторону (err_filt=%+.2f) -> нейтраль%s. P=%.2f",
+            ESP_LOGI("PID", "HOLD: вход у цели, серво не в ту сторону (err_filt=%+.3f) -> нейтраль%s. P=%.3f",
                      error_filt,
                      fast_mode ? ", пред-выдержка перед выбором стороны" : ", сторону выберем на след. тике",
                      pressure);
@@ -1061,7 +1209,7 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
             reg->step_holding_charge    = reg->valve_flow_floor;
             reg->dose_charge_calibrated = false;
             target_valve = seed;       // серво уже в нужную сторону — доводим
-            ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed, СБРОС). P=%.2f",
+            ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed, СБРОС). P=%.3f",
                      (long)current_valve_position, (long)seed, pressure);
         } else {                                          // подходили набором
             reg->step_holding_charge    = seed;       // старт перебора поиска порога НАБОРА (подсказка RATE)
@@ -1071,7 +1219,7 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
             reg->step_holding_vent      = reg->valve_flow_floor;
             reg->dose_vent_calibrated   = false;
             target_valve = seed;       // серво уже в нужную сторону — доводим
-            ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed, НАБОР). P=%.2f",
+            ESP_LOGI("PID", "HOLD: вход, игла %ld -> %ld (seed, НАБОР). P=%.3f",
                      (long)current_valve_position, (long)seed, pressure);
         }
         dose_window_reset(reg, now_us);
@@ -1122,14 +1270,14 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
                     reg->fine_after_speed_search = true;
                     dose_window_reset(reg, now_us);
                     target_valve = reg->fine_pos;
-                    ESP_LOGI("PID", "FINE(накачка): доп.проверка %.1fс ПАДАЕМ dP=%+.3f -> сразу НАБОР, игла на %ld. P=%.2f",
+                    ESP_LOGI("PID", "FINE(накачка): доп.проверка %.1fс ПАДАЕМ dP=%+.3f -> сразу НАБОР, игла на %ld. P=%.3f",
                              check_s, dp_check, (long)reg->fine_pos, pressure);
                 } else {
                     // РАСТЁМ -> обычный замер дрейфа (как было), решаем там.
                     reg->fine_speed_search = true;
                     reg->fine_ss_t0_us     = now_us;
                     reg->fine_ss_p0        = reg->filtered_pressure;
-                    ESP_LOGI("PID", "FINE(накачка): доп.проверка %.1fс РАСТЁМ dP=%+.3f -> замер дрейфа %.1fс (P_filt=%.3f)",
+                    ESP_LOGI("PID", "FINE(накачка): доп.проверка %.1fс РАСТЁМ dP=%+.3f -> замер дрейфа %.1fс (P_filt=%.4f)",
                              check_s, dp_check, (float)reg->fine_ss_period_us / 1000000.0f, reg->fine_ss_p0);
                 }
             }
@@ -1138,7 +1286,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
             reg->fine_speed_search  = true;                 // этап «поиск скорости»
             reg->fine_ss_t0_us      = now_us;
             reg->fine_ss_p0         = reg->filtered_pressure; // фиксируем P_filt
-            ESP_LOGI("PID", "FINE: пауза 5с окончена -> замер дрейфа %.1fс (P_filt=%.3f зафиксировано)",
+            ESP_LOGI("PID", "FINE: пауза 5с окончена -> замер дрейфа %.1fс (P_filt=%.4f зафиксировано)",
                      (float)reg->fine_ss_period_us / 1000000.0f, reg->fine_ss_p0);
         }
     } else if (reg->fine_speed_search) {
@@ -1167,7 +1315,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
                 apply_servo(reg, SERVO_NEUTRAL);
                 target_valve = reg->valve_flow_floor;       // игла 0 (запечатано)
                 dose_window_reset(reg, now_us);
-                ESP_LOGI("PID", "FINE-SS: дрейф пренебрежимо мал dP=%+.3f (|dP|<%.3f) -> перекрываем всё (игла 0, серво нейтраль), без FINE. P=%.2f",
+                ESP_LOGI("PID", "FINE-SS: дрейф пренебрежимо мал dP=%+.3f (|dP|<%.3f) -> перекрываем всё (игла 0, серво нейтраль), без FINE. P=%.3f",
                          delta, reg->fine_ss_seal_band, pressure);
             } else {
                 // Порог направления зависит от ПОДХОДА (ss_from_charge):
@@ -1193,7 +1341,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
                     dose_window_reset(reg, now_us);
                     target_valve = reg->valve_flow_floor;       // поиск стартует из floor (фаза подгона фильтра)
                     ESP_LOGW("PID", "FINE-SS: дрейф ВНИЗ dP=%+.3f (утечка) -> держим НАБОРОМ: "
-                                    "переборный поиск порога потока. P=%.2f", delta, pressure);
+                                    "переборный поиск порога потока. P=%.3f", delta, pressure);
                 } else if (dir == SERVO_VENTING && !reg->dose_vent_calibrated) {
                     // п.1: дрейф ВВЕРХ (объём подпирает), а готовой дозы СБРОСА нет ->
                     // держать надо СБРОСОМ, ищем порог потока СБРОСА (ПОДГОНА УГЛА), как у
@@ -1205,7 +1353,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
                     dose_window_reset(reg, now_us);
                     target_valve = reg->valve_flow_floor;       // поиск стартует из floor (фаза подгона фильтра)
                     ESP_LOGW("PID", "FINE-SS: дрейф ВВЕРХ dP=%+.3f -> держим СБРОСОМ: "
-                                    "переборный поиск порога потока. P=%.2f", delta, pressure);
+                                    "переборный поиск порога потока. P=%.3f", delta, pressure);
                 } else {
                     apply_servo(reg, dir);
                     reg->fine_pos          = fine_seed_for_dir(reg, dir);  // дозовая позиция направления (Q2)
@@ -1213,7 +1361,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
                     reg->fine_after_speed_search = true;        // недолёт до цели тут = просадка замера, не равновесие -> не переучивать
                     dose_window_reset(reg, now_us);           // окно равновесия — с чистого листа
                     target_valve = reg->fine_pos;
-                    ESP_LOGI("PID", "FINE: дрейф за %.1fс dP=%+.3f -> %s, игла на %ld (%s). P=%.2f",
+                    ESP_LOGI("PID", "FINE: дрейф за %.1fс dP=%+.3f -> %s, игла на %ld (%s). P=%.3f",
                              (float)reg->fine_ss_period_us / 1000000.0f, delta,
                              (dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg->fine_pos,
                              (dir == SERVO_CHARGING && reg->fine_visited) ? "±переуч." : "дозовая поз.",
@@ -1235,7 +1383,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
     // Просадка от 1с паузы + замера дрейфа «оплачена», как только P_filt
     // вернулось к цели (|err_filt| <= 0.1): дальше выбросы уже диагностичны
     // (равновесие), снимаем щит -> следующий хэндоф переучивает как обычно.
-    if (reg->fine_after_speed_search && fabsf(error_filt) <= 0.1)
+    if (reg->fine_after_speed_search && fabsf(error_filt) <= 0.1 * P_SCALE)
         reg->fine_after_speed_search = false;
     bool fast = (reg->fine_change >= reg->fine_hold_change);
     // grace: только что выбрали направление в «поиске скорости» -> даём FINE одно
@@ -1243,7 +1391,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
     // чем гейт сочтёт нас «успокоились, но мимо» и отдаст в HOLD. Иначе дрейф за
     // 1с паузы + 2с замера роняет P ниже цели > 0.1 и гейт хэндофил бы сразу.
     bool grace = (now_us - reg->fine_grace_t0_us) < reg->fine_period_us;
-    if (!fast && !grace && fabsf(error_filt) > 0.1) {
+    if (!fast && !grace && fabsf(error_filt) > 0.1 * P_SCALE) {
         // СБРОС-FINE: держать против утечки нечем (она тоже вниз) -> просто отдаём в
         // обычный HOLD ниже; charge-переучивание (fine_visited/last_pos/мид-доза)
         // пропускаем — это позиции НАБОРА (иной перепад на игле). НАБОР-FINE учится как раньше.
@@ -1284,7 +1432,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
         reg->fine_holding  = false;
         apply_servo(reg, SERVO_NEUTRAL);
         target_valve = reg->valve_flow_floor;
-        ESP_LOGW("PID", "FINE: err_filt=%.2f change=%.2f/5с — выход в обычный HOLD (доза -> %ld)",
+        ESP_LOGW("PID", "FINE: err_filt=%.3f change=%.3f/5с — выход в обычный HOLD (доза -> %ld)",
                  error_filt, reg->fine_change, (long)reg->step_holding_charge);
     } else {
         int32_t trim = fast ? reg->fine_trim_fast : reg->fine_trim;
@@ -1308,7 +1456,7 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
             reg->fine_grace_t0_us = now_us;              // новому направлению — окно до гейта HOLD и до повторного разворота
             dose_window_reset(reg, now_us);              // дрейф мерим с чистого листа
             target_valve          = reg->fine_pos;
-            ESP_LOGW("PID", "FINE: игла упала ниже %ld в %s -> разворот в %s, старт с %ld без подгона шага. P=%.2f",
+            ESP_LOGW("PID", "FINE: игла упала ниже %ld в %s -> разворот в %s, старт с %ld без подгона шага. P=%.3f",
                      (long)reg->fine_flip_floor,
                      (new_dir == SERVO_CHARGING) ? "СБРОСЕ" : "НАБОРЕ",
                      (new_dir == SERVO_CHARGING) ? "НАБОР"  : "СБРОС",
@@ -1348,7 +1496,7 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                     break;
                 }
                 reg->hold_presettle = false;                // выдержка прошла -> падаем в обычный выбор стороны ниже
-                ESP_LOGI("PID", "HOLD: пред-выдержка %.1fс окончена -> выбираем сторону по отстоявшемуся err_filt=%.2f. P=%.2f",
+                ESP_LOGI("PID", "HOLD: пред-выдержка %.1fс окончена -> выбираем сторону по отстоявшемуся err_filt=%.3f. P=%.3f",
                          (float)reg->hold_presettle_us / 1000000.0f, error_filt, pressure);
             }
 
@@ -1365,12 +1513,12 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                     reg->hold_vent_arming    = true;
                     reg->hold_vent_arm_t0_us = now_us;
                     target_valve = reg->valve_flow_floor;
-                    ESP_LOGI("PID", "HOLD: эпизод СБРОС — серво в VENT, игла ждёт %.0f мс (стравить штуцер), err_filt=%.2f",
+                    ESP_LOGI("PID", "HOLD: эпизод СБРОС — серво в VENT, игла ждёт %.0f мс (стравить штуцер), err_filt=%.3f",
                              (float)reg->hold_vent_settle_us / 1000.0f, error_filt);
                 } else {
                     target_valve = (dir == SERVO_CHARGING) ? reg->step_holding_charge
                                                            : reg->step_holding_vent;
-                    ESP_LOGI("PID", "HOLD: эпизод %s, игла на %ld, err_filt=%.2f",
+                    ESP_LOGI("PID", "HOLD: эпизод %s, игла на %ld, err_filt=%.3f",
                              (dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС",
                              (long)target_valve, error_filt);
                 }
@@ -1401,7 +1549,7 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                     reg->fine_grace_t0_us = now_us;
                     dose_window_reset(reg, now_us);
                     target_valve = reg->fine_pos;
-                    ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.2f | ЗАДАЧА ЗАВЕРШЕНА, УДЕРЖАНИЕ ПОЗИЦИИ",
+                    ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.3f | ЗАДАЧА ЗАВЕРШЕНА, УДЕРЖАНИЕ ПОЗИЦИИ",
                              (reg->fine_dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg->fine_pos, pressure);
                 } else {
                     target_valve = hold_dose_step(reg, now_us, true, pressure);
@@ -1419,13 +1567,13 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                 fix_time_for_delay = now_us;
                 first_in_fine      = true;
                 reg->ss_from_charge = true;            // паузу/замер запустил приход НАБОРОМ -> доп.проверка
-                ESP_LOGI("PID", "FINE(после НАБОРА): дошли до цель−%.2f -> серво в нейтраль, пауза + доп.проверка/замер. P=%.2f",
+                ESP_LOGI("PID", "FINE(после НАБОРА): дошли до цель−%.3f -> серво в нейтраль, пауза + доп.проверка/замер. P=%.3f",
                          reg->fine_ss_charge_offset, pressure);
             } else if (!use_fine && error_filt <= hold_reseal) {   // low_mode: дошли до цели (по P_filt, как и сброс — сырое error дёргало серво от шума)
                 reg->dose_searching = false;
                 apply_servo(reg, SERVO_NEUTRAL);
                 target_valve = reg->valve_flow_floor;
-                ESP_LOGI("PID", "HOLD: дошли до точки, запечатано (игла floor, серво нейтраль). P=%.2f err_filt=%+.2f | ЗАДАЧА ЗАВЕРШЕНА, УДЕРЖАНИЕ ПОЗИЦИИ",
+                ESP_LOGI("PID", "HOLD: дошли до точки, запечатано (игла floor, серво нейтраль). P=%.3f err_filt=%+.3f | ЗАДАЧА ЗАВЕРШЕНА, УДЕРЖАНИЕ ПОЗИЦИИ",
                          pressure, error_filt);
             } else {
                 target_valve = hold_dose_step(reg, now_us, true, pressure);
@@ -1443,7 +1591,7 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                 }
                 reg->hold_vent_arming = false;
                 dose_window_reset(reg, now_us);   // прогресс дозы — от реального старта стравливания
-                ESP_LOGI("PID", "HOLD: СБРОС — серво осело (%.0f мс), открываю иглу. P=%.2f",
+                ESP_LOGI("PID", "HOLD: СБРОС — серво осело (%.0f мс), открываю иглу. P=%.3f",
                          (float)reg->hold_vent_settle_us / 1000.0f, pressure);
             }
             if (!reg->dose_vent_calibrated) {
@@ -1465,7 +1613,7 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                     reg->fine_grace_t0_us = now_us;
                     dose_window_reset(reg, now_us);
                     target_valve = reg->fine_pos;
-                    ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.2f | ЗАДАЧА ЗАВЕРШЕНА, УДЕРЖАНИЕ ПОЗИЦИИ",
+                    ESP_LOGI("PID", "FINE: вход, направление уже известно (%s) -> сразу удержание, игла на %ld. P=%.3f | ЗАДАЧА ЗАВЕРШЕНА, УДЕРЖАНИЕ ПОЗИЦИИ",
                              (reg->fine_dir == SERVO_CHARGING) ? "НАБОР" : "СБРОС", (long)reg->fine_pos, pressure);
                 } else {
                     target_valve = hold_dose_step(reg, now_us, false, pressure);
@@ -1484,7 +1632,7 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                     fix_time_for_delay = now_us;
                     first_in_fine = true;
                     reg->ss_from_charge = false;   // приход СБРОСОМ -> обычная 5с пауза, без доп.проверки
-                    ESP_LOGI("PID", "FINE(после СБРОСА): дошли до цель+%.2f -> серво в нейтраль, пауза 5с, затем замер дрейфа. P=%.2f",
+                    ESP_LOGI("PID", "FINE(после СБРОСА): дошли до цель+%.3f -> серво в нейтраль, пауза 5с, затем замер дрейфа. P=%.3f",
                              reg->fine_ss_vent_offset, pressure);
                 } else {
                     target_valve = hold_dose_step(reg, now_us, false, pressure);  // спуск до точки замера
@@ -1495,7 +1643,7 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                     reg->dose_searching = false;
                     apply_servo(reg, SERVO_NEUTRAL);
                     target_valve = reg->valve_flow_floor;
-                    ESP_LOGI("PID", "HOLD: дошли до точки, запечатано (игла floor, серво нейтраль). P=%.2f err_filt=%+.2f | ЗАДАЧА ЗАВЕРШЕНА, УДЕРЖАНИЕ ПОЗИЦИИ",
+                    ESP_LOGI("PID", "HOLD: дошли до точки, запечатано (игла floor, серво нейтраль). P=%.3f err_filt=%+.3f | ЗАДАЧА ЗАВЕРШЕНА, УДЕРЖАНИЕ ПОЗИЦИИ",
                              pressure, error_filt);
                 } else {
                     target_valve = hold_dose_step(reg, now_us, false, pressure);
@@ -1571,16 +1719,16 @@ void pid_regulator_task(void *pvParameters) {
                 move_valve_absolute(reg.valve_flow_floor, VALVE_STEP_US);
             
             if(fast_mode){
-                reg.dose_dp_fast = 0.20f;
-                reg.dose_dp_slow = 0.10f;
-                reg.dose_dp_VERYslow    = -0.08f;
-                reg.dose_dp_runaway = 0.40f;
+                reg.dose_dp_fast = 0.20f * P_SCALE;
+                reg.dose_dp_slow = 0.10f * P_SCALE;
+                reg.dose_dp_VERYslow    = -0.08f * P_SCALE;
+                reg.dose_dp_runaway = 0.40f * P_SCALE;
             }
             else{
-                reg.dose_dp_fast = 0.10f;
-                reg.dose_dp_slow = 0.05f;
-                reg.dose_dp_VERYslow    = -0.04f;
-                reg.dose_dp_runaway = 0.20f;
+                reg.dose_dp_fast = 0.10f * P_SCALE;
+                reg.dose_dp_slow = 0.05f * P_SCALE;
+                reg.dose_dp_VERYslow    = -0.04f * P_SCALE;
+                reg.dose_dp_runaway = 0.20f * P_SCALE;
             }
         }
 
@@ -1591,7 +1739,7 @@ void pid_regulator_task(void *pvParameters) {
         // раз rate=0). Поэтому скорость пересчитываем ТОЛЬКО когда пришёл свежий
         // отсчёт (значение реально изменилось), и по реальному времени с прошлого.
         float pressure = pressure1_kPa;
-        if (fabsf(pressure-reg.prev_pressure) > 0.001f ) { // сравниваем если на одинаковых показаниях датчик дает чуть разное
+        if (fabsf(pressure-reg.prev_pressure) > 0.001f * P_SCALE ) { // сравниваем если на одинаковых показаниях датчик дает чуть разное
             float dt_p = (float)(now_us - reg.last_pressure_us) / 1000000.0f;
             if (dt_p < 0.001f) dt_p = 0.001f;
             float raw_rate = (pressure - reg.prev_pressure) / dt_p;   // кПа/с по свежему отсчёту
@@ -1658,7 +1806,7 @@ void pid_regulator_task(void *pvParameters) {
                 }
 
                 if (esp_timer_get_time()/1000 - last_log_ms > LOG_PERIOD_MS) {
-                    ESP_LOGI("PID", "Idle | P=%.2f kPa | P_filt=%.3f kPa | Pos=%ld | speed=%.3f kpa/s",
+                    ESP_LOGI("PID", "Idle | P=%.3f kPa | P_filt=%.4f kPa | Pos=%ld | speed=%.3f kpa/s",
                              pressure, reg.filtered_pressure, (long)current_valve_position, idle_speed);
                     last_log_ms = esp_timer_get_time()/1000;
                 }
@@ -1674,7 +1822,7 @@ void pid_regulator_task(void *pvParameters) {
                 // в тишине. Метка "P_filt" — для гошиного парсера; значение тут СЫРОЕ
                 // pressure1_kPa: настоящий P_filt (reg.filtered_pressure) в блокирующем
                 // HOMING заморожен — основной цикл, который его считает, стоит.
-                ESP_LOGI("VENT", "VENT старт | P_filt=%.3f kPa | Pos=%ld",
+                ESP_LOGI("VENT", "VENT старт | P_filt=%.4f kPa | Pos=%ld",
                          pressure1_kPa, (long)current_valve_position);
 
                 // Открываем иглу кусками до упора, логируя КАЖДЫЙ кусок. Размер куска
@@ -1690,20 +1838,27 @@ void pid_regulator_task(void *pvParameters) {
                     if (chunk > MAX_VALVE_STEPS) chunk = MAX_VALVE_STEPS;
                     move_valve_absolute(chunk, 190);
                     vTaskDelay(1);
-                    ESP_LOGI("VENT", "VENT откр | P_filt=%.3f kPa | Pos=%ld",
+                    ESP_LOGI("VENT", "VENT откр | P_filt=%.4f kPa | Pos=%ld",
                              pressure1_kPa, (long)current_valve_position);
                 }
-                // Ждём, пока давление реально упадёт (игла настежь). pressure1_kPa
-                // читаем напрямую — это живой глобал от задачи датчика (pressure и
-                // reg.filtered_pressure тут заморожены: основной цикл стоит). Шаг ~0.5 с.
+                // Игла настежь — засекаем момент полного открытия. От него держим
+                // стравливание минимум VENT_MIN_OPEN_MS (см. define выше).
+                int64_t vent_open_us = esp_timer_get_time();
+
+                // Ждём, пока давление реально упадёт (игла настежь) И пройдёт хотя бы
+                // VENT_MIN_OPEN_MS от открытия иглы. Если давление упало раньше — всё
+                // равно дожидаемся выдержки. pressure1_kPa читаем напрямую — это живой
+                // глобал от задачи датчика (pressure и reg.filtered_pressure тут
+                // заморожены: основной цикл стоит). Шаг ~0.5 с.
                 int vent_log = 0;
-                while (pressure1_kPa > 0.2f) {
+                while (pressure1_kPa > 0.2f ||
+                       (esp_timer_get_time() - vent_open_us) < (int64_t)VENT_MIN_OPEN_MS * 1000) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                     if (++vent_log % 20 == 0)            // ~0.5 с
-                        ESP_LOGI("VENT", "VENT | P_filt=%.3f kPa | Pos=%ld",
+                        ESP_LOGI("VENT", "VENT | P_filt=%.4f kPa | Pos=%ld",
                                  pressure1_kPa, (long)current_valve_position);
                 }
-                ESP_LOGI("VENT", "VENT конец | P_filt=%.3f kPa", pressure1_kPa);
+                ESP_LOGI("VENT", "VENT конец | P_filt=%.4f kPa", pressure1_kPa);
                 // Закрываем иглу обратно (давление уже сброшено — логировать нечего)
                 chunk = current_valve_position;
                 while (current_valve_position > 0) {
@@ -1749,7 +1904,7 @@ void pid_regulator_task(void *pvParameters) {
                 const int32_t STEP_CHUNK = 1000;   // ход иглы кусками — кормим watchdog
                 int32_t chunk;
 
-                ESP_LOGE("PID", "АВАРИЯ:ПРЕВЫШЕНИЕ - давление %.2f кПа -> превышен потолок %.1f кПа, аварийный сброс!",
+                ESP_LOGE("PID", "АВАРИЯ:ПРЕВЫШЕНИЕ - давление %.3f кПа -> превышен потолок %.1f кПа, аварийный сброс!",
                          pressure1_kPa, (float)P_MAX_KPA);
 
                 // 1) Серво -> СБРОС немедленно: запускаем долгий физический ход 0°->180°.
@@ -1765,7 +1920,7 @@ void pid_regulator_task(void *pvParameters) {
                     move_valve_absolute(chunk, 190);
                     vTaskDelay(1);
                 }
-                ESP_LOGW("PID", "АВАРИЯ: игла закрыта, серво едет в СБРОС — ждём %d мс хода серво. P=%.2f Pos=%ld",
+                ESP_LOGW("PID", "АВАРИЯ: игла закрыта, серво едет в СБРОС — ждём %d мс хода серво. P=%.3f Pos=%ld",
                          SERVO_VENT_SETTLE_MS, pressure1_kPa, (long)current_valve_position);
 
                 // 3) Ждём, пока серво ФИЗИЧЕСКИ доедет до VENT (и штуцер стравится в
@@ -1779,7 +1934,7 @@ void pid_regulator_task(void *pvParameters) {
                     if (chunk > MAX_VALVE_STEPS) chunk = MAX_VALVE_STEPS;
                     move_valve_absolute(chunk, 190);
                     vTaskDelay(1);
-                    ESP_LOGW("PID", "АВАРИЯ: стравливаю | P=%.2f кПа | Pos=%ld",
+                    ESP_LOGW("PID", "АВАРИЯ: стравливаю | P=%.3f кПа | Pos=%ld",
                              pressure1_kPa, (long)current_valve_position);
                 }
 
@@ -1802,7 +1957,7 @@ void pid_regulator_task(void *pvParameters) {
                 reg.active_setpoint = 0.0f;
                 reset_controllers(&reg);
                 reg.state = REG_STATE_IDLE;
-                ESP_LOGE("PID", "АВАРИЯ: сброс завершён, уставка обнулена -> IDLE. P=%.2f кПа", pressure1_kPa);
+                ESP_LOGE("PID", "АВАРИЯ: сброс завершён, уставка обнулена -> IDLE. P=%.3f кПа", pressure1_kPa);
                 continue;
             }
 
@@ -1853,7 +2008,7 @@ void pid_regulator_task(void *pvParameters) {
         // sensor_noise_delta_filt) и use_fine=hold_fine_enable -> поведение FINE не меняется.
         bool  low_mode    = reg.active_setpoint < reg.fine_min_setpoint;
         bool  use_fine    = reg.hold_fine_enable && !low_mode;
-        float hold_trig   = low_mode ? reg.hold_trig_band   : 0.1f;
+        float hold_trig   = low_mode ? reg.hold_trig_band   : 0.1f * P_SCALE;
         float hold_reseal = low_mode ? reg.hold_reseal_band : reg.sensor_noise_delta_filt;
 
         // Возврат HOLD->RATE, если ошибка уехала далеко (ложный вход на спайке или
@@ -1862,7 +2017,7 @@ void pid_regulator_task(void *pvParameters) {
         // На возврате сбрасываем калибровку — на другой высоте порог потока другой,
         // RATE накачает и поиск переищет уже у цели.
         if (reg.holding && fabsf(error_filt) > reg.hold_exit_err) {
-            ESP_LOGW("PID", "HOLD->RATE: err_filt=%.2f > %.2f — далеко от цели, качаем RATE заново",
+            ESP_LOGW("PID", "HOLD->RATE: err_filt=%.3f > %.3f — далеко от цели, качаем RATE заново",
                      error_filt, reg.hold_exit_err);
             reg.holding                = false;
             reg.fine_holding           = false;
@@ -1894,7 +2049,7 @@ void pid_regulator_task(void *pvParameters) {
         uint32_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - last_log_ms >= LOG_PERIOD_MS) {
             ESP_LOGI("PID",
-                "%s | P=%.2f P_filt=%.3f set=%.1f err=%.2f rate=%.2f rate_filt=%.3f kPa/s | servo=%d pos=%ld ch5=%.2f",
+                "%s | P=%.3f P_filt=%.4f set=%.1f err=%.3f rate=%.3f rate_filt=%.3f kPa/s | servo=%d pos=%ld ch5=%.3f",
                 zone, pressure, reg.filtered_pressure, reg.active_setpoint, error, reg.raw_rate, reg.filtered_rate,
                 reg.servo_state, (long)current_valve_position, reg.fine_change);
             last_log_ms = now_ms;

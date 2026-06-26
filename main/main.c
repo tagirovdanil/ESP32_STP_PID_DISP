@@ -122,29 +122,39 @@ static void handle_command(char *str) {
     }
 
     // ==========================================================================
-    // ОБРАБОТКА КОМАНДЫ "SER <n> <angle>" — РУЧНОЕ управление серво-краном.
-    // Формат: SER 1 0 / SER 1 90 / SER 1 180 (угол 0..180; серво № пока только 1).
-    // Прямо выставляет ШИМ серво — для теста. ВНИМАНИЕ: пока регулятор в RUNNING,
-    // он перебьёт это значение на следующем тике, поэтому пользоваться в IDLE.
+    // ОБРАБОТКА КОМАНДЫ "SER <n> <val>" — РУЧНОЕ управление приводами (для теста).
+    //   SER 1 <angle>  — отсечной СЕРВО-кран, угол 0..180 (0=сброс, 90=нейтраль, 180=подача).
+    //   SER 2 <step>   — ИГЛА (шаговый), абсолютная координата 0..MAX_VALVE_STEPS шагов.
+    // ВНИМАНИЕ: пока регулятор в RUNNING, он перебьёт это значение на следующем тике,
+    // поэтому пользоваться в IDLE.
     // ==========================================================================
     char *ser_ptr = strstr(str, "ser ");
     if (ser_ptr == NULL) ser_ptr = strstr(str, "SER ");
     if (ser_ptr != NULL) {
-        int   idx   = 0;
-        float angle = 0.0f;
-        if (sscanf(ser_ptr + 4, "%d %f", &idx, &angle) == 2) {
-            if (idx != 1) {
-                respond("\r\n>> [ERR] SER: only servo 1 supported\r\n");
-            } else if (angle < 0.0f || angle > 180.0f) {
+        int   idx = 0;
+        float val = 0.0f;
+        char  msg[56];
+        if (sscanf(ser_ptr + 4, "%d %f", &idx, &val) != 2) {
+            respond("\r\n>> [ERR] SER: format 'SER 1 90' or 'SER 2 1000'\r\n");
+        } else if (idx == 1) {                       // отсечной серво-кран (угол)
+            if (val < 0.0f || val > 180.0f) {
                 respond("\r\n>> [ERR] SER: angle out of range 0..180\r\n");
             } else {
-                set_servo_angle(angle);
-                char msg[48];
-                snprintf(msg, sizeof(msg), "\r\n>> Servo %d -> %.0f deg\r\n", idx, angle);
+                set_servo_angle(val);
+                snprintf(msg, sizeof(msg), "\r\n>> Servo 1 -> %.0f deg\r\n", val);
+                respond(msg);
+            }
+        } else if (idx == 2) {                       // игла (шаговый, абсолютный шаг)
+            if (val < 0.0f || val > (float)MAX_VALVE_STEPS) {
+                snprintf(msg, sizeof(msg), "\r\n>> [ERR] SER: step out of range 0..%d\r\n", MAX_VALVE_STEPS);
+                respond(msg);
+            } else {
+                move_valve_absolute((int32_t)val, 400);   // 400 мкс/шаг — безопасная скорость
+                snprintf(msg, sizeof(msg), "\r\n>> Needle (servo 2) -> %ld steps\r\n", (long)current_valve_position);
                 respond(msg);
             }
         } else {
-            respond("\r\n>> [ERR] SER: format 'SER 1 90'\r\n");
+            respond("\r\n>> [ERR] SER: servo 1 (angle) or 2 (needle step) only\r\n");
         }
         return;
     }
@@ -279,7 +289,7 @@ void usb_uart_rx_task(void *pvParameters) {
         return;
     }
 
-    ESP_LOGI(TAG, "Задача чтения команд через USB UART запущена. Формат: set X / ser N A / reset / idle / home / sn / range [N] / setrange N");
+    ESP_LOGI(TAG, "Задача чтения команд через USB UART запущена. Формат: set X / ser 1 <угол> / ser 2 <шаг> / vent / idle / home / sn / range [N] / setrange N");
 
     while (1) {
         // Читаем данные из UART_NUM_0. Таймаут 20 мс позволяет задаче «засыпать», если порт пуст
