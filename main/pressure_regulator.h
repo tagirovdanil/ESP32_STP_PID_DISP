@@ -190,6 +190,8 @@ typedef struct {
     int32_t  dose_trim_lowvent;     // замена dose_trim     на низком сбросе
     int32_t  dose_trim_big_lowvent; // замена dose_trim_big на низком сбросе
     float    dose_lowvent_max;      // порог давления (кПа): ниже -> крупный шаг сброса
+    float   dose_lowvent_p_low;      // нижняя граница интерп. откачивания: ≤этого → крупный шаг (20/50)
+    int32_t dose_vent_reduce_count;  // счётчик подряд-опусканий при откачивании (аварийный /2)
     float    dose_big_min_err;      // п.1: |уставка − P(СЫРОЕ)| меньше этого -> big/very_big НЕ применяем,
                                     // берём обычный dose_trim (близко к цели крупный шаг переливает)
 

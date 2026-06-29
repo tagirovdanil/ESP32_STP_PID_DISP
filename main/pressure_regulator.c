@@ -235,6 +235,10 @@ void regulator_init(PressureRegulator* reg) {
     reg->dose_trim_lowvent     = 20;       // вместо dose_trim (2)
     reg->dose_trim_big_lowvent = 50;       // вместо dose_trim_big (5)
     reg->dose_lowvent_max      = 300.0f;   // абсолютные кПа (НЕ ×P_SCALE: на 63-датчике сброс всегда крупным шагом)
+    reg->dose_lowvent_max       = 60.0f;   // верхняя граница интерп. (кПа): ≥этого → нормал. шаг 2/5
+    reg->dose_lowvent_p_low     = 10.0f;   // нижняя граница интерп. (кПа): ≤этого → крупный шаг 20/50
+    //   на 35 кПа (между): trim≈11, trim_big≈28
+    reg->dose_vent_reduce_count = 0;       // счётчик подряд-опусканий (3 подряд → позиция /2)
     reg->dose_big_min_err = 0.5f * P_SCALE;     // п.1: ближе 0.5 кПа к цели (по СЫРОМУ давлению) big/very_big не применяем
     // п.2: кольцо лагов мультиоконной проверки HOLD/FINE (как окно поиска порога, но на 5с-масштаб)
     reg->dose_hist_dt_us = 1250000ULL;  // 1.25 с -> лаги 1.25/2.5/3.75/5.0 с
@@ -456,17 +460,49 @@ static void dose_hist_tick(PressureRegulator* reg, uint64_t now_us) {
     }
 }
 
-// Сброс окна проверки дозы (на входе в HOLD и на старте каждого эпизода), чтобы
-// прогресс мерился от начала текущего эпизода, а не от прошлого. Заодно чистит
-// кольцо лагов (п.2): после смены фазы / защитного залпа лаги считаем заново.
-static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
+// ЛЁГКИЙ сброс — только таймер/кольцо лагов/flat_run/jump_armed. Используется,
+// когда мы просто приняли решение по дозе и хотим мерить прогресс с чистого
+// листа, но ЭПИЗОД (направление набор/сброс) не меняется. В отличие от полного
+// dose_window_reset() НЕ трогает dose_vent_reduce_count — этот счётчик должен
+// жить через несколько подряд идущих коррекций внутри одного направления,
+// иначе авария "3 подряд" никогда не накопится (как и было в логе).
+static void dose_window_soft_reset(PressureRegulator* reg, uint64_t now_us) {
     reg->dose_t0_us = now_us;
     reg->dose_p0    = reg->filtered_pressure;
     reg->dose_hist_count = 0;
     reg->dose_hist_idx   = 0;
     reg->dose_hist_t0_us = now_us;
-    reg->dose_flat_run   = 0;       // новое окно/эпизод -> память «пустых окон» с нуля
-    reg->dose_jump_armed = false;   // смена фазы / откат отменяют сторож подскока
+    reg->dose_flat_run   = 0;
+    reg->dose_jump_armed = false;
+}
+
+// ПОЛНЫЙ сброс — для настоящих границ эпизода (новая уставка, смена направления,
+// откат после прыжка, вход в HOLD/FINE из RATE). Добавляет обнуление счётчика
+// аварийных опусканий — там это действительно новый эпизод.
+static void dose_window_reset(PressureRegulator* reg, uint64_t now_us) {
+    dose_window_soft_reset(reg, now_us);
+    reg->dose_vent_reduce_count = 0;
+}
+// Общая проверка аварийного деления пополам на СБРОСЕ. Вызывается из ОБОИХ мест,
+// где доза может уменьшить позицию: из «ЗАЩИТЫ» (любой короткий лаг) и из
+// «основного окна 5с». Счётчик общий для обеих веток — раньше ЗАЩИТА его не
+// трогала и тут же стирала через dose_window_reset(), поэтому 3 подряд не
+// набирались никогда.
+static bool dose_vent_emergency_check(PressureRegulator* reg, int32_t old_pos, int32_t* pos) {
+    if (*pos < old_pos) {
+        if (++reg->dose_vent_reduce_count >= 3) {
+            int32_t half = old_pos / 2;
+            if (half < reg->valve_flow_floor) half = reg->valve_flow_floor;
+            *pos = half;
+            reg->dose_vent_reduce_count = 0;
+            ESP_LOGW("PID", "HOLD: СБРОС АВАР — 3 опускания подряд, %ld -> %ld (old/2), счётчик сброшен",
+                     (long)old_pos, (long)*pos);
+            return true;
+        }
+    } else {
+        reg->dose_vent_reduce_count = 0;
+    }
+    return false;
 }
 //
 // ============================================================================
@@ -519,14 +555,27 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
             return *pos;                             // пока сторожим — держим прыжковую позицию
     }
 
-    // Базовый шаг дозы. СБРОС (откачивание) на низком давлении — особый случай:
-    // поток через иглу слабый, мелким шагом дозу не выгрести -> крупный шаг. Весь
-    // особый случай живёт ЗДЕСЬ; ниже всё считает по trim/trim_big и про него не знает.
+     // Базовый шаг дозы. На откачивании (СБРОС) шаг зависит от давления линейно:
+    //   pressure >= dose_lowvent_max   (60 кПа) → нормальный шаг 2 / 5
+    //   pressure <= dose_lowvent_p_low (10 кПа) → крупный шаг   20 / 50
+    //   между                                  → интерполяция (напр. 35 кПа → 11 / 28)
+    // На наборе всегда нормальный шаг (2/5). Весь выбор шага живёт ЗДЕСЬ.
     int32_t trim     = reg->dose_trim;       // обычно 2
     int32_t trim_big = reg->dose_trim_big;   // обычно 5
-    if (!charging && pressure_raw < reg->dose_lowvent_max) {
-        trim     = reg->dose_trim_lowvent;       // 20
-        trim_big = reg->dose_trim_big_lowvent;   // 50
+    if (!charging) {
+        float span = reg->dose_lowvent_max - reg->dose_lowvent_p_low;   // 60-10=50
+        float t    = (span > 0.0f)
+                   ? (pressure_raw - reg->dose_lowvent_p_low) / span
+                   : 1.0f;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        // t=0 (низкое давление): 20/50;  t=1 (высокое): 2/5
+        trim     = (int32_t)roundf((float)reg->dose_trim_lowvent
+                   + t * (float)(reg->dose_trim     - reg->dose_trim_lowvent));
+        trim_big = (int32_t)roundf((float)reg->dose_trim_big_lowvent
+                   + t * (float)(reg->dose_trim_big - reg->dose_trim_big_lowvent));
+        if (trim     < 1) trim     = 1;
+        if (trim_big < 1) trim_big = 1;
     }
 
     // п.1: близко к цели (по СЫРОМУ давлению) крупный шаг переливает -> big/very_big
@@ -590,11 +639,14 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
         if (fired) {
             if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
             if (*pos > reg->valve_max)        *pos = reg->valve_max;
-            if (*pos != old)
+
+            bool emerg = !charging && dose_vent_emergency_check(reg, old, pos);
+
+            if (!emerg && *pos != old)
                 ESP_LOGI("PID", "HOLD: доза %s ЗАЩИТА %ld -> %ld (toward_max=%+.3f toward_min=%+.3f по лагам<=%.2fс)",
                          charging ? "НАБОР" : "СБРОС", (long)old, (long)*pos, toward_max, toward_min,
                          (float)(reg->dose_hist_dt_us * DOSE_HIST_N) / 1000000.0f);
-            dose_window_reset(reg, now_us);
+            dose_window_soft_reset(reg, now_us);   // было dose_window_reset — счётчик больше не стираем
             return *pos;
         }
     }
@@ -644,9 +696,16 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
         } else {
             reg->dose_flat_run = 0;                            // «хорошо» — прогресс в норме
         }
-        if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
+         if (*pos < reg->valve_flow_floor) *pos = reg->valve_flow_floor;
         if (*pos > reg->valve_max)        *pos = reg->valve_max;
-        if (*pos != old) {
+
+        // --- аварийный /2 при откачивании: 3 подряд опускания → делим позицию пополам ---
+        // Счётчик растёт только при реальном снижении *pos (после клампа) при charging=false.
+        // Обнуляется: при не-опускании (плоско / рост), при dose_window_reset (смена
+        // эпизода / направления / защитный залп) — это покрывает «был набор».
+        bool emerg = !charging && dose_vent_emergency_check(reg, old, pos);
+
+        if (!emerg && *pos != old) {
             if (jumped)
                 ESP_LOGI("PID", "HOLD: доза %s ПРЫЖОК %ld -> %ld (2 окна без изменений, +%ld; сторожу подскок %.0f мс)",
                          charging ? "НАБОР" : "СБРОС", (long)old, (long)*pos,
@@ -659,6 +718,7 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
         }
         reg->dose_t0_us = now_us;
         reg->dose_p0    = reg->filtered_pressure;
+
         if (jumped) {                                          // прогресс после прыжка мерим с чистого длинного кольца
             reg->dose_hist_count = 0;
             reg->dose_hist_idx   = 0;
