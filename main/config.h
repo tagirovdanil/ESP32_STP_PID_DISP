@@ -29,7 +29,7 @@
 //   они зависят от привода/подачи, а не от диапазона датчика.)
 // ============================================================================
 #define P_SENSOR_REF_KPA   6000.0f                                  // опорная шкала: при ней P_SCALE = 1.0
-#define CURRENT_SENSOR_KPA 63.0f                                    // полная шкала установленного датчика (старый стенд: 6000.0f)
+#define CURRENT_SENSOR_KPA 6000.0f                                    // полная шкала установленного датчика (старый стенд: 6000.0f)  // ПОМЕНЯТЬ НА 63 КОГДА БУДЕТ 63
 #define P_SCALE            (CURRENT_SENSOR_KPA / P_SENSOR_REF_KPA)  // общий множитель порогов в кПа
 
 // --- Мелкие ступени «медленного удержания» у цели (slow holding) ---------------
@@ -63,6 +63,7 @@ extern volatile int32_t current_valve_position;
 // 4. Прототипы функций
 void set_servo_angle(float angle);
 void move_valve_absolute(int32_t target_position, uint32_t speed_us);
+void move_valve_absolute_inv(int32_t target_position, uint32_t speed_us);
 void start_pressure_homing(void);
 void hardware_setup_and_calibrate(void);
 void update_setpoint(float new_setpoint, bool new_fast_mode);

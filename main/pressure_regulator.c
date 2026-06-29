@@ -143,6 +143,26 @@ void move_valve_absolute(int32_t target_position, uint32_t speed_us) {
     }
 }
 
+void move_valve_absolute_inv(int32_t target_position, uint32_t speed_us) {
+    if (target_position < 0)               target_position = 0;
+    if (target_position > MAX_VALVE_STEPS) target_position = MAX_VALVE_STEPS;
+    if (current_valve_position == target_position) return;
+
+    int32_t steps_to_move = labs(target_position - current_valve_position);
+    bool    dir = (target_position > current_valve_position) ? true : false; // false=открыть, true=закрыть
+    gpio_set_level(PIN_DIR, dir);
+    esp_rom_delay_us(5);
+
+    for (int32_t i = 0; i < steps_to_move; i++) {
+        gpio_set_level(PIN_STEP, 1);
+        esp_rom_delay_us(10);
+        gpio_set_level(PIN_STEP, 0);
+        esp_rom_delay_us(speed_us);
+        if (dir == false) current_valve_position++;
+        else              current_valve_position--;
+    }
+}
+
 // ============================================================================
 //  ИНИЦИАЛИЗАЦИЯ РЕГУЛЯТОРА
 //  Все коэффициенты ФИКСИРОВАННЫЕ — настраиваются один раз. Значения ниже —
@@ -370,7 +390,7 @@ void regulator_init(PressureRegulator* reg) {
     // примерно на max_step*0.41 мс, поэтому держим небольшим (60 -> ~25 мс/тик,
     // слю ~2400 шаг/с, полный ход ~4 с). Если игла открывается слишком медленно —
     // увеличивай вместе с контролем времени тика.
-    reg->max_step       = 60;
+    reg->max_step       = 300;
 }
 
 // ============================================================================
@@ -389,9 +409,9 @@ static float desired_rate_from_error(float error, float near_rate, float very_ne
     if      (e > 500.0f) rate = 100.0f;
     else if (e > 250.0f) rate = 50.0f;
     else if (e >  80.0f) rate = 20.0f;
-    else if (e >  30.0f) rate = 10.0f;
-    else if (e >   16.0f) rate = 3.0f;
-    else if (e >   5.0f) rate = fast_mode ? 2.0f : 1.0f; 
+    else if (e >  50.0f) rate = 5.0f;
+    else if (e >   22.0f) rate = 3.0f;
+    else if (e >   8.0f) rate = fast_mode ? 2.0f : 1.0f; 
     else if (e >   1.0)                 rate = fast_mode ? 1.0 : near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
     else rate = fast_mode ? 0.5 : very_near_rate;   // у самой цели — скорость уровня шума; точную доводку до точки делает HOLD-доза
     return (error >= 0.0f) ? rate : -rate;
@@ -1218,7 +1238,7 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
         // разгоняется по +dose_trim_big за окно до первого потока
         // (см. hold_dose_step), дальше штатные +-dose_trim.
         reg->holding = true;
-        int32_t seed = current_valve_position - reg->dose_step_back;
+        int32_t seed = current_valve_position * 0.7;// - reg->dose_step_back;
         if (seed < reg->valve_flow_floor) seed = reg->valve_flow_floor;
 
         // Сторону коррекции берём по тому, С КАКОЙ СТОРОНЫ цели мы сейчас (по

@@ -149,11 +149,22 @@ static void handle_command(char *str) {
                 snprintf(msg, sizeof(msg), "\r\n>> [ERR] SER: step out of range 0..%d\r\n", MAX_VALVE_STEPS);
                 respond(msg);
             } else {
+                move_valve_absolute_inv((int32_t)val, 400);   // 400 мкс/шаг — безопасная скорость
+                snprintf(msg, sizeof(msg), "\r\n>> Needle (servo 2) -> %ld steps\r\n", (long)current_valve_position);
+                respond(msg);
+            }
+        } 
+        else if (idx == 3) {                       // игла (шаговый, абсолютный шаг)
+            if (val < 0.0f || val > (float)MAX_VALVE_STEPS) {
+                snprintf(msg, sizeof(msg), "\r\n>> [ERR] SER: step out of range 0..%d\r\n", MAX_VALVE_STEPS);
+                respond(msg);
+            } else {
                 move_valve_absolute((int32_t)val, 400);   // 400 мкс/шаг — безопасная скорость
                 snprintf(msg, sizeof(msg), "\r\n>> Needle (servo 2) -> %ld steps\r\n", (long)current_valve_position);
                 respond(msg);
             }
-        } else {
+        }
+        else {
             respond("\r\n>> [ERR] SER: servo 1 (angle) or 2 (needle step) only\r\n");
         }
         return;
