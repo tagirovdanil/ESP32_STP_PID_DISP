@@ -808,6 +808,35 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
                  dir_name, (long)*pos, reg->filtered_pressure, reg->filtered_rate);
     }
 
+    // --- ДОШЛИ ДО ЦЕЛИ, ПОКА ИСКАЛИ (направление удержания уже замерено) ----------
+    // Детект потока ниже срабатывает по чекпойнтам раз в search_hist_dt_us (0.25 с) и
+    // по ОТСТАЮЩЕМУ P_filt. На быстром сбросе, пока копится история для детекта,
+    // СЫРОЕ давление успевает провалиться НИЖЕ цели — и «скорость становится нужной»
+    // уже за целью (видели спуск до 999.7 при цели 1000). Если направление удержания
+    // на эту уставку мы УЖЕ замерили дрейфом (fine_dir_known), доискивать порог
+    // незачем: как только по СЫРОМУ давлению (reg->prev_pressure, без лага фильтра)
+    // дошли до цели — финишируем здесь же, как фаза 2 у цели (иглу на тек.поз −
+    // search_done_back, калибровку фиксируем). На следующем тике штатная ветка
+    // fine_dir_known в run_hold_phase отдаёт в готовое удержание. Ниже цели больше не
+    // проваливаемся. На ПЕРВОМ подходе (направление ещё не известно) НЕ срабатывает:
+    // там поиск обязан довести до цели, а запас offset нужен под замер дрейфа.
+    if (reg->fine_dir_known) {
+        float remaining_raw = charging ? (reg->active_setpoint - reg->prev_pressure)
+                                       : (reg->prev_pressure - reg->active_setpoint);
+        if (remaining_raw <= reg->sensor_noise_delta_filt) {
+            int32_t hold_pos = *pos - reg->search_done_back;
+            if (hold_pos < reg->valve_flow_floor) hold_pos = reg->valve_flow_floor;
+            reg->search_found_pos = *pos;
+            *pos                  = hold_pos;
+            *calib                = true;
+            reg->dose_searching   = false;
+            dose_window_reset(reg, now_us);
+            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — ДОШЛИ ДО ЦЕЛИ пока искали (P=%.3f) -> финиш на игле %ld (−%ld) БЕЗ детекта скорости, отдаём в готовое удержание",
+                     dir_name, reg->prev_pressure, (long)hold_pos, (long)reg->search_done_back);
+            return hold_pos;
+        }
+    }
+
     // --- фаза 0 Подгон: после RATE фильтр P_filt ОТСТАЁТ от raw и слюит.
     //     rate_filt считается по RAW (а raw после закрытия иглы стабилен почти сразу),
     //     поэтому ждём |rate_filt| мал = «raw стоит», затем ПРИБИВАЕМ P_filt к raw и
