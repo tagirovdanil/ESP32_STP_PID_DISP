@@ -96,7 +96,7 @@ volatile RegulatorState requested_reg_state = REG_STATE_NONE;
 // Жёсткий верхний предел стравливания (предохранитель). Слежение за скоростью само
 // надёжно ловит дно, но если датчик совсем врёт и «падение» никогда не замирает —
 // не висим бесконечно с открытой иглой, а закрываемся по этому таймауту.
-#define VENT_MAX_OPEN_MS  30000
+#define VENT_MAX_OPEN_MS  60000
 
 // Защита фильтров от глюков датчика. Битый UART-кадр иногда раскодируется в
 // «валидное» давление (проходит проверку диапазона в pressure_sensor.c), и один
@@ -359,6 +359,13 @@ void regulator_init(PressureRegulator* reg) {
                                          // «стоим» уже требует плоского окна -> дребезг максимум ±1 шаг
     reg->fine_dev_guard   = 0.00f * P_SCALE;       // было 0.05, потом 0.01 поставил - на 500 вышло, теперь пробую 0.00 q2: ниже цели на 0.01+ не прикрываем (−), выше на 0.01+ не приоткрываем (+)
     reg->fine_trim_fast   = 4;           // пока давление ещё активно движется — крупный шаг (вместо fine_trim=2)
+    // ЛЕСЕНКА ШАГА (см. fine_drift_step): дрейф упрямо в одну сторону -> шаг растёт.
+    reg->fine_drift_run       = 0;       // состояние серии (стартуем с пустой)
+    reg->fine_drift_sign      = 0;
+    reg->fine_drift_grace_seen = 0;      // ещё не гасили серию ни на одном grace-окне
+    reg->fine_drift_run_thresh = 1;      // расти со 2-го подряд-дрейфа: 1,2,3,4,5,... (0 = с 1-го; 3 = «как 3 подряд»)
+    reg->fine_drift_step_inc  = 1;       // +1 к шагу за каждый дрейф сверх порога
+    reg->fine_drift_step_cap  = 5;       // потолок шага иглы (было фикс. 1/4; 5 = интуиция «±5»)
     reg->fine_hold_change = 0.5f * P_SCALE;        // |ΔP_filt| за ~5 с >= этого = «ещё движусь»: не отдаём в HOLD
     reg->fine_flip_floor  = 40;          // FINE: игла прикрылась ниже этого -> разворот направления (НАБОР<->СБРОС)
                                          // и старт FINE заново с этого же открытия, БЕЗ поиска порога (растит дрейф-алгоритм)
@@ -941,12 +948,34 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
 // на sgn: на наборе шаг=phys, на сбросе зеркальный (−phys).
 // Простыми словами: давление чуть упало -> приоткрыть иглу, чуть выросло -> прикрыть.
 // Со страховкой: не толкаем давление ПРОЧЬ от цели (дрейф К цели при этом не глушим).
+// ЛЕСЕНКА: если дрейф упрямо идёт в ОДНУ сторону подряд, фикс. ±trim не успевает
+// (видели ~7 шагов +1, а P всё рос). Считаем серию подряд-дрейфов одного знака и
+// растим величину шага (1->2->3->4->5, потолок fine_drift_step_cap). Серию рвёт
+// только РЕАЛЬНЫЙ шаг в ДРУГУЮ сторону (разворот), «стоим», grace и новая уставка;
+// придушенный гардом тик (шумовой провал P_filt у цели) серию НЕ трогает.
 static int32_t fine_drift_step(PressureRegulator* reg, float drift, float error_filt, int32_t trim, int sgn) {
-    int32_t phys = (drift < 0.0f) ? trim : -trim;                 // знак нужного ВОЗДЕЙСТВИЯ на давление
-    if(trim <= -4) trim = -3; // ЭТО ОТВРАТИТЕЛЬНЫЙ ХАРДКОД, надо бы переделать. Зачем это нужно, чтоб не было туда сюда +4 -4, а сводилось немного
-    if (phys < 0 && error_filt >=  reg->fine_dev_guard) phys = 0;  // ниже цели -> не толкаем вниз
-    if (phys > 0 && error_filt <= -reg->fine_dev_guard) phys = 0;  // выше цели -> не толкаем вверх
-    return sgn * phys;                                            // НАБОР: шаг=phys; СБРОС: зеркально
+    // нужное ВОЗДЕЙСТВИЕ на давление: упало -> вверх (dir=+1), выросло -> вниз (dir=−1)
+    int dir = (drift < 0.0f) ? +1 : -1;
+    // защита «не толкать ПРОЧЬ от цели» (дрейф К цели не глушим): ниже цели не вниз,
+    // выше цели не вверх. error_filt = цель − P_filt (>0 = ниже цели).
+    if (dir < 0 && error_filt >=  reg->fine_dev_guard) dir = 0;    // ниже цели -> не толкаем вниз
+    if (dir > 0 && error_filt <= -reg->fine_dev_guard) dir = 0;    // выше цели -> не толкаем вверх
+    // Шаг придушен (дрейф К цели / шумовой провал у цели): просто НЕ шагаем. Серию
+    // НЕ трогаем — она копится только реальными шагами (ниже), а шумовой провал
+    // P_filt на 1 тик даёт отрицательный лаг (макс.|dP|), который выше цели попадает
+    // сюда; сброс серии тут сбивал лесенку обратно на 1 (видели -1,-1,-2,-3,-1 вместо
+    // 1,2,3,4,5). Реальный разворот (шаг в ДРУГУЮ сторону), «стоим», grace и новая
+    // уставка серию сбрасывают и без этого.
+    if (dir == 0) return 0;
+    // --- ЛЕСЕНКА: наращиваем шаг, пока дрейф упрямо в одну сторону ---
+    int32_t s = (drift < 0.0f) ? -1 : +1;                         // знак самого дрейфа (направление увода)
+    if (s == reg->fine_drift_sign) reg->fine_drift_run++;         // та же сторона -> длиннее серия
+    else { reg->fine_drift_sign = s; reg->fine_drift_run = 1; }   // сменилась -> новая серия с 1
+    int32_t mag = trim;                                           // база: fine_trim (1) или fine_trim_fast (4)
+    if (reg->fine_drift_run > reg->fine_drift_run_thresh)
+        mag += (reg->fine_drift_run - reg->fine_drift_run_thresh) * reg->fine_drift_step_inc;
+    if (mag > reg->fine_drift_step_cap) mag = reg->fine_drift_step_cap;
+    return sgn * dir * mag;                                       // НАБОР: шаг=dir*mag; СБРОС: зеркально
 }
 
 // Стартовое открытие иглы FINE для направления dir (Q2: дозовая позиция направления):
@@ -1027,6 +1056,8 @@ static int32_t hold_fine_step(PressureRegulator* reg, uint64_t now_us, float err
 
         if (fabsf(dp) < reg->fine_eq_band) {
             // «стоим» — текущее открытие и есть равновесное, запоминаем
+            reg->fine_drift_run  = 0;   // равновесие -> лесенка с чистого листа
+            reg->fine_drift_sign = 0;
             reg->fine_eq_pos = reg->fine_pos;
             if (!reg->fine_eq_found) {
                 reg->fine_eq_found = true;
@@ -1088,6 +1119,8 @@ static void reset_controllers(PressureRegulator* reg) {
     reg->fine_speed_search = false; // недоигранный замер дрейфа к новой уставке не относится
     reg->fine_dir_known    = false; // направление (утечка/набор) определяем заново на новой уставке
     reg->fine_eq_found = false;   // на новой уставке равновесное открытие другое
+    reg->fine_drift_run = 0;      // лесенка шага — с чистого листа на новой уставке
+    reg->fine_drift_sign = 0;
     reg->fine_rate_t0_us = 0;     // сброс трекера fine_change (на новой уставке история не нужна)
     reg->dose_searching  = false; // начатый поиск порога потока к новой уставке не относится
     reg->fine_visited    = false; // переучивание FINE (±5 от прошлой позиции) — на новой уставке с чистого листа
@@ -1255,7 +1288,7 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
         // разгоняется по +dose_trim_big за окно до первого потока
         // (см. hold_dose_step), дальше штатные +-dose_trim.
         reg->holding = true;
-        int32_t seed = current_valve_position * 0.7;// - reg->dose_step_back;
+        int32_t seed = current_valve_position * 0.6;// - reg->dose_step_back;
         if (seed < reg->valve_flow_floor) seed = reg->valve_flow_floor;
 
         // Сторону коррекции берём по тому, С КАКОЙ СТОРОНЫ цели мы сейчас (по
@@ -1532,6 +1565,16 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
         ESP_LOGW("PID", "FINE: err_filt=%.3f change=%.3f/5с — выход в обычный HOLD (доза -> %ld)",
                  error_filt, reg->fine_change, (long)reg->step_holding_charge);
     } else {
+        // Вход в FINE / разворот = НОВОЕ grace-окно: стейл-серию от ПРОШЛОГО
+        // удержания (через HOLD-эпизод) гасим ОДИН раз, чтобы она не дала крупный шаг
+        // на первом же дрейфе. НЕ каждый тик: раньше сброс «пока grace» глушил лесенку
+        // все 5с входа (видели -1,-1,-1,-2 вместо -1,-2,-3,-4). Теперь старую серию
+        // гасит сам факт нового grace-окна (по fine_grace_t0_us), а свежая копится сразу.
+        if (reg->fine_grace_t0_us != reg->fine_drift_grace_seen) {
+            reg->fine_drift_grace_seen = reg->fine_grace_t0_us;
+            reg->fine_drift_run  = 0;
+            reg->fine_drift_sign = 0;
+        }
         int32_t trim = fast ? reg->fine_trim_fast : reg->fine_trim;
         target_valve = hold_fine_step(reg, now_us, error_filt, trim);
 
@@ -1550,6 +1593,8 @@ static int32_t run_fine_phase(PressureRegulator* reg, uint64_t now_us,
             reg->fine_dir_known   = true;                // (повторные входы в FINE возьмут уже его)
             reg->fine_pos         = reg->fine_flip_floor; // маленький старт, без подгона шага
             reg->fine_eq_found    = false;               // у другого направления равновесие другое
+            reg->fine_drift_run   = 0;                   // развернулись -> лесенка с чистого листа
+            reg->fine_drift_sign  = 0;
             reg->fine_grace_t0_us = now_us;              // новому направлению — окно до гейта HOLD и до повторного разворота
             dose_window_reset(reg, now_us);              // дрейф мерим с чистого листа
             target_valve          = reg->fine_pos;
