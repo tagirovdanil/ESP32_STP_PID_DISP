@@ -249,6 +249,9 @@ void regulator_init(PressureRegulator* reg) {
     reg->hold_exit_err   = 5.0f;  //SLOW_HOLDING_ENABLED ? (5.0f * SCALE_for_slow_holding) : (5.0f * P_SCALE);
                                         // в HOLD |err_filt| больше -> микродозой не вытянуть, назад в RATE качать.
                                         // >>hold_enter_err: гистерезис, чтоб не дёргалось RATE<->HOLD у цели
+    reg->hold_lead_close_s = 1.8f;      // упреждение входа в HOLD (тормозной путь = |rate|*это). По логам
+                                        // перелёт ~1.5 кПа при подходе ~0.8 кПа/с -> ~1.8 с. Подбери по
+                                        // своим логам; 0 = выключить упреждение (прежнее поведение).
     reg->dose_step_back  = 30;          // вход в HOLD набором: СТАРТ ПЕРЕБОРА поиска = позиция RATE минус это
                                         // (было 60; на высоком давлении порог ВЫШЕ позиции RATE, отступ вниз
                                         //  только удлинял перебор -> 30. Подгон в floor страхует от перелёта)
@@ -436,6 +439,7 @@ static float desired_rate_from_error(float error, float near_rate, float very_ne
     else if (e >  50.0f) rate = 5.0f;
     else if (e >   22.0f) rate = 3.0f;
     else if (e >   8.0f) rate = fast_mode ? 2.0f : 1.0f; 
+    else if(e > 4.0f && !fast_mode) rate = 0.4f;  // от 4 еще посильнее приторможу чтоб точно успеть потом затормозить
     else if (e >   1.0)                 rate = fast_mode ? 1.0 : near_rate;   // полоса 0..2 кПа: ползём со скоростью шума датчика
     else rate = fast_mode ? 0.5 : very_near_rate;   // у самой цели — скорость уровня шума; точную доводку до точки делает HOLD-доза
     return (error >= 0.0f) ? rate : -rate;
@@ -806,35 +810,6 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
         reg->search_settle_t0_us = now_us;                  // таймер фазы (тут — Подгон)
         ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — вход, фаза ПОДГОНА УГЛА (игла в floor, ждём P_filt; перебор начнётся с %ld). P_filt=%.4f rate_filt=%.3f",
                  dir_name, (long)*pos, reg->filtered_pressure, reg->filtered_rate);
-    }
-
-    // --- ДОШЛИ ДО ЦЕЛИ, ПОКА ИСКАЛИ (направление удержания уже замерено) ----------
-    // Детект потока ниже срабатывает по чекпойнтам раз в search_hist_dt_us (0.25 с) и
-    // по ОТСТАЮЩЕМУ P_filt. На быстром сбросе, пока копится история для детекта,
-    // СЫРОЕ давление успевает провалиться НИЖЕ цели — и «скорость становится нужной»
-    // уже за целью (видели спуск до 999.7 при цели 1000). Если направление удержания
-    // на эту уставку мы УЖЕ замерили дрейфом (fine_dir_known), доискивать порог
-    // незачем: как только по СЫРОМУ давлению (reg->prev_pressure, без лага фильтра)
-    // дошли до цели — финишируем здесь же, как фаза 2 у цели (иглу на тек.поз −
-    // search_done_back, калибровку фиксируем). На следующем тике штатная ветка
-    // fine_dir_known в run_hold_phase отдаёт в готовое удержание. Ниже цели больше не
-    // проваливаемся. На ПЕРВОМ подходе (направление ещё не известно) НЕ срабатывает:
-    // там поиск обязан довести до цели, а запас offset нужен под замер дрейфа.
-    if (reg->fine_dir_known) {
-        float remaining_raw = charging ? (reg->active_setpoint - reg->prev_pressure)
-                                       : (reg->prev_pressure - reg->active_setpoint);
-        if (remaining_raw <= reg->sensor_noise_delta_filt) {
-            int32_t hold_pos = *pos - reg->search_done_back;
-            if (hold_pos < reg->valve_flow_floor) hold_pos = reg->valve_flow_floor;
-            reg->search_found_pos = *pos;
-            *pos                  = hold_pos;
-            *calib                = true;
-            reg->dose_searching   = false;
-            dose_window_reset(reg, now_us);
-            ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — ДОШЛИ ДО ЦЕЛИ пока искали (P=%.3f) -> финиш на игле %ld (−%ld) БЕЗ детекта скорости, отдаём в готовое удержание",
-                     dir_name, reg->prev_pressure, (long)hold_pos, (long)reg->search_done_back);
-            return hold_pos;
-        }
     }
 
     // --- фаза 0 Подгон: после RATE фильтр P_filt ОТСТАЁТ от raw и слюит.
@@ -1302,7 +1277,31 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
         reached = (reg->rate_approach_sign > 0 && error_filt <= 0.0f) ||  // шли снизу -> P достигло/прошло цель
                   (reg->rate_approach_sign < 0 && error_filt >= 0.0f);    // шли сверху -> P опустилось до/ниже цели
     } else {
-        reached = fabsf(error) <= reg->hold_enter_err && fabsf(error_filt) <= reg->hold_enter_err;
+        // ОБЫЧНЫЙ режим: узкая полоса И по сырому, И по фильтру (как было —
+        // двойная проверка отсекает спайк датчика).
+        bool in_band = fabsf(error) <= reg->hold_enter_err &&
+                       fabsf(error_filt) <= reg->hold_enter_err;
+        // УПРЕЖДЕНИЕ (тормозной путь). Пока RATE едет к цели, игла широко открыта и
+        // закрывается ~hold_lead_close_s c; за это время давление ещё уйдёт
+        // |rate|*hold_lead_close_s в сторону цели (это и есть перелёт ~1.5 кПа из
+        // логов). Поэтому отдаём в HOLD РАНЬШЕ — как только остаток до цели стал
+        // равен этому будущему уходу: пока закроемся, давление как раз дойдёт.
+        //   remaining  — сколько ещё падать (по сырому P, как и в голове);
+        //   brake_dist — сколько упадёт, ПОКА закрываемся.
+        // Берём БОЛЬШЕЕ из brake_dist и узкой полосы: формула включается ТОЛЬКО
+        // когда едем быстро (brake_dist > hold_enter_err); у самой цели на малой
+        // скорости остаётся прежний вход по hold_enter_err. toward — едем именно К
+        // цели (знак err и rate совпал -> |err| убывает), чтобы не печатать на
+        // встречном выбросе.
+        float remaining  = fabsf(error);
+        float brake_dist = reg->hold_lead_close_s * fabsf(reg->filtered_rate);
+        bool  toward     = (error * reg->filtered_rate) > 0.0f;
+        bool  brake_now  = toward && brake_dist > reg->hold_enter_err &&
+                           remaining <= brake_dist;
+        reached = in_band || brake_now;
+        if (brake_now && !in_band)
+            ESP_LOGI("PID", "RATE->HOLD УПРЕЖДЕНИЕ: остаток %.3f <= тормозной путь %.3f (rate=%.3f, k=%.2fс). P=%.3f",
+                     remaining, brake_dist, reg->filtered_rate, reg->hold_lead_close_s, pressure);
     }
     if (reached) {
         // И сырое, И фильтр у цели -> это НЕ транзиентный спайк (видели заброс
@@ -1698,13 +1697,22 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
         }
 
         case SERVO_CHARGING:
-            if (!reg->dose_charge_calibrated) {
-                // порог потока ещё неизвестен -> быстрый перебор к нему (идея 3),
-                // а не медленный +dose_trim за 5 с через весь мёртвый ход. Эта ветка
-                // ВЫШЕ проверки «дошли»: при подходе СБРОСОМ + утечка серво переключается
-                // в НАБОР, а P ещё ВЫШЕ цели (на +offset) — будь «дошли» первым, оно бы
-                // перехватило и мы печатали бы вместо поиска. Запас +offset даёт время
-                // поиску, пока утечка ведёт P к цели (п.2: утечка -> сразу ищем порог накачки).
+            // Поиск порога потока — быстрый перебор к нему (идея 3) вместо медленного
+            // +dose_trim за 5 с через весь мёртвый ход. Ветка ВЫШЕ проверки «дошли»: при
+            // подходе СБРОСОМ + утечка серво переключается в НАБОР, а P ещё ВЫШЕ цели (на
+            // +offset) — будь «дошли» первым, перехватило бы и мы печатали бы вместо поиска.
+            // Запас +offset даёт время поиску, пока утечка ведёт P к цели.
+            // ИСКЛЮЧЕНИЕ — поиск ПРОПУСКАЕМ, если уже ДОШЛИ до цели и там ждёт готовый исход:
+            //   • low_mode -> серво-отсечка запечатает (ветка !use_fine ниже);
+            //   • fine_dir_known -> войдём в готовое удержание (ветка fine_dir_known ниже).
+            // У самой цели двигать P на search_dp_flow НЕКУДА — поиск гонял бы иглу за
+            // перелёт (на 500 видели открытие 102->183 ~49 с и заброс до 500.27). low_mode
+            // судим по гладкому P_filt (error_filt, как штатная отсечка), fine_dir_known —
+            // по сырому error (бывает быстрый ход, фильтр запаздывает). На ПЕРВОМ подходе в
+            // FINE-зоне (use_fine, направление ещё не известно) НЕ пропускаем — там offset.
+            if (!reg->dose_charge_calibrated
+                && !((!use_fine           && error_filt <=  hold_reseal)
+                  || (reg->fine_dir_known && error      <=  reg->sensor_noise_delta_filt))) {
                 *zone = "SEARCH";
                 target_valve = hold_search_step(reg, now_us, true);
             } else if (reg->fine_dir_known) {
@@ -1765,12 +1773,19 @@ static int32_t run_hold_phase(PressureRegulator* reg, uint64_t now_us,
                 ESP_LOGI("PID", "HOLD: СБРОС — серво осело (%.0f мс), открываю иглу. P=%.3f",
                          (float)reg->hold_vent_settle_us / 1000.0f, pressure);
             }
-            if (!reg->dose_vent_calibrated) {
-                // Порог потока СБРОСА ещё неизвестен -> быстрый перебор-поиск от seed
-                // вверх под откачивание до потока (симметрично НАБОРУ). Ветка ВЫШЕ
-                // выбора направления и проверки «дошли»: поиск должен гарантированно
-                // завершиться и привести P к цели, а не перехватываться ими при дрейфе
-                // P к цели. После него доза СБРОСА калибрована реальным порогом.
+            // Порог потока СБРОСА — быстрый перебор-поиск от seed вверх под откачивание до
+            // потока (симметрично НАБОРУ). Ветка ВЫШЕ выбора направления и «дошли»: поиск
+            // должен довести P к цели, а не перехватываться ими при дрейфе P к цели.
+            // ИСКЛЮЧЕНИЕ — поиск ПРОПУСКАЕМ, если уже ДОШЛИ до цели и там ждёт готовый исход
+            // (зеркально НАБОРУ): low_mode -> серво-отсечка запечатает (ветка else ниже);
+            // fine_dir_known -> войдём в готовое удержание (ветка fine_dir_known ниже). У
+            // самой цели детект скорости сработал бы уже ЗА целью = провал НИЖЕ (видели спуск
+            // до 999.7 при цели 1000). low_mode судим по гладкому P_filt, fine_dir_known — по
+            // сырому error (быстрый сброс, фильтр запаздывает). На ПЕРВОМ подходе в FINE-зоне
+            // (use_fine, направление ещё не известно) НЕ пропускаем — там нужен запас offset.
+            if (!reg->dose_vent_calibrated
+                && !((!use_fine           && error_filt >= -hold_reseal)
+                  || (reg->fine_dir_known && error      >= -reg->sensor_noise_delta_filt))) {
                 *zone = "SEARCH";
                 target_valve = hold_search_step(reg, now_us, false);  // поиск порога СБРОСА
             } else if (reg->fine_dir_known) {
