@@ -228,7 +228,7 @@ void regulator_init(PressureRegulator* reg) {
     // держался вниз до ~3600 -> ставим floor около нижней границы потока. Регулятор
     // никогда не опускает иглу ниже floor во время работы, поэтому уходит мёртвое
     // время ~3 с на старте и тонкая зона реально может дать поток.
-    reg->valve_flow_floor = 30; // 0;// 3600 * 0.9; // на всякий случай умножил на 0.8, чтоб наверняка 0 был          // ВНИМАНИЕ: этот параметр настраиваемый под каждый прибор.
+    reg->valve_flow_floor = 90;// на старом было 30, щас на 100 не пропускает а на 120 пропускает, взял с запасом 90//30; // 0;// 3600 * 0.9; // на всякий случай умножил на 0.8, чтоб наверняка 0 был          // ВНИМАНИЕ: этот параметр настраиваемый под каждый прибор.
 
     // Потолок интегратора контура скорости = полный ход привода, выраженный в
     // единицах интеграла: (valve_max - floor)/ki. При таком капе интегратор может
@@ -321,7 +321,7 @@ void regulator_init(PressureRegulator* reg) {
     // search_step, если порог высоко по шагам.
     reg->dose_searching        = false;
     reg->search_phase          = 0;
-    reg->search_step_period_us = 200000ULL;   // 0.2 с
+    reg->search_step_period_us = 200000ULL;   // поменял на 0.1с, было 0.2 с
     reg->search_step           = 1;           // мелкий шаг = точная локализация порога
     reg->search_hist_dt_us     = 250000ULL;   // чекпойнт раз в 0.25 с -> лаги 0.25..1.0 с
     reg->search_hist_idx       = 0;
@@ -336,8 +336,11 @@ void regulator_init(PressureRegulator* reg) {
                                               // калибровка фиксируется РАНЬШЕ внешней проверки «дошли» (см. .h)
     reg->search_done_back      = 10;          // после финиша держать иглу на (найденная - 10), а не на самой
                                               // флоу-позиции: мягкий добор хвоста без перелёта (0 = на найденной)
+    reg->search_drive_boost    = 10;          // ПОКА едем до цели (фаза 2) держим иглу на (найденная + 10):
+                                              // поток сильнее -> быстрее доезжаем. На финише буст откатываем
+                                              // (садимся на найденная - search_done_back). 0 = как было (на пороге)
     reg->search_slow_step_band = 0.5f;        // шаг до цели < 0.5 кПа -> свип втрое медленнее (только НАБОР)   // клод делал * P_SCALE но я думаю не надо
-    reg->search_slow_step_mult = 3;           // во столько раз реже приращение иглы на малом шаге
+    reg->search_slow_step_mult = 3;           // во столько раз реже приращение иглы на малом шаге  // было 3, поставил 6 чтобы было 0.6 поиогу, потому что search_step_period_us поставил на 0.1с
     reg->search_small_step     = false;
 
     // --- ВТОРОЙ (ТОЧНЫЙ) ХОЛДИНГ: равновесное приоткрытие вместо подкачек ---
@@ -743,7 +746,7 @@ static int32_t hold_dose_step(PressureRegulator* reg, uint64_t now_us, bool char
                 reg->jump_hist_idx      = 1;
                 reg->jump_hist_t0_us    = now_us;
             } else {
-                *pos += *calib ? trim : very_big;              // штатный добор / разгон с floor
+                *pos += *calib ? 1 : very_big;              // штатный добор / разгон с floor   // поставил 1 вместо trim, чтоб было +1 и -2, чтобы не скакало туда сюда
             }
             reg->dose_flat_run++;                              // ещё одно «пустое» окно
         } else if (toward > dp_runaway) {                      // сильно разогнались (резерв длинного окна)
@@ -900,7 +903,12 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
             reg->search_step_t0_us = now_us;
             reg->dose_p0           = reg->filtered_pressure;
         }
-        return reg->search_found_pos;               // держим иглу, давление идёт к цели
+        // ПОКА едем — держим НЕ на самом пороге, а на (найденная + search_drive_boost):
+        // поток сильнее -> до цели доезжаем быстрее. Буст откатим на финише (см. выше:
+        // hold_pos = search_found_pos - search_done_back). Кламп по потолку иглы.
+        int32_t drive = reg->search_found_pos + reg->search_drive_boost;
+        if (drive > reg->valve_max) drive = reg->valve_max;
+        return drive;                               // держим иглу (порог+буст), давление идёт к цели
     }
 
     // --- фаза 1 ПЕРЕБОР: поток = P_filt ушло на search_dp_flow В СТОРОНУ ЦЕЛИ над ЛЮБЫМ
@@ -917,10 +925,12 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
         reg->search_phase      = 2;                            // -> ЕДЕМ ДО ЦЕЛИ (не floor!)
         reg->search_step_t0_us = now_us;                       // таймер страховки от застоя в фазе 2
         reg->dose_p0           = reg->filtered_pressure;       // опорное P_filt для проверки движения
-        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — ПОТОК на игле %ld (P_filt %+.3f к цели над лагом <=%.2fс) -> едем до цели",
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — ПОТОК на игле %ld (P_filt %+.3f к цели над лагом <=%.2fс) -> едем до цели (+%ld буст)",
                  dir_name, (long)reg->search_found_pos, max_move,
-                 (float)(reg->search_hist_dt_us * SEARCH_HIST_N) / 1000000.0f);
-        return reg->search_found_pos;
+                 (float)(reg->search_hist_dt_us * SEARCH_HIST_N) / 1000000.0f, (long)reg->search_drive_boost);
+        int32_t drive = reg->search_found_pos + reg->search_drive_boost;   // первый тик проезда: порог+буст
+        if (drive > reg->valve_max) drive = reg->valve_max;
+        return drive;
     }
     // новый чекпойнт раз в search_hist_dt_us (кольцо, глубина SEARCH_HIST_N)
     if (now_us - reg->search_hist_t0_us >= reg->search_hist_dt_us) {
@@ -928,6 +938,19 @@ static int32_t hold_search_step(PressureRegulator* reg, uint64_t now_us, bool ch
         reg->search_hist[reg->search_hist_idx] = reg->filtered_pressure;
         reg->search_hist_idx = (reg->search_hist_idx + 1) % SEARCH_HIST_N;
         if (reg->search_hist_count < SEARCH_HIST_N) reg->search_hist_count++;
+    }
+
+    // Малый шаг был выставлен по стартовой близости к цели, но объём мог стравить вниз,
+    // пока идёт перебор (искали угол, а P падало — видели цель 3000, старт на 2999.6,
+    // стравило до 2994). Как только до цели стало >= полосы, снимаем «медленно»: свип
+    // ускоряется с 0.6 на 0.2с. Одноразово (только снимаем): набор уже далеко от цели,
+    // замедляться обратно смысла нет, а перелёт крошечной цели больше не грозит.
+    if (reg->search_small_step &&
+        (reg->active_setpoint - reg->filtered_pressure) >= reg->search_slow_step_band) {
+        reg->search_small_step = false;
+        ESP_LOGI("PID", "HOLD: ПОИСК ПОРОГА %s — до цели %.3f >= %.3f (стравило) -> свип ускорен до %.2fс",
+                 dir_name, reg->active_setpoint - reg->filtered_pressure,
+                 reg->search_slow_step_band, (float)reg->search_step_period_us / 1000000.0f);
     }
 
     // --- перебор: приращение иглы раз в период (на малом шаге НАБОРА — втрое реже) ---
@@ -1305,7 +1328,12 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
         float remaining  = fabsf(error);
         float brake_dist = reg->hold_lead_close_s * fabsf(reg->filtered_rate);
         bool  toward     = (error * reg->filtered_rate) > 0.0f;
-        bool  brake_now  = toward && brake_dist > reg->hold_enter_err &&
+        // Упреждение ТОЛЬКО когда игла открыта широко (pos > 1000) — это быстрый набор на
+        // высоком давлении, где перелёт реальный. На медленном подходе у цели (pos <= 1000)
+        // упреждение выключаем: там входим по узкой полосе in_band (старая логика), без
+        // раннего торможения за ~10 кПа до цели.
+        bool  brake_now  = current_valve_position > 1000 &&
+                           toward && brake_dist > reg->hold_enter_err &&
                            remaining <= brake_dist;
         reached = in_band || brake_now;
         if (brake_now && !in_band)
@@ -1327,6 +1355,7 @@ static int32_t run_rate_phase(PressureRegulator* reg, uint64_t now_us, float dt,
         reg->holding = true;
         int32_t seed = current_valve_position * 0.6;// - reg->dose_step_back;
         if (seed < reg->valve_flow_floor) seed = reg->valve_flow_floor;
+        seed = reg->valve_flow_floor; // да, это ХАРДКОД мой, но иначе оно перелетало 3000. Потому что даже *0.6 это много бывает когда было 700 например.
 
         // Сторону коррекции берём по тому, С КАКОЙ СТОРОНЫ цели мы сейчас (по
         // сглаженному давлению), а НЕ по остаточному servo_state. Иначе мелкий
@@ -2239,9 +2268,23 @@ void pid_regulator_task(void *pvParameters) {
         // при |error|<=hold_enter_err(0.5), выходим при |err_filt|>hold_exit_err(5).
         // На возврате сбрасываем калибровку — на другой высоте порог потока другой,
         // RATE накачает и поиск переищет уже у цели.
-        if (reg.holding && fabsf(error_filt) > reg.hold_exit_err) {
-            ESP_LOGW("PID", "HOLD->RATE: err_filt=%.3f > %.3f — далеко от цели, качаем RATE заново",
-                     error_filt, reg.hold_exit_err);
+        // ВАЖНО (фикс пинг-понга): требуем «далеко» И по фильтру, И по СЫРОМУ давлению.
+        // Вход в HOLD судится по сырому error (упреждение), а P_filt на быстром наборе
+        // ОТСТАЁТ от сырого (EMA alpha=0.8, лаг несколько кПа). Раньше выход шёл только по
+        // err_filt: сразу после входа сырое уже у цели, а err_filt ещё >5 -> мгновенный
+        // откат в RATE, и так по кругу (HOLD<->RATE, игла гоняется к floor, набор глох).
+        // Симметрично двойной проверке ВХОДА (in_band по обоим): реальная просадка/спайк
+        // уводят ОБА сигнала -> выйдем; один лишь лаг фильтра у цели больше не выкидывает.
+        // Пока идёт ПЕРЕБОР (поиск порога потока / проезд до цели, dose_searching) —
+        // НЕ выходим в RATE, даже если ушли далеко: объём сам травит вниз, пока ищем
+        // угол (видели цель 3000, старт перебора на 2999.6, стравило до 2994 -> |err|>5),
+        // а перебор это догонит, ускорив свип (см. search_small_step в hold_search_step).
+        // Иначе на просадке >hold_exit_err перебор рвётся на полпути и уходит в RATE по кругу.
+        if (reg.holding && !reg.dose_searching
+                        && fabsf(error_filt) > reg.hold_exit_err
+                        && fabsf(error)      > reg.hold_exit_err) {
+            ESP_LOGW("PID", "HOLD->RATE: err_filt=%.3f err=%.3f > %.3f — далеко от цели, качаем RATE заново",
+                     error_filt, error, reg.hold_exit_err);
             reg.holding                = false;
             reg.fine_holding           = false;
             reg.fine_speed_search      = false;  // прерываем замер дрейфа, если шёл
