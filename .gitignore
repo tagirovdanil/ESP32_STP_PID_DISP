@@ -19,6 +19,7 @@
 # Build artifacts and directories
 **/build/
 build/
+build_verify/
 *.o
 *.a
 *.out
