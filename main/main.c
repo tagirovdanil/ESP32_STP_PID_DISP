@@ -1,143 +1,205 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/uart.h"
 #include "esp_mac.h"          // Для чтения заводского MAC (серийного номера) из efuse
 
-#include "st7789.h"           // Для работы с дисплеем TTGO
-#include "pressure_sensor.h"  // Для работы с датчиками давления
-#include "config.h"           // Глобалы: давления, уставки двух каналов
-#include "compressor_control.h" // Управление двумя компрессорами (реле)
+#include "st7789.h"           // Локальный маленький экран TTGO
+#include "pressure_sensor.h"  // Датчики давления
+#include "config.h"           // Глобалы: давления, уставка P2, порт дисплея
+#include "compressor_control.h"
 #include "wifi_tcp.h"         // WiFi (AP/STA) + TCP-сервер для приёма команд по сети
 
-#define USB_UART_PORT       UART_NUM_0
-#define USB_BUF_SIZE        256
-
-TaskHandle_t display_task_handle = NULL;
-
-static const char *TAG = "MAIN_APP";
+#define KPA_PER_MPA 1000.0f
 
 // ==========================================================================
-// СЕРИЙНЫЙ НОМЕР ESP32 (заводской MAC из efuse — уникален для каждого чипа)
-// ==========================================================================
-static bool get_chip_serial(char *buf, size_t buf_size) {
-    uint8_t mac[6] = {0};
-    if (esp_efuse_mac_get_default(mac) != ESP_OK) {
-        snprintf(buf, buf_size, "UNKNOWN");
-        return false;
-    }
-    snprintf(buf, buf_size, "%02X%02X%02X%02X%02X%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    return true;
-}
-
-static void log_chip_serial(void) {
-    char sn[16];
-    if (get_chip_serial(sn, sizeof(sn))) {
-        ESP_LOGI(TAG, "Серийный номер ESP32 (SN): %s", sn);
-    } else {
-        ESP_LOGE(TAG, "Не удалось прочитать серийный номер ESP32");
-    }
-}
-
-// ==========================================================================
-// ВЫВОД ОТВЕТА: дублируем и в USB-консоль, и всем WiFi/TCP-клиентам
+// ВЫВОД ОТВЕТА: WiFi/TCP-клиентам и внешнему дисплею (UART0). Дисплей в ответ
+// может просто игнорировать не-NMEA-строки (его состояние обновляется $SLSD).
 // ==========================================================================
 static void respond(const char *msg) {
-    uart_write_bytes(USB_UART_PORT, msg, strlen(msg));
     wifi_tcp_send(msg);
+#if !SAFE_NO_PINS
+    uart_write_bytes(DISPLAY_UART_NUM, msg, strlen(msg));
+#else
+    // Заглушка: UART0 (GPIO21/22) не установлен — в порт не пишем.
+    (void)msg;
+#endif
 }
 
 // ==========================================================================
-// РАЗБОР И ИСПОЛНЕНИЕ ОДНОЙ КОМАНДЫ
-// Источник команды — USB UART0 или WiFi/TCP (обработчик общий).
-// Формат: SET1 X / SET2 X / SET X (алиас SET1) / STAT / SN / ZERO.
+// XOR-контрольная сумма NMEA: XOR байтов между '$' и '*' (не включая их).
+// ==========================================================================
+static uint8_t nmea_checksum(const char *line) {
+    uint8_t cs = 0;
+    const char *p = line;
+    if (*p == '$') p++;   // по протоколу '$' не входит в XOR
+    while (*p && *p != '*' && *p != '\r' && *p != '\n') {
+        cs ^= (uint8_t)*p;
+        p++;
+    }
+    return cs;
+}
+
+// Разбор кадра от дисплея: $SLSS,<P2_Set МПа>  и  $SLSC,<CMD>
+static bool parse_display_nmea(char *line) {
+    if (line[0] != '$') return false;
+    char *star = strchr(line, '*');
+    if (star == NULL) return false;
+
+    // контрольная сумма
+    uint8_t cs = nmea_checksum(line);
+    unsigned int cs_rx = 0;
+    if (sscanf(star + 1, "%02x", &cs_rx) != 1) return false;
+    if (cs_rx != cs) return false;
+
+    char type[5] = {0};
+    char *p1 = line + 1;
+    if (sscanf(p1, "%4[^,]", type) != 1) return false;
+    char *rest = strchr(p1, ',');
+    if (rest == NULL) return false;
+    rest++; // после первой запятой
+
+    if (strcmp(type, "SLSS") == 0) {
+        // $SLSS,<P2_Set МПа>
+        float mpa = 0.0f;
+        if (sscanf(rest, "%f", &mpa) != 1) return false;
+        float applied = compressor_set_setpoint_kpa(mpa * KPA_PER_MPA);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "SET OK %.2f MPa\r\n", applied / KPA_PER_MPA);
+        respond(msg);
+        return true;
+    }
+
+    if (strcmp(type, "SLSC") == 0) {
+        char cmd[16] = {0};
+        // читаем команду до '*' (иначе %s зацепит "*XX")
+        if (sscanf(rest, "%15[^*]", cmd) != 1) return false;
+        if (strcmp(cmd, "START") == 0) {
+            compressor_cmd_start();
+            respond("\r\n>> START\r\n");
+        } else if (strcmp(cmd, "STOP") == 0) {
+            compressor_cmd_stop();
+            respond("\r\n>> STOP\r\n");
+        } else if (strcmp(cmd, "RESET") == 0) {
+            compressor_cmd_reset();
+            respond("\r\n>> RESET\r\n");
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// ==========================================================================
+// ТЕКСТОВЫЕ КОМАНДЫ (WiFi и не-NMEA строки с дисплея)
+// Формат: START / STOP / RESET / SET <МПа> / STAT / SN / ZERO
 // ==========================================================================
 static void handle_command(char *str) {
 
-    // Команда "sn" – вывод серийного номера чипа
     if (strstr(str, "sn") || strstr(str, "SN")) {
-        char sn[16];
-        get_chip_serial(sn, sizeof(sn));
-        char msg[40];
-        snprintf(msg, sizeof(msg), "\r\n>> SN: %s\r\n", sn);
+        uint8_t mac[6];
+        if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+            respond("\r\n>> SN: UNKNOWN\r\n");
+            return;
+        }
+        char msg[48];
+        snprintf(msg, sizeof(msg), "\r\n>> SN: %02X%02X%02X%02X%02X%02X\r\n",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         respond(msg);
         return;
     }
 
-    // Команда "stat" – статус обоих каналов
     if (strstr(str, "stat") || strstr(str, "STAT")) {
         char msg[160];
         snprintf(msg, sizeof(msg),
-                 "\r\n>> CH1: P=%.2f SET=%.1f %s | CH2: P=%.2f SET=%.1f %s\r\n",
-                 pressure1_kPa, setpoint1_kPa, comp1_on ? "ON" : "OFF",
-                 pressure2_kPa, setpoint2_kPa, comp2_on ? "ON" : "OFF");
+                 "\r\n>> P1=%.2f P2=%.2f SET=%.2f MPa | K1=%s K2=%s ALM=%d RUN=%s\r\n",
+                 pressure1_kPa / KPA_PER_MPA, pressure2_kPa / KPA_PER_MPA,
+                 p2_set_kPa / KPA_PER_MPA,
+                 comp1_on ? "ON" : "OFF", comp2_on ? "ON" : "OFF",
+                 compressor_get_alarm(),
+                 compressor_is_running() ? "ON" : "OFF");
         respond(msg);
         return;
     }
 
-    // Команда "zero" – калибровка нуля датчика №1 (когда реально атмосфера).
+    if (strstr(str, "start") || strstr(str, "START")) {
+        compressor_cmd_start();
+        respond(compressor_is_running() ? "\r\n>> RUNNING\r\n" : "\r\n>> [ERR] alarm active, do RESET first\r\n");
+        return;
+    }
+
+    if (strstr(str, "stop") || strstr(str, "STOP")) {
+        compressor_cmd_stop();
+        respond("\r\n>> STOPPED\r\n");
+        return;
+    }
+
+    if (strstr(str, "reset") || strstr(str, "RESET")) {
+        compressor_cmd_reset();
+        respond("\r\n>> ALARM RESET\r\n");
+        return;
+    }
+
+    // SET <МПа> — уставка P2 (1.0 .. 4.0)
+    char *ps = strstr(str, "set ");
+    if (ps == NULL) ps = strstr(str, "SET ");
+    if (ps != NULL) {
+        float mpa = strtof(ps + 4, NULL);
+        float applied = compressor_set_setpoint_kpa(mpa * KPA_PER_MPA);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "\r\n>> P2 target set to %.2f MPa\r\n", applied / KPA_PER_MPA);
+        respond(msg);
+        return;
+    }
+
     if (strstr(str, "zero") || strstr(str, "ZERO")) {
         respond("\r\n>> Zeroing pressure sensor 1...\r\n");
         bool ok = performAdvancedZeroCalibration(0.0f, SENSOR_UART_NUM);
         respond(ok ? "\r\n>> [OK] Sensor 1 zeroed\r\n"
-                   : "\r\n>> [ERR] Sensor 1 zero failed (no response)\r\n");
+                   : "\r\n>> [ERR] Sensor 1 zero failed\r\n");
         return;
     }
 
-    // Уставка канала 2: SET2 X
-    char *ptr2 = strstr(str, "set2 ");
-    if (ptr2 == NULL) ptr2 = strstr(str, "SET2 ");
-    if (ptr2 != NULL) {
-        float v = strtof(ptr2 + 5, NULL);
-        update_setpoint(2, v);
-        char msg[64];
-        snprintf(msg, sizeof(msg), "\r\n>> CH2 target updated to: %.1f kPa\r\n", setpoint2_kPa);
-        respond(msg);
-        return;
-    }
-
-    // Уставка канала 1: SET1 X (и legacy "set X" как алиас)
-    char *ptr1 = strstr(str, "set1 ");
-    if (ptr1 == NULL) ptr1 = strstr(str, "SET1 ");
-    char *ptrL = strstr(str, "set ");
-    if (ptrL == NULL) ptrL = strstr(str, "SET ");
-    if (ptr1 != NULL || ptrL != NULL) {
-        float v = (ptr1 != NULL) ? strtof(ptr1 + 5, NULL) : strtof(ptrL + 4, NULL);
-        update_setpoint(1, v);
-        char msg[64];
-        snprintf(msg, sizeof(msg), "\r\n>> CH1 target updated to: %.1f kPa\r\n", setpoint1_kPa);
-        respond(msg);
-        return;
-    }
-
-    respond("\r\n>> Unknown command. Usage: SET1 X | SET2 X | STAT | SN | ZERO\r\n");
+    respond("\r\n>> Usage: START | STOP | RESET | SET <МПа> | STAT | SN | ZERO\r\n");
 }
 
 // ==========================================================================
-// Задача приёма команд с USB-консоли
+// Задача приёма с внешнего дисплея (UART0, RX=GPIO22): строки NMEA $SLSS/$SLSC
+// или текстовые команды. Строка между \r\n.
 // ==========================================================================
-void usb_uart_rx_task(void *pvParameters) {
-    uint8_t *data = (uint8_t *) malloc(USB_BUF_SIZE);
-    if (data == NULL) {
-        ESP_LOGE(TAG, "Не удалось выделить память для буфера USB UART");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Задача чтения команд через USB UART запущена. Формат: SET1 X / SET2 X / STAT / SN / ZERO");
+static void display_rx_task(void *pvParameters) {
+    char line[128];
+    int  idx = 0;
 
     while (1) {
-        int len = uart_read_bytes(USB_UART_PORT, data, USB_BUF_SIZE - 1, pdMS_TO_TICKS(20));
-        if (len > 0) {
-            data[len] = '\0';
-            handle_command((char *)data);
+        uint8_t b;
+        int n = uart_read_bytes(DISPLAY_UART_NUM, &b, 1, pdMS_TO_TICKS(20));
+        if (n > 0) {
+            if (b == '\n') {
+                if (idx > 0) {
+                    // убрать возможный \r в конце
+                    if (line[idx - 1] == '\r') line[idx - 1] = '\0';
+                    else                       line[idx] = '\0';
+                    if (line[0] == '$') {
+                        parse_display_nmea(line);
+                    } else if (line[0] != '\0') {
+                        handle_command(line);
+                    }
+                    idx = 0;
+                }
+            } else if (b == '\r') {
+                // игнорируем, кадр заканчивается по \n
+            } else if (idx < (int)sizeof(line) - 1) {
+                line[idx++] = (char)b;
+            }
         }
     }
-    free(data);
     vTaskDelete(NULL);
 }
 
@@ -146,23 +208,27 @@ void usb_uart_rx_task(void *pvParameters) {
 // ==========================================================================
 void app_main(void) {
 
-    log_chip_serial();
+    LCD_init();                     // маленький экран TTGO + шрифты
+    pressure_ui_and_usb_init(&dev); // подписи/экран + UART0 (TX21/RX22) на дисплей
+    pressure_sensor_init();         // датчик №1 (UART1) + датчик №2 (UART2)
 
-    LCD_init();                       // дисплей + шрифты
-    pressure_ui_and_usb_init(&dev);   // USB UART, рамки/подписи, задача экрана
-    pressure_sensor_init();           // датчик №1 (UART1) + датчик №2 (UART2)
-    compressor_control_init();        // пины реле компрессоров, всё выключено
-    compressor_control_start();       // задача управления двумя компрессорами
+    compressor_control_init();      // реле К1/К2 (GPIO2/GPIO17) — выключены
+    compressor_control_start();     // автомат двухступенчатой установки
 
-    // Поднимаем WiFi (AP/STA) и TCP-сервер для приёма команд по сети.
-    // Внутри инициализируется NVS. Команды кладутся в очередь и исполняются
-    // ниже в этом же цикле — теми же handle_command(), что и USB-команды.
+#if !SAFE_NO_PINS
+    xTaskCreate(display_rx_task, "display_rx", 3072, NULL, 6, NULL);
+#else
+    // Заглушка: UART0/RX (GPIO22) не настроен, приём от панели не запускаем.
+    (void)display_rx_task;
+    ESP_LOGW("INIT", "SAFE: приём с внешнего дисплея (UART0 RX=GPIO%d) отключён", PIN_DISP_RX);
+#endif
+
+    // WiFi (AP/STA) + TCP для приёма команд по сети.
     wifi_tcp_init();
 
     char wcmd[256];
     while (1) {
         while (wifi_tcp_poll_command(wcmd, sizeof(wcmd))) {
-            ESP_LOGI(TAG, "WIFI команда: %s", wcmd);
             handle_command(wcmd);
         }
         vTaskDelay(pdMS_TO_TICKS(20));

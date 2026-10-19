@@ -8,6 +8,7 @@
 #include "driver/gpio.h"
 #include "esp_spiffs.h"
 #include "config.h"
+#include "compressor_control.h"
 #include <math.h>
 
 static const char *TAG = "SENSOR_MODULE";
@@ -32,9 +33,6 @@ uint8_t rxIndex2 = 0;
 bool frameStarted2 = false;
 uint32_t sum_err2 = 0;              // CRC-ошибки второго датчика
 uint32_t lastPressureTime2 = 0;
-extern TaskHandle_t display_task_handle;
-
-extern void usb_uart_rx_task(void *pvParameters); 
 
 /* ========================================================================== */
 /*   ПРИВАТНЫЕ (СЛУЖЕБНЫЕ) ФУНКЦИИ — СНАРУЖИ ИХ НЕ ВИДНО                      */
@@ -47,6 +45,12 @@ static void processIncomingData(void);
 extern TFT_t dev;
 
 void display_update_task(void *pvParameters) {
+#if SAFE_NO_PINS
+    // Заглушка: местный экран и кнопка BOOT (GPIO0) не опрашиваются.
+    (void)pvParameters;
+    ESP_LOGW(TAG, "SAFE: display_update_task отключена (экран не инициализирован)");
+    vTaskDelete(NULL);
+#endif
     // Создаем буфер для текста прямо внутри задачи, чтобы не тащить его из main
     char screen_buffer[32]; 
 
@@ -72,35 +76,52 @@ void display_update_task(void *pvParameters) {
             dev._font_fill = true;
             dev._font_fill_color = BLACK;
 
-            // Уставка канала 1
-            snprintf(screen_buffer, sizeof(screen_buffer), "%-6.1f kPa", setpoint1_kPa);
-            lcdDrawString(&dev, fx16, 25, 140, (uint8_t*)screen_buffer, GREEN);
+            // P1 (1-я ступень), МПа
+            snprintf(screen_buffer, sizeof(screen_buffer), "%.2f MPa", pressure1_kPa / 1000.0f);
+            lcdDrawString(&dev, fx16, 25, 140, (uint8_t*)screen_buffer, YELLOW);
 
-            // Давление канала 1
-            snprintf(screen_buffer, sizeof(screen_buffer), "%-6.1f kPa", pressure1_kPa);
-            lcdDrawString(&dev, fx16, 45, 140, (uint8_t*)screen_buffer, YELLOW);
+            // P2 (2-я ступень), МПа
+            snprintf(screen_buffer, sizeof(screen_buffer), "%.2f MPa", pressure2_kPa / 1000.0f);
+            lcdDrawString(&dev, fx16, 45, 140, (uint8_t*)screen_buffer, CYAN);
 
-            // Ошибки CRC: датчик 1 и датчик 2
-            snprintf(screen_buffer, sizeof(screen_buffer), "1:%lu 2:%lu", sum_err, sum_err2);
-            lcdDrawString(&dev, fx16, 65, 100, (uint8_t*)screen_buffer, RED);
+            // Уставка P2, МПа
+            snprintf(screen_buffer, sizeof(screen_buffer), "%.2f MPa", p2_set_kPa / 1000.0f);
+            lcdDrawString(&dev, fx16, 65, 140, (uint8_t*)screen_buffer, GREEN);
 
-            // Давление канала 2
-            snprintf(screen_buffer, sizeof(screen_buffer), "%-6.1f kPa", pressure2_kPa);
-            lcdDrawString(&dev, fx16, 85, 140, (uint8_t*)screen_buffer, CYAN);
+            // K1/K2 — подписи в правой колонке (как P1/P2/SET), каждая на своей
+            // строке; красным — компрессор включён, белым — выключен.
+            dev._font_fill = true;
+            dev._font_fill_color = BLACK;
+            snprintf(screen_buffer, sizeof(screen_buffer), "K1");
+            lcdDrawString(&dev, fx16, 85, 220, (uint8_t*)screen_buffer, comp1_on ? RED : WHITE);
+            snprintf(screen_buffer, sizeof(screen_buffer), "K2");
+            lcdDrawString(&dev, fx16, 105, 220, (uint8_t*)screen_buffer, comp2_on ? RED : WHITE);
 
-            // Уставка канала 2
-            snprintf(screen_buffer, sizeof(screen_buffer), "%-6.1f kPa", setpoint2_kPa);
-            lcdDrawString(&dev, fx16, 105, 140, (uint8_t*)screen_buffer, WHITE);
+            // Режим/авария — в колонке значений (строка 85): сначала стираем, потом пишем
+            snprintf(screen_buffer, sizeof(screen_buffer), "        ");
+            lcdDrawString(&dev, fx16, 85, 140, (uint8_t*)screen_buffer, BLACK);
+            int alm = compressor_get_alarm();
+            if (alm != 0) {
+                snprintf(screen_buffer, sizeof(screen_buffer), "AL %d", alm);
+                lcdDrawString(&dev, fx16, 85, 140, (uint8_t*)screen_buffer, RED);
+            } else {
+                snprintf(screen_buffer, sizeof(screen_buffer), "%-4s",
+                         compressor_is_running() ? "RUN" : "STOP");
+                lcdDrawString(&dev, fx16, 85, 140, (uint8_t*)screen_buffer,
+                              compressor_is_running() ? GREEN : WHITE);
+            }
 
             dev._font_fill = false;
             lcdDrawFinish(&dev);
         }
 
-        // Логирование показаний обоих каналов раз в ~1 с (каждый 5-й цикл по 200 мс)
+        // Логирование показаний раз в ~1 с (каждый 5-й цикл по 200 мс)
         static uint32_t sensor_log_cnt = 0;
         if ((++sensor_log_cnt % 5) == 0) {
-            ESP_LOGI("SENSOR", "P1=%.2f kPa (set=%.1f) | P2=%.2f kPa (set=%.1f) crc1=%lu crc2=%lu",
-                     pressure1_kPa, setpoint1_kPa, pressure2_kPa, setpoint2_kPa, sum_err, sum_err2);
+            ESP_LOGI("SENSOR", "P1=%.2f P2=%.2f MPa | SET=%.2f | ALM=%d K1=%d K2=%d",
+                     pressure1_kPa / 1000.0f, pressure2_kPa / 1000.0f,
+                     p2_set_kPa / 1000.0f, compressor_get_alarm(),
+                     comp1_on ? 1 : 0, comp2_on ? 1 : 0);
         }
 
         // Та самая важная задержка на 200 мс, которая дает процессору дышать
@@ -122,6 +143,11 @@ void clearBufferCompletely(uart_port_t uart_num) {
         }
     
 void LCD_init(void){
+#if SAFE_NO_PINS
+    // Заглушка: SPI и выводы LCD (GPIO18/19/5/16/23/4) не инициализируются.
+    ESP_LOGW(TAG, "SAFE: LCD_init пропущен — ST7789 и его пины отключены");
+    return;
+#endif
     esp_vfs_spiffs_conf_t spiffs_conf = {
         .base_path = "/fonts", .partition_label = "storage1", .max_files = 1, .format_if_mount_failed = false 
     };
@@ -176,6 +202,11 @@ static void processIncomingData2(void);
 // ==========================================================================
 // Настройка UART1 датчика давления
 void pressure_sensor_init(void) {
+#if SAFE_NO_PINS
+    // Заглушка: UART1 (TX=GPIO27, RX=GPIO26) не занимаем — выводы «в воздухе».
+    ESP_LOGW(TAG, "SAFE: UART1 датчика №1 не настраивается (TX=GPIO%d, RX=GPIO%d)",
+             PIN_TX1, PIN_RX1);
+#else
     uart_config_t uart_config = {
         .baud_rate = 19200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_ODD,
         .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT
@@ -183,10 +214,15 @@ void pressure_sensor_init(void) {
     uart_driver_install(SENSOR_UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
     uart_param_config(SENSOR_UART_NUM, &uart_config);
     uart_set_pin(SENSOR_UART_NUM, PIN_TX1, PIN_RX1, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+#endif
 
     const esp_timer_create_args_t timer_args = { .callback = &timerCallback, .name = "pressure_timer" };
     esp_timer_create(&timer_args, &pressure_timer);
+#if !SAFE_NO_PINS
     esp_timer_start_periodic(pressure_timer, SERIAL_UART1_INTERVAL * 1000);
+#else
+    ESP_LOGW(TAG, "SAFE: опрос датчика №1 (каждые %d мс) не запущен", SERIAL_UART1_INTERVAL);
+#endif
 
     
     ESP_LOGI(TAG, "Модуль датчика давления №1 успешно инициализирован.");
@@ -198,6 +234,11 @@ void pressure_sensor_init(void) {
 // Настройка UART2 датчика давления №2 (отдельная независимая шина).
 // У обоих датчиков одинаковый адрес, поэтому второй сидит на своём UART2.
 void pressure_sensor2_init(void) {
+#if SAFE_NO_PINS
+    // Заглушка: UART2 (TX=GPIO33, RX=GPIO25) не занимаем — выводы «в воздухе».
+    ESP_LOGW(TAG, "SAFE: UART2 датчика №2 не настраивается (TX=GPIO%d, RX=GPIO%d)",
+             PIN_TX2, PIN_RX2);
+#else
     uart_config_t uart_config = {
         .baud_rate = 19200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_ODD,
         .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT
@@ -205,15 +246,28 @@ void pressure_sensor2_init(void) {
     uart_driver_install(SENSOR2_UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
     uart_param_config(SENSOR2_UART_NUM, &uart_config);
     uart_set_pin(SENSOR2_UART_NUM, PIN_TX2, PIN_RX2, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+#endif
 
     const esp_timer_create_args_t timer_args = { .callback = &timerCallback2, .name = "pressure_timer2" };
     esp_timer_create(&timer_args, &pressure_timer2);
+#if !SAFE_NO_PINS
     esp_timer_start_periodic(pressure_timer2, SERIAL_UART2_INTERVAL * 1000);
+#else
+    ESP_LOGW(TAG, "SAFE: опрос датчика №2 (каждые %d мс) не запущен", SERIAL_UART2_INTERVAL);
+#endif
 
     ESP_LOGI(TAG, "Датчик давления №2 (UART2: RX=%d, TX=%d) инициализирован.", PIN_RX2, PIN_TX2);
 }
 
 bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num) {
+#if SAFE_NO_PINS
+    // Заглушка: калибровка невозможна — UART датчика не поднят (ничего не дёргаем).
+    (void)offset_kPa;
+    (void)uart_num;
+    is_calibrating = false;
+    ESP_LOGW(TAG, "SAFE: калибровка нуля пропущена");
+    return false;
+#endif
     // 1. Включаем флаг, чтобы заблокировать отрисовку экрана на время калибровки
     is_calibrating = true; 
 
@@ -274,7 +328,7 @@ static void handlePressureResponse1(uint8_t *frame, uint8_t length) {
     uint32_t raw_value;
     memcpy(&raw_value, &fval.value, 4);
     const uint32_t OVF_PATTERN = 0x7F800000;
-    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > 3000.0f || fval.value < -100.0f) {
+    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > PRESSURE_MAX_KPA || fval.value < -100.0f) {
         sum_err++;
         return;
     }
@@ -361,7 +415,7 @@ static void handlePressureResponse2(uint8_t *frame, uint8_t length) {
     uint32_t raw_value;
     memcpy(&raw_value, &fval.value, 4);
     const uint32_t OVF_PATTERN = 0x7F800000;
-    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > 3000.0f || fval.value < -100.0f) {
+    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > PRESSURE_MAX_KPA || fval.value < -100.0f) {
         sum_err2++;
         return;
     }
@@ -414,58 +468,76 @@ static void processIncomingData2(void) {
     }
 }
 
-// Перед самой функцией нужно объявить таску, чтобы xTaskCreate понимал, что это такое
-extern void usb_uart_rx_task(void *pvParameters);
+// ==========================================================================
+//  Отправка состояния на внешний дисплей по UART0 (TX=GPIO21) в формате NMEA:
+//      $SLSD,<P1 МПа>,<P2 МПа>,<K1>,<K2>,<alarm>*<HH>\r\n
+//  Дисплей шлёт нам $SLSS/$SLSC обратно (RX=GPIO22) — их разбирает
+//  display_rx_task в main.c.
+// ==========================================================================
+static void display_link_task(void *arg) {
+    char body[96];
+    char out[128];
+    while (1) {
+        int bn = snprintf(body, sizeof(body), "SLSD,%.2f,%.2f,%d,%d,%d",
+                          pressure1_kPa / 1000.0f,
+                          pressure2_kPa / 1000.0f,
+                          comp1_on ? 1 : 0,
+                          comp2_on ? 1 : 0,
+                          compressor_get_alarm());
+        uint8_t cs = 0;
+        for (int i = 0; i < bn; i++) cs ^= (uint8_t)body[i];
+        int n = snprintf(out, sizeof(out), "$%s*%02X\r\n", body, (unsigned)cs);
+        uart_write_bytes(DISPLAY_UART_NUM, out, n);
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_SEND_MS));
+    }
+}
 
 void pressure_ui_and_usb_init(TFT_t *p_dev) {
+#if SAFE_NO_PINS
+    // Заглушка: UART0 (TX=GPIO21/RX=GPIO22) не занимаем, ST7789 не поднимаем,
+    // задачи отрисовки и отправки $SLSD не создаём — ни один вывод не дёргается.
+    (void)p_dev;
+    (void)display_link_task;
+    ESP_LOGW("INIT", "SAFE: UART0 панели (TX=GPIO%d, RX=GPIO%d) и экран отключены",
+             PIN_DISP_TX, PIN_DISP_RX);
+    return;
+#endif
 
     // ==========================================================================
-    // ИНИЦИАЛИЗАЦИЯ ДРАЙВЕРА USB UART (UART_NUM_0) ДЛЯ ПРИЕМА КОМАНД С ПК
+    // UART0: порт данных на внешний дисплей.
+    // Пины переназначены с GPIO1/3 (USB-консоль) на GPIO21 (TX) / GPIO22 (RX).
+    // Прошивка НЕ ломается: ROM-загрузчик общается по GPIO1/3 по умолчанию.
     // ==========================================================================
     uart_config_t uart_config = {
-        .baud_rate = 115200,                  // Стандартная скорость монитора ESP-IDF
+        .baud_rate = DISPLAY_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    // Конфигурируем параметры порта
-    uart_param_config(UART_NUM_0, &uart_config);
-    
-    // Устанавливаем стандартные пины (GPIO 1 и GPIO 3 используются для USB по умолчанию)
-    uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    
-    // Устанавливаем драйвер и выделяем буфер под прием (например, 512 байт)
-    uart_driver_install(UART_NUM_0, 512, 0, 0, NULL, 0);
-    // ==========================================================================
+    uart_driver_install(DISPLAY_UART_NUM, 512, 512, 0, NULL, 0);
+    uart_param_config(DISPLAY_UART_NUM, &uart_config);
+    uart_set_pin(DISPLAY_UART_NUM, PIN_DISP_TX, PIN_DISP_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    // Теперь создание задачи пройдет успешно и без ошибок драйвера!
-    xTaskCreate(usb_uart_rx_task, "usb_uart_rx_task", 3072, NULL, 4, &display_task_handle);
+    ESP_LOGI("INIT", "UART0 -> внешний дисплей (TX=GPIO%d, RX=GPIO%d)", PIN_DISP_TX, PIN_DISP_RX);
 
-    ESP_LOGI("INIT", "Все системы запущены.");
-
-    // Рисуем тонкую серую рамку по всему периметру экрана 135x240
-    // Так как p_dev это указатель, используем его напрямую (без знака &)
-    lcdDrawRect(p_dev, 0, 0, 134, 239, BLUE);
-
-    // Рисуем горизонтальную линию под показаниями давления
-    lcdDrawLine(p_dev, 0, 50, 134, 50, BLUE);
+    // (рамки/разделители убраны — экран чистый, красивости добавим позже)
     
     // Включаем прозрачный фон для статического текста
     lcdUnsetFontFill(p_dev);
 
     // Рисуем неизменяемые подписи (передаем разыменованный указатель на шрифт *p_fx16)
-    lcdDrawString(p_dev, fx16, 25, 220, (uint8_t*)"SET1:", GREEN);
-    lcdDrawString(p_dev, fx16, 45, 220, (uint8_t*)"P1:", YELLOW);
-    lcdDrawString(p_dev, fx16, 65, 220, (uint8_t*)"CRC:", RED);
-    lcdDrawString(p_dev, fx16, 85, 220, (uint8_t*)"P2:", CYAN);
-    lcdDrawString(p_dev, fx16, 105, 220, (uint8_t*)"SET2:", WHITE);
+    lcdDrawString(p_dev, fx16, 25, 220, (uint8_t*)"P1:", YELLOW);
+    lcdDrawString(p_dev, fx16, 45, 220, (uint8_t*)"P2:", CYAN);
+    lcdDrawString(p_dev, fx16, 65, 220, (uint8_t*)"SET:", GREEN);
 
     // Рисуем заставку «PLEASE WAIT» или рамки, если они нужны
-    lcdDrawFinish(p_dev); 
+    lcdDrawFinish(p_dev);
     
-    // Запускаем задачу обновления экрана автоматически!
-    // Выделяем ей 3072 байт стека и приоритет 3 (чуть ниже, чем у UART)
+    // Задача локального экрана TTGO
+    // Выделяем ей 3072 байт стека и приоритет 3
     xTaskCreate(display_update_task, "display_update_task", 3072, NULL, 3, NULL);
+    // Задача передачи данных на внешний большой дисплей
+    xTaskCreate(display_link_task, "display_link", 3072, NULL, 4, NULL);
 }
