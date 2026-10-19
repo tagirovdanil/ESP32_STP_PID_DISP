@@ -17,5 +17,6 @@
     "--compile-commands-dir=c:\\Users\\danik\\ESP32_STP_PID_DISP\\build"
   ],
   "idf.flashType": "UART",
-  "idf.monitorPort": "COM2"
+  "idf.monitorPort": "COM2",
+  "idf.port": "COM2"
 }

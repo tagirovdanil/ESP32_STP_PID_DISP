@@ -20,8 +20,8 @@
 // UART1: RX=26, TX=27; UART2: RX=23, TX=25. Если провода переставлены —
 // меняйте значения здесь.
 #define SENSOR2_UART_NUM        UART_NUM_2
-#define PIN_RX2                 23
-#define PIN_TX2                 25
+#define PIN_RX2                 25
+#define PIN_TX2                 33
 #define SERIAL_UART2_INTERVAL   50
 
 // пины дисплея
