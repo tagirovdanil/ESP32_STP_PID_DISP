@@ -19,20 +19,20 @@ static const char *TAG = "SENSOR_MODULE";
 
 esp_timer_handle_t pressure_timer;
 
+// ===== ОБЩАЯ ШИНА UART1: оба датчика (0x01 и 0x02) на одних проводах =====
+// Буфер сборки кадра один: принадлежность кадра определяется по frame[1] —
+// байту адреса устройства. Оба датчика отвечают кадром ровно 12 байт.
 uint8_t rxBuffer1[12];
 uint8_t rxIndex1 = 0;
 bool frameStarted1 = false;
-uint32_t sum_err = 0;
+uint32_t sum_err = 0;               // ошибки кадра датчика №1 (адрес 0x01)
+uint32_t sum_err2 = 0;              // ошибки кадра датчика №2 (адрес 0x02)
 uint32_t lastPressureTime = 0;
-
-// ===== Датчик №2 (независимая шина UART2): свои буферы, счётчики и таймер =====
-esp_timer_handle_t pressure_timer2;
-volatile float pressure2_kPa = 0;   // показания второго датчика (extern в .h)
-uint8_t rxBuffer2[12];
-uint8_t rxIndex2 = 0;
-bool frameStarted2 = false;
-uint32_t sum_err2 = 0;              // CRC-ошибки второго датчика
 uint32_t lastPressureTime2 = 0;
+volatile float pressure2_kPa = 0;   // показания второго датчика (extern в .h)
+
+// Адрес, которому уйдёт СЛЕДУЮЩИЙ запрос: 0x01 -> 0x02 -> 0x01 -> ...
+static uint8_t poll_addr = DEVICE_ADDRESS1;
 
 /* ========================================================================== */
 /*   ПРИВАТНЫЕ (СЛУЖЕБНЫЕ) ФУНКЦИИ — СНАРУЖИ ИХ НЕ ВИДНО                      */
@@ -66,9 +66,9 @@ void display_update_task(void *pvParameters) {
 
     // Бесконечный рабочий цикл задачи
     while (1) {
-        // 1. Опрос кнопки Boot (Калибровка нуля)
+        // 1. Опрос кнопки Boot (калибровка нуля датчика P1, адрес 0x01)
         if (gpio_get_level(GPIO_NUM_0) == 0) {
-            performAdvancedZeroCalibration(0.0f, SENSOR_UART_NUM);
+            performAdvancedZeroCalibration(0.0f, SENSOR_UART_NUM, DEVICE_ADDRESS1);
         }
 
         // 2. Отрисовка данных, если нет калибровки
@@ -175,36 +175,36 @@ void LCD_init(void){
 // ПРИВАТНЫЕ ПРОТОТИПЫ (Видны ТОЛЬКО внутри этого файла)
 // ==========================================================================
 
-void IRAM_ATTR timerCallback(void *arg) {
-     // 1. Сначала забираем и парсим ответ на ПРЕДЫДУЩИЙ запрос
+// Тик общего опроса шины UART1 (период — SENSOR_POLL_INTERVAL_MS).
+// Сначала вычитываем и разбираем ответ на ПРЕДЫДУЩИЙ запрос, затем отправляем
+// запрос СЛЕДУЮЩЕМУ адресу. Так запросы к 0x01 и 0x02 чередуются, а пауза
+// между ними равна периоду таймера (по умолчанию 50 мс).
+static void timerCallback(void *arg) {
+    (void)arg;
     processIncomingData();
-    // 2. Отправляем НОВЫЙ запрос датчику (он ответит на него к следующему вызову таймера)
-    uint8_t prCmd1[] = { 0x02, DEVICE_ADDRESS1, 0x01, 0x00, 0x00 };
-    prCmd1[4] = calculateChecksum(prCmd1, 4);
-    uart_write_bytes(SENSOR_UART_NUM, (const char*)prCmd1, sizeof(prCmd1));
+
+    uint8_t prCmd[] = { 0x02, poll_addr, 0x01, 0x00, 0x00 };
+    prCmd[4] = calculateChecksum(prCmd, 4);
+    uart_write_bytes(SENSOR_UART_NUM, (const char*)prCmd, sizeof(prCmd));
+
+    poll_addr = (poll_addr == DEVICE_ADDRESS1) ? DEVICE_ADDRESS2 : DEVICE_ADDRESS1;
 }
-// Обработчик ответа от датчика на команду калибровки/измерения
+
+// Разбор принятого кадра: адрес в кадре решает, какому датчику он принадлежит
+static void handleSensorFrame(uint8_t *frame, uint8_t length);
+// Обработчики показаний конкретного датчика
 static void handlePressureResponse1(uint8_t *frame, uint8_t length);
-
-// Обработчик успешно принятого и проверенного UART кадра
-static void handleUART1ReceivedFrame(uint8_t *frame, uint8_t length);
-
-// ===== Датчик №2 (UART2): прототипы =====
-// NB: IRAM_ATTR только в определении (не в прототипе), иначе GCC ругается на
-// конфликт секций ".iram1.1"/".iram1.2".
-void timerCallback2(void *arg);
 static void handlePressureResponse2(uint8_t *frame, uint8_t length);
-static void handleUART2ReceivedFrame(uint8_t *frame, uint8_t length);
-static void processIncomingData2(void);
 
 // ==========================================================================
 // РЕАЛИЗАЦИЯ ФУНКЦИЙ
 // ==========================================================================
-// Настройка UART1 датчика давления
+// Настройка ОБЩЕЙ шины UART1: на ней два датчика с адресами 0x01 и 0x02.
+// Опрос по кругу (round-robin) с периодом SENSOR_POLL_INTERVAL_MS.
 void pressure_sensor_init(void) {
 #if SAFE_NO_PINS
     // Заглушка: UART1 (TX=GPIO27, RX=GPIO26) не занимаем — выводы «в воздухе».
-    ESP_LOGW(TAG, "SAFE: UART1 датчика №1 не настраивается (TX=GPIO%d, RX=GPIO%d)",
+    ESP_LOGW(TAG, "SAFE: UART1 датчиков не настраивается (TX=GPIO%d, RX=GPIO%d)",
              PIN_TX1, PIN_RX1);
 #else
     uart_config_t uart_config = {
@@ -214,56 +214,31 @@ void pressure_sensor_init(void) {
     uart_driver_install(SENSOR_UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
     uart_param_config(SENSOR_UART_NUM, &uart_config);
     uart_set_pin(SENSOR_UART_NUM, PIN_TX1, PIN_RX1, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    ESP_LOGI(TAG, "Общая шина UART1 (RX=%d, TX=%d): опрос 0x%02X/0x%02X каждые %d мс",
+             PIN_RX1, PIN_TX1, DEVICE_ADDRESS1, DEVICE_ADDRESS2, SENSOR_POLL_INTERVAL_MS);
 #endif
 
-    const esp_timer_create_args_t timer_args = { .callback = &timerCallback, .name = "pressure_timer" };
+    const esp_timer_create_args_t timer_args = { .callback = &timerCallback, .name = "sensor_poll" };
     esp_timer_create(&timer_args, &pressure_timer);
 #if !SAFE_NO_PINS
-    esp_timer_start_periodic(pressure_timer, SERIAL_UART1_INTERVAL * 1000);
+    poll_addr = DEVICE_ADDRESS1;
+    esp_timer_start_periodic(pressure_timer, SENSOR_POLL_INTERVAL_MS * 1000);
 #else
-    ESP_LOGW(TAG, "SAFE: опрос датчика №1 (каждые %d мс) не запущен", SERIAL_UART1_INTERVAL);
+    ESP_LOGW(TAG, "SAFE: опрос датчиков (каждые %d мс) не запущен", SENSOR_POLL_INTERVAL_MS);
 #endif
 
-    
-    ESP_LOGI(TAG, "Модуль датчика давления №1 успешно инициализирован.");
-
-    // Инициализируем и датчик №2 (UART2) — отдельная независимая шина
-    pressure_sensor2_init();
+    ESP_LOGI(TAG, "Модуль датчиков давления инициализирован (общая шина UART1).");
 }
 
-// Настройка UART2 датчика давления №2 (отдельная независимая шина).
-// У обоих датчиков одинаковый адрес, поэтому второй сидит на своём UART2.
-void pressure_sensor2_init(void) {
+// Калибровка нуля датчика на общей шине. device_addr — адрес датчика (0x01/0x02):
+// команда уходит на тот же UART1, но конкретному устройству.
+bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num, uint8_t device_addr) {
 #if SAFE_NO_PINS
-    // Заглушка: UART2 (TX=GPIO33, RX=GPIO25) не занимаем — выводы «в воздухе».
-    ESP_LOGW(TAG, "SAFE: UART2 датчика №2 не настраивается (TX=GPIO%d, RX=GPIO%d)",
-             PIN_TX2, PIN_RX2);
-#else
-    uart_config_t uart_config = {
-        .baud_rate = 19200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_ODD,
-        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT
-    };
-    uart_driver_install(SENSOR2_UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
-    uart_param_config(SENSOR2_UART_NUM, &uart_config);
-    uart_set_pin(SENSOR2_UART_NUM, PIN_TX2, PIN_RX2, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-#endif
-
-    const esp_timer_create_args_t timer_args = { .callback = &timerCallback2, .name = "pressure_timer2" };
-    esp_timer_create(&timer_args, &pressure_timer2);
-#if !SAFE_NO_PINS
-    esp_timer_start_periodic(pressure_timer2, SERIAL_UART2_INTERVAL * 1000);
-#else
-    ESP_LOGW(TAG, "SAFE: опрос датчика №2 (каждые %d мс) не запущен", SERIAL_UART2_INTERVAL);
-#endif
-
-    ESP_LOGI(TAG, "Датчик давления №2 (UART2: RX=%d, TX=%d) инициализирован.", PIN_RX2, PIN_TX2);
-}
-
-bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num) {
-#if SAFE_NO_PINS
-    // Заглушка: калибровка невозможна — UART датчика не поднят (ничего не дёргаем).
+    // Заглушка: калибровка невозможна — UART датчиков не поднят (ничего не дёргаем).
     (void)offset_kPa;
     (void)uart_num;
+    (void)device_addr;
     is_calibrating = false;
     ESP_LOGW(TAG, "SAFE: калибровка нуля пропущена");
     return false;
@@ -275,7 +250,7 @@ bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num) {
     vTaskDelay(150 / portTICK_PERIOD_MS);
     clearBufferCompletely(uart_num);
 
-    uint8_t zeroCmd[9] = { 0x02, 0x02, 0x2B, 0x04 };
+    uint8_t zeroCmd[9] = { 0x02, device_addr, 0x2B, 0x04 };
     union { float value; uint8_t bytes[4]; } pUnion;
     pUnion.value = offset_kPa;
     zeroCmd[4] = pUnion.bytes[3]; zeroCmd[5] = pUnion.bytes[2];
@@ -295,9 +270,11 @@ bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num) {
     }
 
     if (responseIndex == 0) {
-        esp_timer_start_periodic(pressure_timer, SERIAL_UART1_INTERVAL * 1000);
+        // Возобновляем опрос с адреса 0x01, иначе round-robin может «застрять»
+        poll_addr = DEVICE_ADDRESS1;
+        esp_timer_start_periodic(pressure_timer, SENSOR_POLL_INTERVAL_MS * 1000);
         // СБРОС ФЛАГА ПРИ ОШИБКЕ: возвращаем управление экрану
-        is_calibrating = false; 
+        is_calibrating = false;
         return false;
     }
 
@@ -312,10 +289,12 @@ bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num) {
         vTaskDelay(1);
     }
 
-    esp_timer_start_periodic(pressure_timer, SERIAL_UART1_INTERVAL * 1000);
+    // Возобновляем опрос с адреса 0x01
+    poll_addr = DEVICE_ADDRESS1;
+    esp_timer_start_periodic(pressure_timer, SENSOR_POLL_INTERVAL_MS * 1000);
     
     // 2. СБРОС ФЛАГА ПРИ УСПЕХЕ: калибровка завершена, экран снова оживает
-    is_calibrating = false; 
+    is_calibrating = false;
     return true;
 }
 
@@ -327,8 +306,11 @@ static void handlePressureResponse1(uint8_t *frame, uint8_t length) {
 
     uint32_t raw_value;
     memcpy(&raw_value, &fval.value, 4);
+    // Отрицательные показания допустимы (атмосферный дрейф нуля): нижний
+    // предел берём единый с автоматом — PRESSURE_MIN_KPA, а не «0 кПа».
     const uint32_t OVF_PATTERN = 0x7F800000;
-    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > PRESSURE_MAX_KPA || fval.value < -100.0f) {
+    if ((raw_value == OVF_PATTERN) || isnan(fval.value) ||
+        fval.value > PRESSURE_MAX_KPA || fval.value < PRESSURE_MIN_KPA) {
         sum_err++;
         return;
     }
@@ -337,85 +319,20 @@ static void handlePressureResponse1(uint8_t *frame, uint8_t length) {
     lastPressureTime = esp_timer_get_time() / 1000;
 }
 
-// Приватный обработчик кадра (обязательно пишется static)
-static void handleUART1ReceivedFrame(uint8_t *frame, uint8_t length) {
-    if (length < 3) return;
-    if (frame[0] != ACK || frame[1] != DEVICE_ADDRESS1) return;
-
-    uint8_t calcChecksum = calculateChecksum(frame, length - 1);
-    if (calcChecksum != frame[length - 1]) {
-        sum_err++;
-        return;
-    }
-
-    if (frame[2] == 0x01 && length >= 12) {
-        // Валидация заголовка (портировано из старого проекта):
-        //  frame[3] — длина данных, всегда 0x07 (единица изм. + 4 байта float +
-        //             статус устройства + статус команды);
-        //  frame[5] — статус команды, 0x00 = OK.
-        // XOR-чексумма выше ловит не всё: при рассинхронизации сборщик может
-        // начать «кадр» с 0x06 из ДАННЫХ, и случайное окно проходит XOR с
-        // вероятностью 1/256 (так в регулятор пролез отсчёт ~118 кПа при
-        // реальных 200). Эти два байта режут ложные кадры ещё в ~65536 раз.
-        if (frame[3] != 0x07 || frame[5] != 0x00) {
-            sum_err++;
-            ESP_LOGW("SENSOR", "Отброшен кадр с битым заголовком: dlen=0x%02X cmd_status=0x%02X",
-                     frame[3], frame[5]);
-            return;
-        }
-        handlePressureResponse1(frame, 12);
-    }
-    // Анализ заголовков, CRC и вызов handlePressureResponse1
-}
-
-// Приватная функция чтения UART (обязательно пишется static)
-static void processIncomingData(void) {
-
-    // Вызов uart_read_bytes и сборка кадров
-    uint8_t incomingByte;
-    while (uart_read_bytes(SENSOR_UART_NUM, &incomingByte, 1, 0) > 0) {
-        if (!frameStarted1 && incomingByte == ACK) {
-            frameStarted1 = true;
-            rxIndex1 = 0;
-            rxBuffer1[rxIndex1++] = incomingByte;
-            continue;
-        }
-        if (frameStarted1 && rxIndex1 < 12) {
-            rxBuffer1[rxIndex1++] = incomingByte;
-        }
-        if (rxIndex1 == 12) {
-            handleUART1ReceivedFrame(rxBuffer1, 12);
-            frameStarted1 = false;
-            rxIndex1 = 0;
-        }
-    }
-}
-
-// ==========================================================================
-//  ДАТЧИК №2 (UART2, независимая шина)
-//  Полностью повторяет логику датчика №1, но на своём UART2 и со своими
-//  буферами/счётчиками — два одинаковых по адресу датчика (0x02) на разных
-//  шинах отвечают только своему UART, поэтому между собой не конфликтуют.
-// ==========================================================================
-void IRAM_ATTR timerCallback2(void *arg) {
-    // 1. Сначала забираем и парсим ответ на ПРЕДЫДУЩИЙ запрос
-    processIncomingData2();
-    // 2. Отправляем НОВЫЙ запрос датчику №2 (он ответит к следующему тику таймера)
-    uint8_t prCmd2[] = { 0x02, DEVICE_ADDRESS1, 0x01, 0x00, 0x00 };
-    prCmd2[4] = calculateChecksum(prCmd2, 4);
-    uart_write_bytes(SENSOR2_UART_NUM, (const char*)prCmd2, sizeof(prCmd2));
-}
-
-// Приватный обработчик ответа датчика №2
+// Приватный обработчик показаний датчика №2 (адрес 0x02)
 static void handlePressureResponse2(uint8_t *frame, uint8_t length) {
+    (void)length;
     union { uint8_t bytes[4]; float value; } fval;
     fval.bytes[0] = frame[10]; fval.bytes[1] = frame[9];
     fval.bytes[2] = frame[8];  fval.bytes[3] = frame[7];
 
     uint32_t raw_value;
     memcpy(&raw_value, &fval.value, 4);
+    // Отрицательные показания допустимы (атмосферный дрейф нуля): нижний
+    // предел берём единый с автоматом — PRESSURE_MIN_KPA, а не «0 кПа».
     const uint32_t OVF_PATTERN = 0x7F800000;
-    if ((raw_value == OVF_PATTERN) || isnan(fval.value) || fval.value > PRESSURE_MAX_KPA || fval.value < -100.0f) {
+    if ((raw_value == OVF_PATTERN) || isnan(fval.value) ||
+        fval.value > PRESSURE_MAX_KPA || fval.value < PRESSURE_MIN_KPA) {
         sum_err2++;
         return;
     }
@@ -424,89 +341,143 @@ static void handlePressureResponse2(uint8_t *frame, uint8_t length) {
     lastPressureTime2 = esp_timer_get_time() / 1000;
 }
 
-// Приватный обработчик кадра датчика №2
-static void handleUART2ReceivedFrame(uint8_t *frame, uint8_t length) {
-    if (length < 3) return;
-    if (frame[0] != ACK || frame[1] != DEVICE_ADDRESS1) return;
+// ==========================================================================
+//  ОБЩИЙ РАЗБОР КАДРОВ С ШИНЫ UART1
+//  Кадр: [0]=ACK(0x06) [1]=адрес [2]=команда(0x01) [3]=длина данных(0x07)
+//        [5]=статус команды(0x00) ... [11]=XOR
+//  Принадлежность определяет frame[1]: 0x01 -> P1, 0x02 -> P2.
+// ==========================================================================
+static void handleSensorFrame(uint8_t *frame, uint8_t length) {
+    if (length < 3 || frame[0] != ACK) return;
 
-    uint8_t calcChecksum = calculateChecksum(frame, length - 1);
-    if (calcChecksum != frame[length - 1]) {
-        sum_err2++;
+    const uint8_t addr = frame[1];
+    uint32_t *err_cnt;
+
+    if (addr == DEVICE_ADDRESS1) {
+        err_cnt = &sum_err;
+    } else if (addr == DEVICE_ADDRESS2) {
+        err_cnt = &sum_err2;
+    } else {
+        // На этой шине других устройств нет — кадр битый/рассинхронизация
+        sum_err++;
         return;
     }
 
-    if (frame[2] == 0x01 && length >= 12) {
-        // Та же валидация заголовка, что и у датчика №1 (см. handleUART1ReceivedFrame)
-        if (frame[3] != 0x07 || frame[5] != 0x00) {
-            sum_err2++;
-            ESP_LOGW("SENSOR2", "Датчик №2: отброшен кадр с битым заголовком: dlen=0x%02X cmd_status=0x%02X",
-                     frame[3], frame[5]);
-            return;
-        }
+    if (calculateChecksum(frame, length - 1) != frame[length - 1]) {
+        (*err_cnt)++;
+        return;
+    }
+
+    if (frame[2] != 0x01 || length < 12) return;
+
+    // Валидация заголовка (портировано из старого проекта):
+    //  frame[3] — длина данных, всегда 0x07 (единица изм. + 4 байта float +
+    //             статус устройства + статус команды);
+    //  frame[5] — статус команды, 0x00 = OK.
+    // XOR-чексумма выше ловит не всё: при рассинхронизации сборщик может
+    // начать «кадр» с 0x06 из ДАННЫХ, и случайное окно проходит XOR с
+    // вероятностью 1/256 (так в регулятор пролез отсчёт ~118 кПа при
+    // реальных 200). Эти два байта режут ложные кадры ещё в ~65536 раз.
+    if (frame[3] != 0x07 || frame[5] != 0x00) {
+        (*err_cnt)++;
+        ESP_LOGW("SENSOR", "Датчик 0x%02X: отброшен кадр с битым заголовком: dlen=0x%02X cmd_status=0x%02X",
+                 addr, frame[3], frame[5]);
+        return;
+    }
+
+    if (addr == DEVICE_ADDRESS1) {
+        handlePressureResponse1(frame, 12);
+    } else {
         handlePressureResponse2(frame, 12);
     }
 }
 
-// Приватная функция чтения UART2 и сборки кадров датчика №2
-static void processIncomingData2(void) {
+// Приватная функция чтения общей шины UART1 и сборки кадров.
+// Буфер один: оба датчика отвечают кадром ровно 12 байт, начиная с ACK.
+static void processIncomingData(void) {
     uint8_t incomingByte;
-    while (uart_read_bytes(SENSOR2_UART_NUM, &incomingByte, 1, 0) > 0) {
-        if (!frameStarted2 && incomingByte == ACK) {
-            frameStarted2 = true;
-            rxIndex2 = 0;
-            rxBuffer2[rxIndex2++] = incomingByte;
-            continue;
+    while (uart_read_bytes(SENSOR_UART_NUM, &incomingByte, 1, 0) > 0) {
+        if (!frameStarted1) {
+            if (incomingByte != ACK) continue;   // ищем начало кадра
+            frameStarted1 = true;
+            rxIndex1 = 0;
         }
-        if (frameStarted2 && rxIndex2 < 12) {
-            rxBuffer2[rxIndex2++] = incomingByte;
-        }
-        if (rxIndex2 == 12) {
-            handleUART2ReceivedFrame(rxBuffer2, 12);
-            frameStarted2 = false;
-            rxIndex2 = 0;
+        rxBuffer1[rxIndex1++] = incomingByte;
+        if (rxIndex1 >= 12) {
+            handleSensorFrame(rxBuffer1, 12);
+            frameStarted1 = false;
+            rxIndex1 = 0;
         }
     }
 }
 
 // ==========================================================================
-//  Отправка состояния на внешний дисплей по UART0 (TX=GPIO21) в формате NMEA:
-//      $SLSD,<P1 МПа>,<P2 МПа>,<K1>,<K2>,<alarm>*<HH>\r\n
-//  Дисплей шлёт нам $SLSS/$SLSC обратно (RX=GPIO22) — их разбирает
-//  display_rx_task в main.c.
+//  Отправка состояния на внешний дисплей по UART2 (TX=GPIO33) в формате NMEA.
+//  Расширенный кадр (обратно совместим: панель читает 5 полей, хвост игнорирует):
+//      $SLSD,<P1>,<P2>,<K1>,<K2>,<alarm>,<K3>,<K4>,<state>*<HH>
+//  K3 — фактическое состояние реле охлаждения (в т.ч. по выдержке 60 с),
+//  K4 — резерв (штатно 0), state — COMP_STATE_STOP/RUN/ALARM/SERVICE/PAUSE2.
+//  Панель шлёт нам $SLSS/$SLSC обратно (RX=GPIO25) — их разбирает
+//  display_rx_task в main.c. Выводы 21/22 отданы реле K1/K2, реле K3/K4 —
+//  17/2, поэтому линия панели на 33/25.
 // ==========================================================================
-static void display_link_task(void *arg) {
+// Один кадр $SLSD. Вынесено отдельно, чтобы после обнуления датчиков ($SLSC,ZERO)
+// сразу отдать панели свежие нулевые значения, не дожидаясь очередных 200 мс.
+static void display_send_status_frame(void) {
     char body[96];
     char out[128];
+
+    // NO_LINK: панель молчит дольше DISPLAY_LINK_MS -> state + 10.
+    // Управление при этом НЕ прекращается: панель — только HMI.
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    bool panel_link = ((uint32_t)(now - panel_last_rx_ms) < DISPLAY_LINK_MS);
+    int state = compressor_get_state();
+    if (!panel_link) state += 10;
+
+    int bn = snprintf(body, sizeof(body), "SLSD,%.2f,%.2f,%d,%d,%d,%d,%d,%d",
+                      pressure1_kPa / 1000.0f,
+                      pressure2_kPa / 1000.0f,
+                      comp1_on ? 1 : 0,
+                      comp2_on ? 1 : 0,
+                      compressor_get_alarm(),
+                      comp3_on ? 1 : 0,
+                      comp4_on ? 1 : 0,
+                      state);
+    uint8_t cs = 0;
+    for (int i = 0; i < bn; i++) cs ^= (uint8_t)body[i];
+    int n = snprintf(out, sizeof(out), "$%s*%02X\r\n", body, (unsigned)cs);
+    uart_write_bytes(DISPLAY_UART_NUM, out, n);
+}
+
+void display_send_status_now(void) {
+#if !SAFE_NO_PINS
+    display_send_status_frame();
+#endif
+}
+
+static void display_link_task(void *arg) {
+    (void)arg;
     while (1) {
-        int bn = snprintf(body, sizeof(body), "SLSD,%.2f,%.2f,%d,%d,%d",
-                          pressure1_kPa / 1000.0f,
-                          pressure2_kPa / 1000.0f,
-                          comp1_on ? 1 : 0,
-                          comp2_on ? 1 : 0,
-                          compressor_get_alarm());
-        uint8_t cs = 0;
-        for (int i = 0; i < bn; i++) cs ^= (uint8_t)body[i];
-        int n = snprintf(out, sizeof(out), "$%s*%02X\r\n", body, (unsigned)cs);
-        uart_write_bytes(DISPLAY_UART_NUM, out, n);
+        display_send_status_frame();
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_SEND_MS));
     }
 }
 
 void pressure_ui_and_usb_init(TFT_t *p_dev) {
 #if SAFE_NO_PINS
-    // Заглушка: UART0 (TX=GPIO21/RX=GPIO22) не занимаем, ST7789 не поднимаем,
+    // Заглушка: UART2 (TX=GPIO33/RX=GPIO25) не занимаем, ST7789 не поднимаем,
     // задачи отрисовки и отправки $SLSD не создаём — ни один вывод не дёргается.
     (void)p_dev;
     (void)display_link_task;
-    ESP_LOGW("INIT", "SAFE: UART0 панели (TX=GPIO%d, RX=GPIO%d) и экран отключены",
+    ESP_LOGW("INIT", "SAFE: UART2 панели (TX=GPIO%d, RX=GPIO%d) и экран отключены",
              PIN_DISP_TX, PIN_DISP_RX);
     return;
 #endif
 
     // ==========================================================================
-    // UART0: порт данных на внешний дисплей.
-    // Пины переназначены с GPIO1/3 (USB-консоль) на GPIO21 (TX) / GPIO22 (RX).
-    // Прошивка НЕ ломается: ROM-загрузчик общается по GPIO1/3 по умолчанию.
+    // UART2: порт данных на внешний дисплей (GPIO33 TX / GPIO25 RX).
+    // UART0 занят консолью/логами (GPIO1/3), UART1 — обоими датчиками (26/27),
+    // а выводы 21/22 отданы резервным реле K3/K4.
     // ==========================================================================
     uart_config_t uart_config = {
         .baud_rate = DISPLAY_UART_BAUD,
@@ -520,7 +491,7 @@ void pressure_ui_and_usb_init(TFT_t *p_dev) {
     uart_param_config(DISPLAY_UART_NUM, &uart_config);
     uart_set_pin(DISPLAY_UART_NUM, PIN_DISP_TX, PIN_DISP_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    ESP_LOGI("INIT", "UART0 -> внешний дисплей (TX=GPIO%d, RX=GPIO%d)", PIN_DISP_TX, PIN_DISP_RX);
+    ESP_LOGI("INIT", "UART2 -> внешний дисплей (TX=GPIO%d, RX=GPIO%d)", PIN_DISP_TX, PIN_DISP_RX);
 
     // (рамки/разделители убраны — экран чистый, красивости добавим позже)
     

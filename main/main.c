@@ -1,10 +1,12 @@
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>     // strncasecmp для точного сравнения команд
 #include <stdlib.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/uart.h"
 #include "esp_mac.h"          // Для чтения заводского MAC (серийного номера) из efuse
 
@@ -12,12 +14,13 @@
 #include "pressure_sensor.h"  // Датчики давления
 #include "config.h"           // Глобалы: давления, уставка P2, порт дисплея
 #include "compressor_control.h"
+#include "settings.h"         // NVS: уставка/пороги переживают перезагрузку
 #include "wifi_tcp.h"         // WiFi (AP/STA) + TCP-сервер для приёма команд по сети
 
 #define KPA_PER_MPA 1000.0f
 
 // ==========================================================================
-// ВЫВОД ОТВЕТА: WiFi/TCP-клиентам и внешнему дисплею (UART0). Дисплей в ответ
+// ВЫВОД ОТВЕТА: WiFi/TCP-клиентам и внешнему дисплею (UART2). Дисплей в ответ
 // может просто игнорировать не-NMEA-строки (его состояние обновляется $SLSD).
 // ==========================================================================
 static void respond(const char *msg) {
@@ -25,7 +28,7 @@ static void respond(const char *msg) {
 #if !SAFE_NO_PINS
     uart_write_bytes(DISPLAY_UART_NUM, msg, strlen(msg));
 #else
-    // Заглушка: UART0 (GPIO21/22) не установлен — в порт не пишем.
+    // Заглушка: UART2 (GPIO33/25) не установлен — в порт не пишем.
     (void)msg;
 #endif
 }
@@ -44,62 +47,252 @@ static uint8_t nmea_checksum(const char *line) {
     return cs;
 }
 
-// Разбор кадра от дисплея: $SLSS,<P2_Set МПа>  и  $SLSC,<CMD>
-static bool parse_display_nmea(char *line) {
-    if (line[0] != '$') return false;
-    char *star = strchr(line, '*');
-    if (star == NULL) return false;
+// Отправка NMEA-кадра по телу (без '$' и '*HH'): сам считает XOR.
+static void send_nmea_body(const char *body) {
+    uint8_t cs = 0;
+    for (const char *p = body; *p; p++) cs ^= (uint8_t)*p;
+    char out[96];
+    snprintf(out, sizeof(out), "$%s*%02X\r\n", body, (unsigned)cs);
+    respond(out);
+}
 
-    // контрольная сумма
-    uint8_t cs = nmea_checksum(line);
-    unsigned int cs_rx = 0;
-    if (sscanf(star + 1, "%02x", &cs_rx) != 1) return false;
-    if (cs_rx != cs) return false;
+// Подтверждение команды панели: $SLSA,<CMD>,OK|ERR*HH
+static void send_ack(const char *cmd, bool ok) {
+    char body[32];
+    snprintf(body, sizeof(body), "SLSA,%s,%s", cmd, ok ? "OK" : "ERR");
+    send_nmea_body(body);
+}
 
-    char type[5] = {0};
-    char *p1 = line + 1;
-    if (sscanf(p1, "%4[^,]", type) != 1) return false;
-    char *rest = strchr(p1, ',');
-    if (rest == NULL) return false;
-    rest++; // после первой запятой
+// Ответ на $SLSC,GET: текущая уставка и порог (источник истины — мастер)
+static void send_setpoint_frame(void) {
+    char body[40];
+    snprintf(body, sizeof(body), "SLSS,%.2f,%.2f",
+             p2_set_kPa / KPA_PER_MPA, p2_start_kPa / KPA_PER_MPA);
+    send_nmea_body(body);
+}
 
-    if (strcmp(type, "SLSS") == 0) {
-        // $SLSS,<P2_Set МПа>
-        float mpa = 0.0f;
-        if (sscanf(rest, "%f", &mpa) != 1) return false;
-        float applied = compressor_set_setpoint_kpa(mpa * KPA_PER_MPA);
-        char msg[64];
-        snprintf(msg, sizeof(msg), "SET OK %.2f MPa\r\n", applied / KPA_PER_MPA);
-        respond(msg);
+// ==========================================================================
+// Разбор кадра от панели CrowPanel (protocol.txt / panel2_agent_instruction.md):
+//   $SLSS,<P2_Set>,<P2_Start>          — уставка и порог повторного включения
+//   $SLSC,START | STOP | RESET | GET
+//   $SLSC,OUT,<K1>,<K2>,<R3>,<R4>      — сервисный тест выходов
+//   $SLSC,TH,<S1_NP>,<S1_VP>,<S2_NP>,<S2_VP> — пороги ступеней (кПа)
+// На каждую команду отвечаем $SLSA,<CMD>,OK|ERR (кроме GET — он получает $SLSS).
+// Любая отбраковка пишется в лог с причиной — это главный инструмент наладки.
+// ==========================================================================
+
+// Обнуление модуля давления — единая реализация для $SLSC,ZERO,<n> и CLI "ZERO [n]".
+// Повторно проверяем |P| < ZERO_MAX_ABS_KPA: дисплей не гарантия (датчик мог
+// «поплыть» между кадрами). Обнуляется только выбранный модуль.
+static bool zero_pressure_channel(int n) {
+    if (n != 1 && n != 2) {
+        ESP_LOGW("ZERO", "неверный номер модуля %d (нужно 1 или 2)", n);
+        return false;
+    }
+    uint8_t addr = (n == 2) ? DEVICE_ADDRESS2 : DEVICE_ADDRESS1;
+    float p = (n == 2) ? pressure2_kPa : pressure1_kPa;
+
+    if (p > ZERO_MAX_ABS_KPA || p < -ZERO_MAX_ABS_KPA) {
+        ESP_LOGW("ZERO", "P%d отклонено: |P|=%.3f МПа (нужно |P| < %.3f МПа)",
+                 n, p / KPA_PER_MPA, ZERO_MAX_ABS_KPA / KPA_PER_MPA);
+        return false;
+    }
+
+    ESP_LOGW("ZERO", "P%d: обнуляю датчик 0x%02X (P=%.3f МПа)", n, addr, p / KPA_PER_MPA);
+    bool ok = performAdvancedZeroCalibration(0.0f, SENSOR_UART_NUM, addr);
+    ESP_LOGW("ZERO", "P%d: %s", n, ok ? "OK" : "ОШИБКА (модуль не ответил)");
+
+    if (ok) display_send_status_now();   // панель сразу видит нулевое давление
+    return ok;
+}
+
+// $SLSS,<P2_Set МПа>[,<P2_Start МПа>]
+static bool handle_slss(char *rest) {
+    char *end = NULL;
+    float set_mpa = strtof(rest, &end);
+    if (end == rest) {
+        ESP_LOGW("NMEA", "SLSS: не число в '%s'", rest);
+        send_ack("SLSS", false);
+        return false;
+    }
+
+    float start_mpa = 0.0f;
+    bool has_start = false;
+    if (*end == ',') {
+        char *e2 = NULL;
+        float v = strtof(end + 1, &e2);
+        if (e2 != end + 1) {
+            start_mpa = v;
+            has_start = true;
+        }
+    }
+
+    float set_kpa = set_mpa * KPA_PER_MPA;
+    float start_kpa;
+    if (has_start) {
+        start_kpa = start_mpa * KPA_PER_MPA;
+    } else {
+        // Старый формат: P2_Start = MAX(1.0; P2_Set - 0.4) с учётом зазора
+        start_kpa = set_kpa - P2_START_DROP_KPA;
+        if (start_kpa < P_SYNC_SET_KPA) start_kpa = P_SYNC_SET_KPA;
+        if (start_kpa > set_kpa - P2_MIN_GAP_KPA) start_kpa = set_kpa - P2_MIN_GAP_KPA;
+        if (start_kpa < P2_START_MIN_KPA) start_kpa = P2_START_MIN_KPA;
+    }
+
+    float applied_set = 0.0f, applied_start = 0.0f;
+    if (!compressor_set_pressure_task_kpa(set_kpa, start_kpa, &applied_set, &applied_start)) {
+        ESP_LOGW("NMEA", "SLSS: отклонено '%s'", rest);
+        send_ack("SLSS", false);
+        return false;
+    }
+
+    settings_save_pressure_task();
+
+    ESP_LOGI("NMEA", "SLSS%s: SET %.2f -> %.2f МПа, START %.2f -> %.2f МПа",
+             has_start ? "" : " (1 поле)",
+             set_kpa / KPA_PER_MPA, applied_set / KPA_PER_MPA,
+             start_kpa / KPA_PER_MPA, applied_start / KPA_PER_MPA);
+    ESP_LOGW("NMEA", "APPLY set=%.2f start=%.2f МПа (src=UART $SLSS)",
+             applied_set / KPA_PER_MPA, applied_start / KPA_PER_MPA);
+    send_ack("SLSS", true);
+    return true;
+}
+
+// $SLSC,<CMD>[...]
+static bool handle_slsc(char *rest) {
+    if (strncasecmp(rest, "START", 5) == 0 && rest[5] == '\0') {
+        bool ok = compressor_cmd_start();
+        send_ack("START", ok);
+        return ok;
+    }
+    if (strncasecmp(rest, "STOP", 4) == 0 && rest[4] == '\0') {
+        compressor_cmd_stop();
+        send_ack("STOP", true);
+        return true;
+    }
+    if (strncasecmp(rest, "RESET", 5) == 0 && rest[5] == '\0') {
+        compressor_cmd_reset();
+        send_ack("RESET", true);
+        return true;
+    }
+    if (strncasecmp(rest, "GET", 3) == 0 && (rest[3] == '\0' || rest[3] == ',')) {
+        // Панель после своей перезагрузки спрашивает уставку у мастера
+        send_setpoint_frame();
         return true;
     }
 
-    if (strcmp(type, "SLSC") == 0) {
-        char cmd[16] = {0};
-        // читаем команду до '*' (иначе %s зацепит "*XX")
-        if (sscanf(rest, "%15[^*]", cmd) != 1) return false;
-        if (strcmp(cmd, "START") == 0) {
-            compressor_cmd_start();
-            respond("\r\n>> START\r\n");
-        } else if (strcmp(cmd, "STOP") == 0) {
-            compressor_cmd_stop();
-            respond("\r\n>> STOP\r\n");
-        } else if (strcmp(cmd, "RESET") == 0) {
-            compressor_cmd_reset();
-            respond("\r\n>> RESET\r\n");
-        } else {
+    // $SLSC,ZERO,<n> — обнуление модуля давления (n=1 -> P1, n=2 -> P2)
+    if (strncasecmp(rest, "ZERO", 4) == 0) {
+        int n = 0;
+        if (sscanf(rest + 4, ",%d", &n) != 1 || (n != 1 && n != 2)) {
+            ESP_LOGW("NMEA", "ZERO: нужно ZERO,1 или ZERO,2, принято '%s'", rest);
+            send_ack("ZERO", false);
             return false;
         }
-        return true;
+        bool ok = zero_pressure_channel(n);
+        send_ack("ZERO", ok);
+        return ok;
     }
 
+    // $SLSC,OUT,<K1>,<K2>,<R3>,<R4> — только тест/диагностика в SERVICE
+    if (strncasecmp(rest, "OUT,", 4) == 0) {
+        int v[4] = {0};
+        int n = sscanf(rest + 4, "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]);
+        bool ok = (n == 4);
+        for (int i = 0; i < 4; i++) {
+            if (v[i] != 0 && v[i] != 1) ok = false;
+        }
+        if (!ok) {
+            ESP_LOGW("NMEA", "OUT: нужно 4 поля 0/1, принято '%s'", rest);
+            send_ack("OUT", false);
+            return false;
+        }
+        bool accepted = compressor_test_outputs(v[0], v[1], v[2], v[3]);
+        send_ack("OUT", accepted);
+        return accepted;
+    }
+
+    // $SLSC,TH,<S1_NP>,<S1_VP>,<S2_NP>,<S2_VP> — пороги ступеней, кПа
+    if (strncasecmp(rest, "TH,", 3) == 0) {
+        float np1 = 0, vp1 = 0, np2 = 0, vp2 = 0;
+        if (sscanf(rest + 3, "%f,%f,%f,%f", &np1, &vp1, &np2, &vp2) != 4) {
+            ESP_LOGW("NMEA", "TH: нужно 4 числа, принято '%s'", rest);
+            send_ack("TH", false);
+            return false;
+        }
+        // TH справочный: ничего не применяем и не сохраняем (источник истины — $SLSS)
+        bool ok = compressor_check_thresholds_kpa(np1, vp1, np2, vp2);
+        send_ack("TH", ok);
+        return ok;
+    }
+
+    ESP_LOGW("NMEA", "SLSC: неизвестная команда '%s'", rest);
+    return false;
+}
+
+static bool parse_display_nmea(char *line) {
+    if (line[0] != '$') {
+        ESP_LOGW("NMEA", "нет '$' в начале: '%s'", line);
+        return false;
+    }
+    char *star = strchr(line, '*');
+    if (star == NULL) {
+        ESP_LOGW("NMEA", "нет '*' (чексуммы): '%s'", line);
+        return false;
+    }
+
+    // контрольная сумма (считаем до отрезания '*')
+    uint8_t cs = nmea_checksum(line);
+    unsigned int cs_rx = 0;
+    if (sscanf(star + 1, "%02x", &cs_rx) != 1) {
+        ESP_LOGW("NMEA", "чексумма не читается: '%s'", line);
+        return false;
+    }
+    if (cs_rx != cs) {
+        ESP_LOGW("NMEA", "чексумма НЕ совпала: принято %02X, расчёт %02X ('%s')", cs_rx, cs, line);
+        return false;
+    }
+    *star = '\0';   // дальше работаем только с телом кадра
+
+    char type[5] = {0};
+    char *body = line + 1;
+    if (sscanf(body, "%4[^,]", type) != 1) {
+        ESP_LOGW("NMEA", "не удалось прочитать тип: '%s'", line);
+        return false;
+    }
+    char *rest = strchr(body, ',');
+    if (rest == NULL) {
+        ESP_LOGW("NMEA", "тип '%s' без запятой: '%s'", type, line);
+        return false;
+    }
+    rest++; // после первой запятой
+
+    if (strcmp(type, "SLSS") == 0) return handle_slss(rest);
+    if (strcmp(type, "SLSC") == 0) return handle_slsc(rest);
+
+    ESP_LOGW("NMEA", "неизвестный тип '%s' ('%s')", type, line);
     return false;
 }
 
 // ==========================================================================
 // ТЕКСТОВЫЕ КОМАНДЫ (WiFi и не-NMEA строки с дисплея)
-// Формат: START / STOP / RESET / SET <МПа> / STAT / SN / ZERO
+// Формат: START / STOP / RESET / SET <МПа> / STAT / SN / ZERO / DEMO / DEMOSTOP
 // ==========================================================================
+
+// Точное совпадение команды: без учёта регистра, с допуском пробелов и \r\n
+// по краям. Нужно, чтобы "DEMOSTOP" не принимался за "DEMO", а случайный
+// текст, содержащий буквы DEMO (например, эхо наших же ответов), не запускал
+// демо реле.
+static bool cmd_match(const char *str, const char *word) {
+    if (str == NULL || word == NULL) return false;
+    while (*str == ' ' || *str == '\t') str++;
+    size_t n = strlen(word);
+    if (strncasecmp(str, word, n) != 0) return false;
+    const char *tail = str + n;
+    while (*tail == ' ' || *tail == '\t') tail++;
+    return (*tail == '\0' || *tail == '\r' || *tail == '\n');
+}
+
 static void handle_command(char *str) {
 
     if (strstr(str, "sn") || strstr(str, "SN")) {
@@ -116,14 +309,16 @@ static void handle_command(char *str) {
     }
 
     if (strstr(str, "stat") || strstr(str, "STAT")) {
-        char msg[160];
+        char msg[200];
         snprintf(msg, sizeof(msg),
-                 "\r\n>> P1=%.2f P2=%.2f SET=%.2f MPa | K1=%s K2=%s ALM=%d RUN=%s\r\n",
+                 "\r\n>> P1=%.2f P2=%.2f SET=%.2f ST=%.2f MPa | K1=%s K2=%s K3=%s K4=%s | ALM=%d RUN=%s | DEMO=%s\r\n",
                  pressure1_kPa / KPA_PER_MPA, pressure2_kPa / KPA_PER_MPA,
-                 p2_set_kPa / KPA_PER_MPA,
+                 p2_set_kPa / KPA_PER_MPA, p2_start_kPa / KPA_PER_MPA,
                  comp1_on ? "ON" : "OFF", comp2_on ? "ON" : "OFF",
+                 comp3_on ? "ON" : "OFF", comp4_on ? "ON" : "OFF",
                  compressor_get_alarm(),
-                 compressor_is_running() ? "ON" : "OFF");
+                 compressor_is_running() ? "ON" : "OFF",
+                 compressor_relay_demo_active() ? "ON" : "OFF");
         respond(msg);
         return;
     }
@@ -146,57 +341,109 @@ static void handle_command(char *str) {
         return;
     }
 
-    // SET <МПа> — уставка P2 (1.0 .. 4.0)
+    // DEMOSTOP — остановить непрерывный демо-цикл реле (проверяется ДО "DEMO")
+    if (cmd_match(str, "DEMOSTOP")) {
+        if (compressor_relay_demo_active()) {
+            compressor_relay_demo_stop();
+            respond("\r\n>> RELAY DEMO: stopping, all relays will be OFF\r\n");
+        } else {
+            respond("\r\n>> [ERR] relay demo is not running\r\n");
+        }
+        return;
+    }
+
+    // DEMO — непрерывный цикл: K1->K2->K3->K4 ON, затем K4->K3->K2->K1 OFF.
+    // Только точное совпадение всей строки: START/STOP и прочие команды
+    // сюда не попадают, а "DEMOSTOP" отсекается предыдущей проверкой.
+    if (cmd_match(str, "DEMO")) {
+        if (compressor_relay_demo_active()) {
+            respond("\r\n>> [ERR] relay demo already running (use DEMOSTOP or STOP)\r\n");
+        } else {
+            compressor_relay_demo_start();
+            respond("\r\n>> RELAY DEMO: cycle K1->K2->K3->K4 ON, then reverse OFF (DEMOSTOP to stop)\r\n");
+        }
+        return;
+    }
+
+    // SET <МПа> — уставка P2; P2_Start пересчитывается по алгоритму
     char *ps = strstr(str, "set ");
     if (ps == NULL) ps = strstr(str, "SET ");
     if (ps != NULL) {
         float mpa = strtof(ps + 4, NULL);
         float applied = compressor_set_setpoint_kpa(mpa * KPA_PER_MPA);
-        char msg[64];
-        snprintf(msg, sizeof(msg), "\r\n>> P2 target set to %.2f MPa\r\n", applied / KPA_PER_MPA);
+        settings_save_pressure_task();
+        char msg[96];
+        snprintf(msg, sizeof(msg), "\r\n>> P2 target set to %.2f MPa (restart %.2f MPa)\r\n",
+                 applied / KPA_PER_MPA, p2_start_kPa / KPA_PER_MPA);
         respond(msg);
         return;
     }
 
     if (strstr(str, "zero") || strstr(str, "ZERO")) {
-        respond("\r\n>> Zeroing pressure sensor 1...\r\n");
-        bool ok = performAdvancedZeroCalibration(0.0f, SENSOR_UART_NUM);
-        respond(ok ? "\r\n>> [OK] Sensor 1 zeroed\r\n"
-                   : "\r\n>> [ERR] Sensor 1 zero failed\r\n");
+        // ZERO / ZERO 1 -> P1, ZERO 2 -> P2. Та же реализация, что у $SLSC,ZERO,<n>.
+        int n = 1;
+        const char *pz = strstr(str, "zero");
+        if (pz == NULL) pz = strstr(str, "ZERO");
+        if (pz != NULL) {
+            const char *pa = pz + 4;                 // после слова ZERO
+            while (*pa == ' ' || *pa == '\t') pa++;  // пропускаем пробелы
+            if (*pa == '2') n = 2;
+        }
+
+        char msg[64];
+        snprintf(msg, sizeof(msg), "\r\n>> Zeroing pressure sensor P%d...\r\n", n);
+        respond(msg);
+        bool ok = zero_pressure_channel(n);
+        snprintf(msg, sizeof(msg), ok ? "\r\n>> [OK] Sensor P%d zeroed\r\n"
+                                      : "\r\n>> [ERR] Sensor P%d zero failed\r\n", n);
+        respond(msg);
         return;
     }
 
-    respond("\r\n>> Usage: START | STOP | RESET | SET <МПа> | STAT | SN | ZERO\r\n");
+    respond("\r\n>> Usage: START | STOP | RESET | SET <МПа> | STAT | SN | ZERO [1|2] | DEMO | DEMOSTOP\r\n");
 }
 
 // ==========================================================================
-// Задача приёма с внешнего дисплея (UART0, RX=GPIO22): строки NMEA $SLSS/$SLSC
-// или текстовые команды. Строка между \r\n.
+// Задача приёма с внешнего дисплея (UART2, RX=GPIO25): строки NMEA $SLSS/$SLSC
+// или текстовые команды. Строка между \r\n. Длина — как у панели (256 байт).
 // ==========================================================================
 static void display_rx_task(void *pvParameters) {
-    char line[128];
+    char line[DISPLAY_RX_MAX];
     int  idx = 0;
 
     while (1) {
         uint8_t b;
         int n = uart_read_bytes(DISPLAY_UART_NUM, &b, 1, pdMS_TO_TICKS(20));
         if (n > 0) {
+            // Отметка «панель жива» для флага NO_LINK в state кадра $SLSD
+            panel_last_rx_ms = (uint32_t)(esp_timer_get_time() / 1000);
             if (b == '\n') {
                 if (idx > 0) {
                     // убрать возможный \r в конце
                     if (line[idx - 1] == '\r') line[idx - 1] = '\0';
                     else                       line[idx] = '\0';
+                    idx = 0;
+
+                    // Полный дамп принятой строки: видно, что реально шлёт панель
+                    ESP_LOGI("PANEL", "RX: '%s'", line);
+
                     if (line[0] == '$') {
                         parse_display_nmea(line);
+                    } else if (line[0] == '>') {
+                        // эхо наших же ответов (">> ...") — командами не считаем
+                        ESP_LOGD("PANEL", "echo ignored");
                     } else if (line[0] != '\0') {
                         handle_command(line);
                     }
-                    idx = 0;
                 }
             } else if (b == '\r') {
                 // игнорируем, кадр заканчивается по \n
             } else if (idx < (int)sizeof(line) - 1) {
                 line[idx++] = (char)b;
+            } else {
+                // строка без '\n' длиннее буфера — сбрасываем, чтобы не склеивать кадры
+                ESP_LOGW("PANEL", "строка > %d символов без \\n — сброс", (int)sizeof(line) - 1);
+                idx = 0;
             }
         }
     }
@@ -204,24 +451,65 @@ static void display_rx_task(void *pvParameters) {
 }
 
 // ==========================================================================
+// Консольный ввод по UART0 (монитор). Строки читаются из stdin и идут в тот же
+// handle_command(), что и команды с TCP/дисплея: DEMO, STAT, ZERO 2, SET 2.5 ...
+// ==========================================================================
+static void console_cmd_task(void *pvParameters) {
+    (void)pvParameters;
+    char line[128];
+
+    while (1) {
+        if (fgets(line, sizeof(line), stdin) != NULL) {
+            size_t n = strlen(line);
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+            if (n > 0) {
+                ESP_LOGI("CONSOLE", "> %s", line);
+                handle_command(line);
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+}
+
+// ==========================================================================
 // ТОЧКА ВХОДА
 // ==========================================================================
 void app_main(void) {
 
-    LCD_init();                     // маленький экран TTGO + шрифты
-    pressure_ui_and_usb_init(&dev); // подписи/экран + UART0 (TX21/RX22) на дисплей
-    pressure_sensor_init();         // датчик №1 (UART1) + датчик №2 (UART2)
+    // ==========================================================================
+    // Стартовая пауза: пока она идёт, прошивка НЕ трогает ни один вывод —
+    // UART2 (TX=GPIO33) в hi-Z, реле не сконфигурированы, LCD не инициализирован.
+    // Это даёт внешнему дисплею время включиться без мусора на его RX.
+    // Длительность — STARTUP_DELAY_MS в config.h.
+    // ==========================================================================
+#if STARTUP_DELAY_MS > 0
+    ESP_LOGW("INIT", "Стартовая пауза %d мс: выводы не трогаем (дисплей стартует)", STARTUP_DELAY_MS);
+    vTaskDelay(pdMS_TO_TICKS(STARTUP_DELAY_MS));
+    ESP_LOGW("INIT", "Пауза окончена, начинаю инициализацию периферии");
+#endif
 
-    compressor_control_init();      // реле К1/К2 (GPIO2/GPIO17) — выключены
+    // Уставки из NVS (после перезагрузки мастер работает с последней уставкой,
+    // а не с 4,0 МПа по умолчанию). Если записи нет — значения по умолчанию.
+    settings_init();
+
+    LCD_init();                     // маленький экран TTGO + шрифты
+    pressure_ui_and_usb_init(&dev); // подписи/экран + UART2 (TX33/RX25) на дисплей
+    pressure_sensor_init();         // общая шина UART1: датчики 0x01 и 0x02 по кругу
+
+    compressor_control_init();      // реле K1..K4 (GPIO2/17/21/22) — выключены
     compressor_control_start();     // автомат двухступенчатой установки
 
 #if !SAFE_NO_PINS
     xTaskCreate(display_rx_task, "display_rx", 3072, NULL, 6, NULL);
 #else
-    // Заглушка: UART0/RX (GPIO22) не настроен, приём от панели не запускаем.
+    // Заглушка: UART2/RX (GPIO25) не настроен, приём от панели не запускаем.
     (void)display_rx_task;
-    ESP_LOGW("INIT", "SAFE: приём с внешнего дисплея (UART0 RX=GPIO%d) отключён", PIN_DISP_RX);
+    ESP_LOGW("INIT", "SAFE: приём с внешнего дисплея (UART2 RX=GPIO%d) отключён", PIN_DISP_RX);
 #endif
+
+    // Ввод команд из монитора (UART0): DEMO запускает проверку реле
+    xTaskCreate(console_cmd_task, "console_cmd", 3072, NULL, 4, NULL);
 
     // WiFi (AP/STA) + TCP для приёма команд по сети.
     wifi_tcp_init();

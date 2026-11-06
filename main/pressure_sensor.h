@@ -8,21 +8,24 @@
 #include "st7789.h"
 #include "fontx.h"
 
-// настройки UART датчика 1
+/* ============================================================================
+ *  РАСКЛАДКА UART
+ * ----------------------------------------------------------------------------
+ *    UART1 -> ОБЩАЯ шина датчиков: 0x01 (P1) и 0x02 (P2) на одних проводах,
+ *             RX=GPIO26, TX=GPIO27, 19200 8O1. Опрос по кругу с периодом
+ *             SENSOR_POLL_INTERVAL_MS (задаётся в config.h).
+ *    UART2 -> внешний дисплей (HMI), TX=GPIO33, RX=GPIO25 (см. config.h)
+ *    UART0 -> консоль/логи ESP-IDF (CONFIG_ESP_CONSOLE_UART_DEFAULT=y)
+ *
+ *  ВНИМАНИЕ: GPIO23 — это RST локального экрана ST7789 (PIN_RST), его нельзя
+ *  назначать ни датчикам, ни чему-либо ещё.
+ * ========================================================================== */
+
+// настройки общей шины датчиков (UART1)
 #define SENSOR_UART_NUM         UART_NUM_1
 #define PIN_RX1                 26
 #define PIN_TX1                 27
 #define BUF_SIZE                1024
-#define SERIAL_UART1_INTERVAL   50
-
-// настройки UART датчика 2 — отдельная НЕЗАВИСИМАЯ шина (UART2), т.к. у обоих
-// датчиков одинаковый адрес (DEVICE_ADDRESS1=0x02). Используемые выводы:
-// UART1: RX=26, TX=27; UART2: RX=23, TX=25. Если провода переставлены —
-// меняйте значения здесь.
-#define SENSOR2_UART_NUM        UART_NUM_2
-#define PIN_RX2                 25
-#define PIN_TX2                 33
-#define SERIAL_UART2_INTERVAL   50
 
 // пины дисплея
 #define PIN_MOSI        19
@@ -38,21 +41,25 @@
 #define OFFSET_Y        40
 
 // протокол датчика
-#define DEVICE_ADDRESS1 0x02
+#define DEVICE_ADDRESS1 0x01
+#define DEVICE_ADDRESS2 0x02
 #define ACK             0x06
 
 // extern-переменные (уставки каналов объявлены в config.h)
 extern volatile float pressure1_kPa;
-extern volatile float pressure2_kPa;   // показания второго датчика (UART2)
-extern uint32_t sum_err;
-extern uint32_t sum_err2;              // счётчик CRC-ошибок второго датчика
+extern volatile float pressure2_kPa;   // показания датчика №2 (адрес 0x02)
+extern uint32_t sum_err;               // счётчик ошибок кадра датчика 0x01
+extern uint32_t sum_err2;              // счётчик ошибок кадра датчика 0x02
 
 // функции датчика и дисплея
-void pressure_sensor_init(void);
-void pressure_sensor2_init(void); // инициализация второго датчика (UART2)
+void pressure_sensor_init(void);       // поднимает общую шину UART1 и опрос обоих датчиков
 void LCD_init(void);
-bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num);
+// Калибровка нуля конкретного датчика на общей шине (адрес 0x01 или 0x02)
+bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num, uint8_t device_addr);
 void display_update_task(void *pvParameters);
 void pressure_ui_and_usb_init(TFT_t *p_dev);
+// Немедленно отправить один кадр $SLSD (после обнуления, чтобы панель сразу
+// увидела нулевое давление, не дожидаясь очередных 200 мс)
+void display_send_status_now(void);
 
 #endif // PRESSURE_SENSOR_H
