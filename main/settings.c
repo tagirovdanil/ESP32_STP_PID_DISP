@@ -41,7 +41,7 @@ static bool s_nvs_ready = false;
 static bool nvs_ensure(void) {
     if (s_nvs_ready) return true;
 
-    // nvs_flash_init() идемпотентен: wifi_tcp_init() вызывает его позже ещё раз.
+    // nvs_flash_init() идемпотентен: повторный вызов безопасен.
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "NVS требует очистки (%s) — стираю", esp_err_to_name(err));

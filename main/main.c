@@ -10,21 +10,18 @@
 #include "driver/uart.h"
 #include "esp_mac.h"          // Для чтения заводского MAC (серийного номера) из efuse
 
-#include "st7789.h"           // Локальный маленький экран TTGO
-#include "pressure_sensor.h"  // Датчики давления
+#include "pressure_sensor.h"  // Датчики давления + UART2 к панели
 #include "config.h"           // Глобалы: давления, уставка P2, порт дисплея
 #include "compressor_control.h"
 #include "settings.h"         // NVS: уставка/пороги переживают перезагрузку
-#include "wifi_tcp.h"         // WiFi (AP/STA) + TCP-сервер для приёма команд по сети
 
 #define KPA_PER_MPA 1000.0f
 
 // ==========================================================================
-// ВЫВОД ОТВЕТА: WiFi/TCP-клиентам и внешнему дисплею (UART2). Дисплей в ответ
-// может просто игнорировать не-NMEA-строки (его состояние обновляется $SLSD).
+// ВЫВОД ОТВЕТА: только внешней панели по UART2 (Wi-Fi в этой прошивке нет).
+// Панель шлёт текстовые и NMEA-команды, ответы читает сама.
 // ==========================================================================
 static void respond(const char *msg) {
-    wifi_tcp_send(msg);
 #if !SAFE_NO_PINS
     uart_write_bytes(DISPLAY_UART_NUM, msg, strlen(msg));
 #else
@@ -295,6 +292,12 @@ static bool cmd_match(const char *str, const char *word) {
 
 static void handle_command(char *str) {
 
+    // PING — простая проверка, что команды доходят и ответ уходит
+    if (cmd_match(str, "PING")) {
+        respond("\r\n>> OK PING\r\n");
+        return;
+    }
+
     if (strstr(str, "sn") || strstr(str, "SN")) {
         uint8_t mac[6];
         if (esp_efuse_mac_get_default(mac) != ESP_OK) {
@@ -309,7 +312,7 @@ static void handle_command(char *str) {
     }
 
     if (strstr(str, "stat") || strstr(str, "STAT")) {
-        char msg[200];
+        char msg[220];
         snprintf(msg, sizeof(msg),
                  "\r\n>> P1=%.2f P2=%.2f SET=%.2f ST=%.2f MPa | K1=%s K2=%s K3=%s K4=%s | ALM=%d RUN=%s | DEMO=%s\r\n",
                  pressure1_kPa / KPA_PER_MPA, pressure2_kPa / KPA_PER_MPA,
@@ -400,7 +403,7 @@ static void handle_command(char *str) {
         return;
     }
 
-    respond("\r\n>> Usage: START | STOP | RESET | SET <МПа> | STAT | SN | ZERO [1|2] | DEMO | DEMOSTOP\r\n");
+    respond("\r\n>> Usage: START | STOP | RESET | SET <МПа> | STAT | SN | ZERO [1|2] | DEMO | DEMOSTOP | PING\r\n");
 }
 
 // ==========================================================================
@@ -493,8 +496,8 @@ void app_main(void) {
     // а не с 4,0 МПа по умолчанию). Если записи нет — значения по умолчанию.
     settings_init();
 
-    LCD_init();                     // маленький экран TTGO + шрифты
-    pressure_ui_and_usb_init(&dev); // подписи/экран + UART2 (TX33/RX25) на дисплей
+    // Локального экрана нет — только UART2 (TX33/RX25) к панели
+    pressure_display_uart_init();
     pressure_sensor_init();         // общая шина UART1: датчики 0x01 и 0x02 по кругу
 
     compressor_control_init();      // реле K1..K4 (GPIO2/17/21/22) — выключены
@@ -511,14 +514,10 @@ void app_main(void) {
     // Ввод команд из монитора (UART0): DEMO запускает проверку реле
     xTaskCreate(console_cmd_task, "console_cmd", 3072, NULL, 4, NULL);
 
-    // WiFi (AP/STA) + TCP для приёма команд по сети.
-    wifi_tcp_init();
-
-    char wcmd[256];
+    // Wi-Fi в этой прошивке нет: связь с панелью — только UART2.
+    // Все рабочие задачи уже созданы, главному циклу делать нечего.
+    ESP_LOGI("INIT", "Инициализация завершена: датчики, реле, UART2, команды");
     while (1) {
-        while (wifi_tcp_poll_command(wcmd, sizeof(wcmd))) {
-            handle_command(wcmd);
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

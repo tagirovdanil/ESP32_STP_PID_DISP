@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 
 #include "freertos/FreeRTOS.h"
@@ -11,6 +12,7 @@
 #include "freertos/semphr.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -81,18 +83,72 @@ static int clients_evict_one(void) {
 }
 
 // ============================ WiFi события ===================================
+// Повторные подключения к AP m531: AP может быть выключена, поэтому не
+// долбим esp_wifi_connect() в цикле, а пробуем раз в WIFI_TCP_STA_RECONNECT_MS.
+static esp_timer_handle_t s_sta_retry_timer = NULL;
+static volatile uint32_t s_last_sta_warn_ms = 0;
+static volatile bool s_sta_was_connected = false;
+static volatile bool s_sta_has_ip = false;      // есть IP в сети m531
+static volatile bool s_sta_suspended = false;   // панель попросила отключиться ($SLSC,WIFI,0)
+static char s_sta_ip[16] = "0.0.0.0";           // последний полученный IP
+static int  s_sta_retry_attempts = 0;           // счётчик неудачных попыток
+static volatile int s_last_reason = -1;         // причина последнего disconnect
+
+static void sta_retry_cb(void*)
+{
+    s_sta_retry_attempts++;
+    // Не засоряем лог: первая попытка и далее раз в 10 (~30 с при 3 с паузе)
+    if (s_sta_retry_attempts == 1 || (s_sta_retry_attempts % 10) == 0) {
+        ESP_LOGI(TAG, "STA: попытка %d подключиться к \"%s\"...",
+                 s_sta_retry_attempts, WIFI_TCP_STA_SSID);
+    }
+    esp_wifi_connect();
+}
+
 static void wifi_event_handler(void* arg, esp_event_base_t base,
                                int32_t id, void* data)
 {
     if (base == WIFI_EVENT) {
         switch (id) {
             case WIFI_EVENT_STA_START:
-                esp_wifi_connect();
+                ESP_LOGI(TAG, "STA: старт, ищу точку доступа \"%s\" (канал %d)",
+                         WIFI_TCP_STA_SSID, WIFI_TCP_STA_CHANNEL);
+                if (!s_sta_suspended) esp_wifi_connect();
                 break;
-            case WIFI_EVENT_STA_DISCONNECTED:
-                ESP_LOGW(TAG, "STA: отключились, переподключаемся...");
-                esp_wifi_connect();
+            case WIFI_EVENT_STA_DISCONNECTED: {
+                // WARN — только при первом разрыве после успешного подключения
+                // или не чаще раза в 30 с, иначе лог забивается.
+                uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+                int reason = data ? ((wifi_event_sta_disconnected_t *)data)->reason : -1;
+                s_last_reason = reason;
+                // Не чаще раза в 10 с (иначе auth-фейл на каждом 3-секундном повторе
+                // забивает лог), но всегда после успешного подключения.
+                if (s_sta_was_connected || (uint32_t)(now - s_last_sta_warn_ms) > 10000u) {
+                    const char *hint = "";
+                    if (reason == 201) {
+                        hint = " (AP не найдена — включите Wi-Fi на панели)";
+                    } else if (reason == 15 || reason == 204 || reason == 202) {
+                        hint = " (авторизация — проверьте пароль/шифрование AP)";
+                    }
+                    ESP_LOGW(TAG, "STA: нет связи с \"%s\" (reason=%d, попыток=%d)%s",
+                             WIFI_TCP_STA_SSID, reason, s_sta_retry_attempts, hint);
+                    s_last_sta_warn_ms = now;
+                }
+                s_sta_was_connected = false;
+                s_sta_has_ip = false;
+                if (s_sta_suspended) {
+                    // Панель попросила отключиться ($SLSC,WIFI,0) — не долбим эфир.
+                    break;
+                }
+                if (s_sta_retry_timer) {
+                    esp_timer_stop(s_sta_retry_timer);   // ошибку «уже запущен» игнорируем
+                    esp_timer_start_once(s_sta_retry_timer,
+                                         (uint64_t)WIFI_TCP_STA_RECONNECT_MS * 1000ULL);
+                } else {
+                    esp_wifi_connect();
+                }
                 break;
+            }
             case WIFI_EVENT_AP_STACONNECTED:
                 ESP_LOGI(TAG, "AP: клиент подключился");
                 break;
@@ -102,12 +158,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t base,
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* e = (ip_event_got_ip_t*)data;
-        ESP_LOGI(TAG, "STA: получен IP " IPSTR ", порт сервера %d",
-                 IP2STR(&e->ip_info.ip), WIFI_TCP_PORT);
+        s_sta_was_connected = true;
+        s_sta_has_ip = true;
+        s_sta_retry_attempts = 0;
+        snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&e->ip_info.ip));
+
+        wifi_ap_record_t ap;
+        int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
+        ESP_LOGI(TAG, "STA: ПОДКЛЮЧЕНО к \"%s\", IP %s, RSSI %d dBm (сервер панели :%d)",
+                 WIFI_TCP_STA_SSID, s_sta_ip, rssi, WIFI_TCP_PORT);
     }
 }
 
 // ============================ WiFi init ======================================
+#if WIFI_TCP_MODE_AP
 static void wifi_init_softap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -135,6 +199,7 @@ static void wifi_init_softap(void)
     ESP_LOGI(TAG, "AP поднят: SSID=\"%s\" pass=\"%s\"  IP=192.168.4.1  порт=%d",
              WIFI_TCP_AP_SSID, WIFI_TCP_AP_PASS, WIFI_TCP_PORT);
 }
+#endif  // WIFI_TCP_MODE_AP
 
 static void wifi_init_sta(void)
 {
@@ -144,6 +209,14 @@ static void wifi_init_sta(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // Конфиг Wi-Fi во флеш не пишем: сеть задана в коде.
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = &sta_retry_cb;
+    targs.name     = "sta_retry";
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &s_sta_retry_timer));
+
     ESP_ERROR_CHECK(esp_event_handler_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(
@@ -152,12 +225,21 @@ static void wifi_init_sta(void)
     wifi_config_t wc = {};
     strncpy((char*)wc.sta.ssid,     WIFI_TCP_STA_SSID, sizeof(wc.sta.ssid));
     strncpy((char*)wc.sta.password, WIFI_TCP_STA_PASS, sizeof(wc.sta.password));
+    wc.sta.channel            = WIFI_TCP_STA_CHANNEL;
+    wc.sta.scan_method        = WIFI_FAST_SCAN;
+    // Не ограничиваем тип шифрования: AP панели может быть WPA2/WPA3/OPEN —
+    // мастер всё равно обязан угадать пароль, а лишний фильтр даёт ложные
+    // «auth fail» на несовпадении режима.
+    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Иначе команда от m531 могла бы ждать до ~300 мс (power save).
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
-    ESP_LOGI(TAG, "STA стартовал, подключаюсь к \"%s\"...", WIFI_TCP_STA_SSID);
+    ESP_LOGI(TAG, "STA: ищу точку доступа m531 \"%s\" (канал %d)",
+             WIFI_TCP_STA_SSID, WIFI_TCP_STA_CHANNEL);
 }
 
 // Отправить накопленную строку в очередь команд.
@@ -374,4 +456,94 @@ bool wifi_tcp_poll_command(char* out, size_t out_size)
     strncpy(out, m.data, out_size - 1);
     out[out_size - 1] = '\0';
     return true;
+}
+
+bool wifi_tcp_has_ip(void)
+{
+    return s_sta_has_ip;
+}
+
+bool wifi_tcp_get_ip(char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return false;
+    snprintf(out, out_size, "%s", s_sta_ip);
+    return s_sta_has_ip;
+}
+
+int wifi_tcp_rssi(void)
+{
+    if (!s_sta_has_ip) return 0;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return 0;
+    return ap.rssi;
+}
+
+int wifi_tcp_last_reason(void)
+{
+    return s_last_reason;
+}
+
+// Диагностика: что вообще видно в эфире и с каким шифрованием.
+void wifi_tcp_scan_log(void)
+{
+    wifi_scan_config_t sc = {};
+    sc.show_hidden = true;
+
+    esp_err_t err = esp_wifi_scan_start(&sc, true);   // блокирующий скан
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SCAN: esp_wifi_scan_start: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint16_t num = 0;
+    esp_wifi_scan_get_ap_num(&num);
+    if (num == 0) {
+        ESP_LOGW(TAG, "SCAN: в эфире не найдено ни одной сети");
+        return;
+    }
+    if (num > 20) num = 20;
+
+    wifi_ap_record_t *recs = (wifi_ap_record_t *)calloc(num, sizeof(*recs));
+    if (!recs) { ESP_LOGE(TAG, "SCAN: нет памяти"); return; }
+
+    uint16_t got = num;
+    if (esp_wifi_scan_get_ap_records(&got, recs) != ESP_OK) got = 0;
+
+    ESP_LOGI(TAG, "SCAN: найдено сетей: %u (нужна \"%s\")", got, WIFI_TCP_STA_SSID);
+    for (int i = 0; i < got; i++) {
+        const char *auth = "?";
+        switch (recs[i].authmode) {
+            case WIFI_AUTH_OPEN:            auth = "OPEN"; break;
+            case WIFI_AUTH_WEP:             auth = "WEP"; break;
+            case WIFI_AUTH_WPA_PSK:         auth = "WPA"; break;
+            case WIFI_AUTH_WPA2_PSK:        auth = "WPA2"; break;
+            case WIFI_AUTH_WPA_WPA2_PSK:    auth = "WPA/WPA2"; break;
+            case WIFI_AUTH_WPA2_ENTERPRISE: auth = "WPA2-ENT"; break;
+            case WIFI_AUTH_WPA3_PSK:        auth = "WPA3"; break;
+            case WIFI_AUTH_WPA2_WPA3_PSK:   auth = "WPA2/WPA3"; break;
+            default:                        auth = "other"; break;
+        }
+        ESP_LOGI(TAG, "SCAN: %2d) \"%s\" RSSI=%d ch=%d auth=%d(%s)",
+                 i + 1, (const char *)recs[i].ssid, recs[i].rssi,
+                 recs[i].primary, recs[i].authmode, auth);
+    }
+    free(recs);
+}
+
+void wifi_tcp_reconnect(void)
+{
+    ESP_LOGW(TAG, "STA: принудительное переподключение к \"%s\"", WIFI_TCP_STA_SSID);
+    s_sta_suspended = false;
+    if (s_sta_retry_timer) esp_timer_stop(s_sta_retry_timer);
+    esp_wifi_disconnect();      // вызовет STA_DISCONNECTED, оттуда пойдёт connect
+    esp_wifi_connect();
+}
+
+void wifi_tcp_disconnect(void)
+{
+    ESP_LOGW(TAG, "STA: отключение по команде панели (повторы приостановлены)");
+    s_sta_suspended = true;
+    if (s_sta_retry_timer) esp_timer_stop(s_sta_retry_timer);
+    s_sta_has_ip = false;
+    esp_wifi_disconnect();
 }

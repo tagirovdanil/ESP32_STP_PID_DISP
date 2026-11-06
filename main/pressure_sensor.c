@@ -2,11 +2,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "st7789.h"
 #include "esp_timer.h"
-#include "fontx.h"
-#include "driver/gpio.h"
-#include "esp_spiffs.h"
+#include "driver/uart.h"
 #include "config.h"
 #include "compressor_control.h"
 #include <math.h>
@@ -41,93 +38,8 @@ static uint8_t poll_addr = DEVICE_ADDRESS1;
 // Фоновая задача или функция циклического чтения данных из буфера UART
 static void processIncomingData(void);
 
-// Если dev и fx16 объявлены в main.c, даем знать файлу pressure_sensor.c о них:
-extern TFT_t dev;
-
-void display_update_task(void *pvParameters) {
-#if SAFE_NO_PINS
-    // Заглушка: местный экран и кнопка BOOT (GPIO0) не опрашиваются.
-    (void)pvParameters;
-    ESP_LOGW(TAG, "SAFE: display_update_task отключена (экран не инициализирован)");
-    vTaskDelete(NULL);
-#endif
-    // Создаем буфер для текста прямо внутри задачи, чтобы не тащить его из main
-    char screen_buffer[32]; 
-
-    // Инициализируем пин кнопки Boot (GPIO 0) на вход с подтяжкой к питанию
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << GPIO_NUM_0),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io_conf);
-
-    // Бесконечный рабочий цикл задачи
-    while (1) {
-        // 1. Опрос кнопки Boot (калибровка нуля датчика P1, адрес 0x01)
-        if (gpio_get_level(GPIO_NUM_0) == 0) {
-            performAdvancedZeroCalibration(0.0f, SENSOR_UART_NUM, DEVICE_ADDRESS1);
-        }
-
-        // 2. Отрисовка данных, если нет калибровки
-        if (!is_calibrating) {
-            dev._font_fill = true;
-            dev._font_fill_color = BLACK;
-
-            // P1 (1-я ступень), МПа
-            snprintf(screen_buffer, sizeof(screen_buffer), "%.2f MPa", pressure1_kPa / 1000.0f);
-            lcdDrawString(&dev, fx16, 25, 140, (uint8_t*)screen_buffer, YELLOW);
-
-            // P2 (2-я ступень), МПа
-            snprintf(screen_buffer, sizeof(screen_buffer), "%.2f MPa", pressure2_kPa / 1000.0f);
-            lcdDrawString(&dev, fx16, 45, 140, (uint8_t*)screen_buffer, CYAN);
-
-            // Уставка P2, МПа
-            snprintf(screen_buffer, sizeof(screen_buffer), "%.2f MPa", p2_set_kPa / 1000.0f);
-            lcdDrawString(&dev, fx16, 65, 140, (uint8_t*)screen_buffer, GREEN);
-
-            // K1/K2 — подписи в правой колонке (как P1/P2/SET), каждая на своей
-            // строке; красным — компрессор включён, белым — выключен.
-            dev._font_fill = true;
-            dev._font_fill_color = BLACK;
-            snprintf(screen_buffer, sizeof(screen_buffer), "K1");
-            lcdDrawString(&dev, fx16, 85, 220, (uint8_t*)screen_buffer, comp1_on ? RED : WHITE);
-            snprintf(screen_buffer, sizeof(screen_buffer), "K2");
-            lcdDrawString(&dev, fx16, 105, 220, (uint8_t*)screen_buffer, comp2_on ? RED : WHITE);
-
-            // Режим/авария — в колонке значений (строка 85): сначала стираем, потом пишем
-            snprintf(screen_buffer, sizeof(screen_buffer), "        ");
-            lcdDrawString(&dev, fx16, 85, 140, (uint8_t*)screen_buffer, BLACK);
-            int alm = compressor_get_alarm();
-            if (alm != 0) {
-                snprintf(screen_buffer, sizeof(screen_buffer), "AL %d", alm);
-                lcdDrawString(&dev, fx16, 85, 140, (uint8_t*)screen_buffer, RED);
-            } else {
-                snprintf(screen_buffer, sizeof(screen_buffer), "%-4s",
-                         compressor_is_running() ? "RUN" : "STOP");
-                lcdDrawString(&dev, fx16, 85, 140, (uint8_t*)screen_buffer,
-                              compressor_is_running() ? GREEN : WHITE);
-            }
-
-            dev._font_fill = false;
-            lcdDrawFinish(&dev);
-        }
-
-        // Логирование показаний раз в ~1 с (каждый 5-й цикл по 200 мс)
-        static uint32_t sensor_log_cnt = 0;
-        if ((++sensor_log_cnt % 5) == 0) {
-            ESP_LOGI("SENSOR", "P1=%.2f P2=%.2f MPa | SET=%.2f | ALM=%d K1=%d K2=%d",
-                     pressure1_kPa / 1000.0f, pressure2_kPa / 1000.0f,
-                     p2_set_kPa / 1000.0f, compressor_get_alarm(),
-                     comp1_on ? 1 : 0, comp2_on ? 1 : 0);
-        }
-
-        // Та самая важная задержка на 200 мс, которая дает процессору дышать
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-}
+// Локального экрана на этой плате НЕТ (ST7789/шрифты вырезаны).
+// Всё общение — UART0 (консоль), UART2 (панель) и Wi-Fi/m531.
 
 // Подсчет контрольной суммы XOR
 uint8_t calculateChecksum(const uint8_t *data, size_t length) {
@@ -142,35 +54,6 @@ void clearBufferCompletely(uart_port_t uart_num) {
             uart_flush_input(uart_num);
         }
     
-void LCD_init(void){
-#if SAFE_NO_PINS
-    // Заглушка: SPI и выводы LCD (GPIO18/19/5/16/23/4) не инициализируются.
-    ESP_LOGW(TAG, "SAFE: LCD_init пропущен — ST7789 и его пины отключены");
-    return;
-#endif
-    esp_vfs_spiffs_conf_t spiffs_conf = {
-        .base_path = "/fonts", .partition_label = "storage1", .max_files = 1, .format_if_mount_failed = false 
-    };
-    if (esp_vfs_spiffs_register(&spiffs_conf) != ESP_OK) return;
-
-    InitFontx(fx16, "/fonts/ILMH16XB.FNT", ""); 
-    spi_master_init(&dev, PIN_MOSI, PIN_SCLK, PIN_CS, PIN_DC, PIN_RST, PIN_BL);
-    
-    // Передаем SCREEN_WIDTH и SCREEN_HEIGHT (Внимание на Шаг 2 ниже!)
-    lcdInit(&dev, SCREEN_WIDTH, SCREEN_HEIGHT, OFFSET_X, OFFSET_Y);
-    
-    gpio_set_direction(PIN_BL, GPIO_MODE_OUTPUT);
-    gpio_set_level(PIN_BL, 1);
-
-    gpio_config_t btn_config = { .pin_bit_mask = (1ULL << GPIO_NUM_0), .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE };
-    gpio_config(&btn_config);
-
-    lcdFillScreen(&dev, BLACK); 
-    
-    // СТРОГО DIRECTION0 (Текст пишется как обычно, слева направо)
-    lcdSetFontDirection(&dev, DIRECTION270); 
-}
-
 // ==========================================================================
 // ПРИВАТНЫЕ ПРОТОТИПЫ (Видны ТОЛЬКО внутри этого файла)
 // ==========================================================================
@@ -463,22 +346,16 @@ static void display_link_task(void *arg) {
     }
 }
 
-void pressure_ui_and_usb_init(TFT_t *p_dev) {
+// UART2 — единственная линия к панели (GPIO33 TX / GPIO25 RX).
+// Локального экрана нет: SPI/ST7789/шрифты/spiffs больше не поднимаются.
+void pressure_display_uart_init(void) {
 #if SAFE_NO_PINS
-    // Заглушка: UART2 (TX=GPIO33/RX=GPIO25) не занимаем, ST7789 не поднимаем,
-    // задачи отрисовки и отправки $SLSD не создаём — ни один вывод не дёргается.
-    (void)p_dev;
     (void)display_link_task;
-    ESP_LOGW("INIT", "SAFE: UART2 панели (TX=GPIO%d, RX=GPIO%d) и экран отключены",
+    ESP_LOGW("INIT", "SAFE: UART2 панели (TX=GPIO%d, RX=GPIO%d) отключён",
              PIN_DISP_TX, PIN_DISP_RX);
     return;
 #endif
 
-    // ==========================================================================
-    // UART2: порт данных на внешний дисплей (GPIO33 TX / GPIO25 RX).
-    // UART0 занят консолью/логами (GPIO1/3), UART1 — обоими датчиками (26/27),
-    // а выводы 21/22 отданы резервным реле K3/K4.
-    // ==========================================================================
     uart_config_t uart_config = {
         .baud_rate = DISPLAY_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
@@ -491,24 +368,8 @@ void pressure_ui_and_usb_init(TFT_t *p_dev) {
     uart_param_config(DISPLAY_UART_NUM, &uart_config);
     uart_set_pin(DISPLAY_UART_NUM, PIN_DISP_TX, PIN_DISP_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    ESP_LOGI("INIT", "UART2 -> внешний дисплей (TX=GPIO%d, RX=GPIO%d)", PIN_DISP_TX, PIN_DISP_RX);
+    ESP_LOGI("INIT", "UART2 -> панель (TX=GPIO%d, RX=GPIO%d)", PIN_DISP_TX, PIN_DISP_RX);
 
-    // (рамки/разделители убраны — экран чистый, красивости добавим позже)
-    
-    // Включаем прозрачный фон для статического текста
-    lcdUnsetFontFill(p_dev);
-
-    // Рисуем неизменяемые подписи (передаем разыменованный указатель на шрифт *p_fx16)
-    lcdDrawString(p_dev, fx16, 25, 220, (uint8_t*)"P1:", YELLOW);
-    lcdDrawString(p_dev, fx16, 45, 220, (uint8_t*)"P2:", CYAN);
-    lcdDrawString(p_dev, fx16, 65, 220, (uint8_t*)"SET:", GREEN);
-
-    // Рисуем заставку «PLEASE WAIT» или рамки, если они нужны
-    lcdDrawFinish(p_dev);
-    
-    // Задача локального экрана TTGO
-    // Выделяем ей 3072 байт стека и приоритет 3
-    xTaskCreate(display_update_task, "display_update_task", 3072, NULL, 3, NULL);
-    // Задача передачи данных на внешний большой дисплей
+    // Задача отправки $SLSD на панель
     xTaskCreate(display_link_task, "display_link", 3072, NULL, 4, NULL);
 }
