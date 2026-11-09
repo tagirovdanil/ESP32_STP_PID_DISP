@@ -8,7 +8,7 @@
  * ============================================================================
  *  Управление двухступенчатой компрессорной установкой
  * ============================================================================
- *  Алгоритм по алгоритм.txt, аварии и обмен с дисплеем по protocol.txt.
+ *  Алгоритм по алгоритм.txt, аварии и обмен с дисплеем по PANEL_PROTOCOL.md.
  *  Давления в кПа (1 МПа = 1000 кПа).
  */
 
@@ -54,7 +54,7 @@ void compressor_cmd_reset(void);        // Сброс аварии
 // Атомарно применяет P2_Set и P2_Start (кПа). Проверяет диапазоны панели:
 //   P2_Set   = P2_SET_MIN_KPA .. P2_SET_MAX_KPA (350..4200 кПа)
 //   P2_Start = P2_START_MIN_KPA .. P2_Set - P2_MIN_GAP_KPA
-// Применяемая уставка дополнительно ограничивается P2_SET_APPLY_MAX_KPA.
+// Применяется как задано (до 4.20 МПа): потолка 4.00 МПа больше нет.
 // false — значения недопустимы, ничего не изменено.
 // applied_set/applied_start (если не NULL) получают фактически применённые значения.
 bool compressor_set_pressure_task_kpa(float set_kpa, float start_kpa,
@@ -91,5 +91,10 @@ bool compressor_relay_demo_active(void);
 bool compressor_is_running(void);
 int  compressor_get_alarm(void);
 int  compressor_get_state(void);         // COMP_STATE_* для поля state в $SLSD
+
+// Была ли уже принята уставка от панели ($SLSS) хотя бы один раз.
+// false -> мастер работает на умолчаниях из config.c, и панель надо
+// попросить прислать уставку кадром $SLSC,GET.
+bool compressor_has_panel_setpoint(void);
 
 #endif // COMPRESSOR_CONTROL_H

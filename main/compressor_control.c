@@ -21,7 +21,7 @@
  *    5) управление K2 (по P2 и P2_Start);
  *    6) управление K1 (гистерезис по P1).
  *
- *  Дополнительно (panel2_agent_instruction.md):
+ *  Дополнительно (PANEL_PROTOCOL.md):
  *    - режим SERVICE: тест выходов $SLSC,OUT только на «холодной» установке;
  *    - R3 (K3) — автоматическое реле охлаждения: (K1 || K2) + выдержка 60 с;
  *    - R4 (K4) — резерв, штатно всегда выключен (только тест из SERVICE);
@@ -208,7 +208,7 @@ static bool is_sync_setpoint(float set_kpa) {
 }
 
 // ============================================================================
-//  Автоматика реле охлаждения R3 и резерва R4 (panel2_agent_instruction §4.5)
+//  Автоматика реле охлаждения R3 и резерва R4 (PANEL_PROTOCOL.md §7.1)
 //  R3 = (K1 || K2), после выключения ОБОИХ держим ещё T_COOL_R3_MS.
 //  Повторный пуск отменяет таймер без разрыва питания реле.
 // ============================================================================
@@ -315,6 +315,40 @@ static void k1_hysteresis_step(uint32_t now, float p1) {
 }
 
 // ============================================================================
+//  Разрешение пуска K2 по давлению 1-й ступени.
+//  Требование заказчика (2026-11-09): при уставке выше 1 МПа вторую ступень
+//  НЕ включать, пока P1 не набран хотя бы до 700 кПа (НП1 гистерезиса K1) —
+//  иначе K2 работает «в пустоту» на низком P1.
+//  В синхронном режиме (уставка 1,0 МПа) P1 и P2 практически равны, поэтому
+//  ограничение не применяется.
+//  Гейт действует только на ВКЛЮЧЕНИЕ: уже работающий K2 им не выключается.
+// ============================================================================
+static bool k2_wait_p1_logged = false;
+
+static bool k2_p1_ready(float p1) {
+    if (!run) {
+        k2_wait_p1_logged = false;
+        return true;
+    }
+    if (is_sync_setpoint(p2_set_kPa)) {
+        k2_wait_p1_logged = false;   // в синхронном режиме гейт не нужен
+        return true;
+    }
+
+    bool ready = (p1 >= K2_START_P1_KPA);
+    if (!ready && !k2_wait_p1_logged) {
+        k2_wait_p1_logged = true;
+        ESP_LOGI("COMP", "K2 удерживается: P1=%.3f < %.2f МПа — ждём набор 1-й ступенью",
+                 p1 / 1000.0f, K2_START_P1_KPA / 1000.0f);
+    } else if (ready && k2_wait_p1_logged) {
+        k2_wait_p1_logged = false;
+        ESP_LOGI("COMP", "P1=%.3f >= %.2f МПа — пуск K2 разрешён",
+                 p1 / 1000.0f, K2_START_P1_KPA / 1000.0f);
+    }
+    return ready;
+}
+
+// ============================================================================
 //  Основной шаг автомата (без сервиса/демо)
 // ============================================================================
 static void control_body(void) {
@@ -402,13 +436,16 @@ static void control_body(void) {
         }
     }
 
-    // Первый пуск / пуск после общего останова: включаем обе ступени сразу.
-    // K1 не включаем, если P1 уже на ВП1 (иначе короткий импульс реле),
-    // K2 — если P2 уже на уставке.
+    // Первый пуск / пуск после общего останова.
+    // K1 не включаем, если P1 уже на ВП1 (иначе короткий импульс реле).
+    // K2 не включаем, если P2 уже на уставке, и — при уставке выше 1 МПа —
+    // только после набора P1 >= 700 кПа (k2_p1_ready): иначе вторая ступень
+    // стартует «в пустоту» на низком P1. Позже её включит обычный блок
+    // управления K2, как только P1 дорастёт до порога.
     if (pending_start) {
         pending_start = false;
         if (p1 < P1_OFF_KPA) set_k1(true);
-        if (p2 < p2_set_kPa) set_k2(true);
+        if (p2 < p2_set_kPa && k2_p1_ready(p1)) set_k2(true);
         warm1_t0 = now; warm2_t0 = now;
         diag1_t0 = 0; diag2_t0 = 0; diag1_active = false; diag2_active = false;
     }
@@ -442,8 +479,9 @@ static void control_body(void) {
         // вторым полем $SLSS,<P2_Set>,<P2_Start> (см. compressor_set_pressure_task_kpa).
         if (!restart2_pause) {
             if (!comp2_on) {
-                // Включение только ниже порога И только ниже уставки
-                if (p2 <= p2_start_kPa && p2 < p2_set_kPa && retry2 < RETRY2_MAX) {
+                // Включение только ниже порога, ниже уставки и после набора P1
+                if (p2 <= p2_start_kPa && p2 < p2_set_kPa && retry2 < RETRY2_MAX &&
+                    k2_p1_ready(p1)) {
                     set_k2(true);
                     warm2_t0 = now;
                     diag2_t0 = 0; diag2_active = false;
@@ -503,8 +541,8 @@ static void control_body(void) {
     if (restart2_pause) {
         if ((now - restart2_t0) >= RESTART2_MS) {
             restart2_pause = false;
-            // после паузы запускаем K2, если P2 < P2_Set и есть попытки
-            if (p2 < p2_set_kPa && retry2 < RETRY2_MAX) {
+            // после паузы запускаем K2, если P2 < P2_Set, есть попытки и набран P1
+            if (p2 < p2_set_kPa && retry2 < RETRY2_MAX && k2_p1_ready(p1)) {
                 set_k2(true);
                 warm2_t0 = now;
                 diag2_active = false; diag2_t0 = 0;
@@ -546,7 +584,7 @@ static void control_body(void) {
 }
 
 // ============================================================================
-//  Жёсткий предел перепуска (panel2_task_overshoot.md §5.1)
+//  Жёсткий предел перепуска (PANEL_PROTOCOL.md §7.2)
 //  P2 >= P2_Set + P2_OVERSHOOT_KPA -> K1=K2=OFF + авария 5 (latched до RESET).
 //  Проверяется КАЖДЫЙ такт до всей остальной логики: в RUN, STOP, SERVICE, демо.
 // ============================================================================
@@ -602,20 +640,37 @@ static void compressor_task(void *arg) {
     while (1) {
         control_step();
 
-        // Раз в секунду — сводка состояния (panel2_task_overshoot.md §5.6)
+        // Раз в секунду — сводка состояния (PANEL_PROTOCOL.md §11)
         if ((++tick % 50u) == 0) {
+            // Связь с панелью: был ли хоть один байт за DISPLAY_LINK_MS
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            bool panel_ok = (panel_last_rx_ms != 0) &&
+                            ((uint32_t)(now_ms - panel_last_rx_ms) <= DISPLAY_LINK_MS);
+            // Возраст последней ПРИМЕНЁННОЙ уставки от панели, с (0 = не было)
+            uint32_t set_age_s = 0;
+            if (panel_slss_last_ms != 0) {
+                set_age_s = (uint32_t)(now_ms - panel_slss_last_ms) / 1000u;
+            }
             ESP_LOGI("STATE",
-                     "P1=%.2f P2=%.2f Set=%.2f Start=%.2f K1=%d K2=%d R3=%d alarm=%d state=%d retry2=%d",
+                     "P1=%.2f P2=%.2f Set=%.2f Start=%.2f K1=%d K2=%d R3=%d alarm=%d state=%d "
+                     "retry2=%d panel=%s src=%s rx=%u slss=%u th=%u set_age=%us",
                      pressure1_kPa / 1000.0f, pressure2_kPa / 1000.0f,
                      p2_set_kPa / 1000.0f, p2_start_kPa / 1000.0f,
                      comp1_on ? 1 : 0, comp2_on ? 1 : 0, comp3_on ? 1 : 0,
-                     current_alarm, compressor_get_state(), retry2);
+                     current_alarm, compressor_get_state(), retry2,
+                     panel_ok ? "ON" : "OFF",
+                     setpoint_rx ? "PANEL" : "DEFAULT",
+                     (unsigned)panel_rx_frames_total,
+                     (unsigned)panel_slss_count,
+                     (unsigned)panel_th_count,
+                     (unsigned)set_age_s);
         }
 
-        // Раз в 5 секунд напоминаем, что уставку от панели мы так и не видели
+        // Раз в 5 секунд напоминаем, что уставку от панели мы так и не видели.
+        // NVS на этой плате нет: уставку хранит дисплейный контроллер.
         if (!setpoint_rx && (tick % 250u) == 0) {
             ESP_LOGW("COMP",
-                     "Уставка от панели не приходила ни разу — работаю на NVS/по умолчанию "
+                     "Уставка от панели не приходила ни разу — работаю на умолчаниях в RAM "
                      "(Set=%.2f Start=%.2f МПа). Проверьте линию RX (GPIO%d)",
                      p2_set_kPa / 1000.0f, p2_start_kPa / 1000.0f, PIN_DISP_RX);
         }
@@ -699,7 +754,7 @@ bool compressor_cmd_start(void) {
         diag1_reset(); diag2_reset();
 
         if (pressure2_kPa >= p2_set_kPa) {
-            // panel2_task_overshoot.md §5.4: не включать компрессоры,
+            // PANEL_PROTOCOL.md §7.3: не включать компрессоры,
             // режим «ждём P2 <= P2_Start», ответ панели всё равно OK
             pending_start = false;
             ESP_LOGW("COMP", "START ignored: P2 (%.2f) >= set (%.2f) — жду P2 <= %.2f МПа",
@@ -738,7 +793,7 @@ void compressor_cmd_reset(void) {
 
 bool compressor_set_pressure_task_kpa(float set_kpa, float start_kpa,
                                       float *applied_set, float *applied_start) {
-    // 1) Диапазоны панели (panel2_agent_instruction §3.1)
+    // 1) Диапазоны панели (PANEL_PROTOCOL.md §4.1)
     if (!(set_kpa >= P2_SET_MIN_KPA && set_kpa <= P2_SET_MAX_KPA)) {
         ESP_LOGW("COMP", "SLSS отклонён: P2_Set=%.3f МПа вне %.2f..%.2f МПа",
                  set_kpa / 1000.0f, P2_SET_MIN_KPA / 1000.0f, P2_SET_MAX_KPA / 1000.0f);
@@ -813,7 +868,7 @@ float compressor_set_setpoint_kpa(float v) {
     return applied;
 }
 
-// $SLSC,TH — СПРАВОЧНЫЙ кадр (panel2_task_overshoot.md §5.3, protocol.txt §3):
+// $SLSC,TH — СПРАВОЧНЫЙ кадр (PANEL_PROTOCOL.md §4.2):
 // пользовательских порогов больше нет, уставку задаёт только $SLSS.
 // Функция ничего не применяет и не сохраняет: только проверяет корректность
 // значений и сверяет их с тем, что уже пришло в $SLSS.
@@ -847,7 +902,7 @@ bool compressor_check_thresholds_kpa(float s1_np, float s1_vp, float s2_np, floa
     }
 
     if (!setpoint_rx) {
-        ESP_LOGW("COMP", "TH пришёл раньше $SLSS: уставка остаётся по умолчанию/NVS — "
+        ESP_LOGW("COMP", "TH пришёл раньше $SLSS: уставка остаётся по умолчанию в RAM — "
                  "TH не применяется, нужен кадр $SLSS");
     }
 
@@ -931,6 +986,8 @@ bool compressor_test_active(void) {
 
 bool compressor_is_running(void) { return run; }
 int  compressor_get_alarm(void)  { return current_alarm; }
+
+bool compressor_has_panel_setpoint(void) { return setpoint_rx; }
 
 int compressor_get_state(void) {
     if (service_active)            return COMP_STATE_SERVICE;

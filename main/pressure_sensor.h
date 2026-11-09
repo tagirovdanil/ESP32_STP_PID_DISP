@@ -39,10 +39,21 @@ void pressure_sensor_init(void);       // поднимает общую шину
 // Калибровка нуля конкретного датчика на общей шине (адрес 0x01 или 0x02)
 bool performAdvancedZeroCalibration(float offset_kPa, uart_port_t uart_num, uint8_t device_addr);
 // Поднимает UART2 (TX=GPIO33, RX=GPIO25) и задачу отправки $SLSD.
+// Вызывается В САМОМ НАЧАЛЕ app_main(), до стартовой паузы: приём от панели
+// работает сразу, а передача $SLSD включается позже — pressure_display_link_start().
 // Локального экрана на плате нет — SPI/ST7789/шрифты не используются.
 void pressure_display_uart_init(void);
+
+// Разрешить передачу $SLSD на панель (после стартовой паузы и инициализации).
+// До этого вызова задача связи молчит, приём $SLSS/$SLSC при этом уже работает.
+void pressure_display_link_start(void);
 // Немедленно отправить один кадр $SLSD (после обнуления, чтобы панель сразу
 // увидела нулевое давление, не дожидаясь очередных 200 мс)
 void display_send_status_now(void);
+
+// Попросить у панели уставку прямо сейчас: $SLSC,GET -> панель отвечает $SLSS.
+// Вызывается после любой команды панели (START/STOP/...), если уставка ещё
+// не приходила; внутри ограничение не чаще 1 раза в 500 мс.
+void display_request_setpoint_now(void);
 
 #endif // PRESSURE_SENSOR_H

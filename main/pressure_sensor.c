@@ -338,10 +338,76 @@ void display_send_status_now(void) {
 #endif
 }
 
+// Передача на панель включается только после стартовой паузы и инициализации:
+// так панель не получает кадры, пока сама ещё грузится. Приём при этом уже идёт.
+static volatile bool display_tx_enabled = false;
+
+void pressure_display_link_start(void) {
+    display_tx_enabled = true;
+    ESP_LOGI("PANEL", "передача $SLSD на панель разрешена (UART2 TX=GPIO%d)",
+             PIN_DISP_TX);
+}
+
+// Попросить у панели уставку: $SLSC,GET -> панель отвечает $SLSS,<Set>,<Start>.
+// Нужно на случай, когда панель отправила $SLSS раньше, чем мастер был готов
+// его принять (или уставка на панели менялась до включения мастера).
+static void display_send_get_request(void) {
+    static const char body[] = "SLSC,GET";
+    uint8_t cs = 0;
+    for (const char *p = body; *p; p++) cs ^= (uint8_t)*p;
+
+    char out[32];
+    int n = snprintf(out, sizeof(out), "$%s*%02X\r\n", body, (unsigned)cs);
+    uart_write_bytes(DISPLAY_UART_NUM, out, n);
+}
+
+void display_request_setpoint_now(void) {
+#if SAFE_NO_PINS
+    return;
+#else
+    // Не чаще 1 раза в 500 мс: команды панели могут идти пачкой (ZERO,1 + START).
+    static uint32_t last_req_ms = 0;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (last_req_ms != 0 && (uint32_t)(now - last_req_ms) < 500u) return;
+    last_req_ms = now;
+
+    display_send_get_request();
+
+    // Лог не чаще раза в 10 с, чтобы не заливать консоль.
+    static uint32_t last_log_ms = 0;
+    if (last_log_ms == 0 || (uint32_t)(now - last_log_ms) >= 10000u) {
+        ESP_LOGW("PANEL", "прошу уставку у панели: $SLSC,GET (нужен ответ $SLSS)");
+        last_log_ms = now;
+    }
+#endif
+}
+
 static void display_link_task(void *arg) {
     (void)arg;
+    uint32_t last_get_ms = 0;
+    bool get_warned = false;
+
     while (1) {
+        if (!display_tx_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(DISPLAY_SEND_MS));
+            continue;
+        }
+
         display_send_status_frame();
+
+        // Уставки от панели ещё не было — раз в 2 с просим её прислать.
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (!compressor_has_panel_setpoint() &&
+            (uint32_t)(now - last_get_ms) >= 2000u) {
+            display_send_get_request();
+            if (!get_warned) {
+                ESP_LOGW("PANEL", "уставка от панели не приходила — прошу её кадром "
+                         "$SLSC,GET (панель должна ответить $SLSS)");
+                get_warned = true;
+            }
+            last_get_ms = now;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_SEND_MS));
     }
 }

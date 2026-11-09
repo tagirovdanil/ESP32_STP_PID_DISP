@@ -13,7 +13,8 @@
 #include "pressure_sensor.h"  // Датчики давления + UART2 к панели
 #include "config.h"           // Глобалы: давления, уставка P2, порт дисплея
 #include "compressor_control.h"
-#include "settings.h"         // NVS: уставка/пороги переживают перезагрузку
+// ВНИМАНИЕ: NVS на этой плате не используется (уставку хранит дисплейный
+// контроллер, он же присылает её кадром $SLSS). Уставка живёт только в RAM.
 
 #define KPA_PER_MPA 1000.0f
 
@@ -69,7 +70,7 @@ static void send_setpoint_frame(void) {
 }
 
 // ==========================================================================
-// Разбор кадра от панели CrowPanel (protocol.txt / panel2_agent_instruction.md):
+// Разбор кадра от панели (PANEL_PROTOCOL.md §4):
 //   $SLSS,<P2_Set>,<P2_Start>          — уставка и порог повторного включения
 //   $SLSC,START | STOP | RESET | GET
 //   $SLSC,OUT,<K1>,<K2>,<R3>,<R4>      — сервисный тест выходов
@@ -105,6 +106,7 @@ static bool zero_pressure_channel(int n) {
 
 // $SLSS,<P2_Set МПа>[,<P2_Start МПа>]
 static bool handle_slss(char *rest) {
+    panel_slss_count++;   // видно в STATE как slss=N
     char *end = NULL;
     float set_mpa = strtof(rest, &end);
     if (end == rest) {
@@ -136,6 +138,19 @@ static bool handle_slss(char *rest) {
         if (start_kpa < P2_START_MIN_KPA) start_kpa = P2_START_MIN_KPA;
     }
 
+    // Защита от перепутанных полей: некоторые версии панели шлют
+    // $SLSS,<P2_Start>,<P2_Set> (нижняя ручка первой). Если прямой порядок
+    // не проходит по зазору, а обратный корректен — меняем местами с WARN.
+    if (has_start && start_kpa > set_kpa - P2_MIN_GAP_KPA &&
+        set_kpa > start_kpa + P2_MIN_GAP_KPA &&
+        start_kpa >= P2_START_MIN_KPA && set_kpa <= P2_SET_MAX_KPA) {
+        ESP_LOGW("NMEA", "SLSS: поля перепутаны (%.2f, %.2f) — меняю местами",
+                 set_kpa / KPA_PER_MPA, start_kpa / KPA_PER_MPA);
+        float tmp = set_kpa;
+        set_kpa = start_kpa;
+        start_kpa = tmp;
+    }
+
     float applied_set = 0.0f, applied_start = 0.0f;
     if (!compressor_set_pressure_task_kpa(set_kpa, start_kpa, &applied_set, &applied_start)) {
         ESP_LOGW("NMEA", "SLSS: отклонено '%s'", rest);
@@ -143,7 +158,7 @@ static bool handle_slss(char *rest) {
         return false;
     }
 
-    settings_save_pressure_task();
+    panel_slss_last_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     ESP_LOGI("NMEA", "SLSS%s: SET %.2f -> %.2f МПа, START %.2f -> %.2f МПа",
              has_start ? "" : " (1 поле)",
@@ -160,6 +175,9 @@ static bool handle_slsc(char *rest) {
     if (strncasecmp(rest, "START", 5) == 0 && rest[5] == '\0') {
         bool ok = compressor_cmd_start();
         send_ack("START", ok);
+        // Связь работает (команда дошла) — но уставки ещё не было: просим сразу,
+        // не дожидаясь очередного 2-секундного опроса.
+        if (!compressor_has_panel_setpoint()) display_request_setpoint_now();
         return ok;
     }
     if (strncasecmp(rest, "STOP", 4) == 0 && rest[4] == '\0') {
@@ -211,14 +229,31 @@ static bool handle_slsc(char *rest) {
 
     // $SLSC,TH,<S1_NP>,<S1_VP>,<S2_NP>,<S2_VP> — пороги ступеней, кПа
     if (strncasecmp(rest, "TH,", 3) == 0) {
+        panel_th_count++;   // видно в STATE как th=N
         float np1 = 0, vp1 = 0, np2 = 0, vp2 = 0;
         if (sscanf(rest + 3, "%f,%f,%f,%f", &np1, &vp1, &np2, &vp2) != 4) {
             ESP_LOGW("NMEA", "TH: нужно 4 числа, принято '%s'", rest);
             send_ack("TH", false);
             return false;
         }
-        // TH справочный: ничего не применяем и не сохраняем (источник истины — $SLSS)
+        // TH справочный: уставку не перебивает (источник истины — $SLSS).
         bool ok = compressor_check_thresholds_kpa(np1, vp1, np2, vp2);
+
+        // РЕЗЕРВНЫЙ путь получения уставки: в кадре TH поля S2_NP/S2_VP — это
+        // копии нижней/верхней ручки панели. Если панель по какой-то причине
+        // не шлёт $SLSS, но шлёт TH (S2 = ручки), берём уставку оттуда.
+        // Только пока ни одного $SLSS не было — TH не должен перебивать $SLSS.
+        if (ok && !compressor_has_panel_setpoint()) {
+            float applied_set = 0.0f, applied_start = 0.0f;
+            if (compressor_set_pressure_task_kpa(vp2, np2, &applied_set, &applied_start)) {
+                panel_slss_last_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                ESP_LOGW("NMEA",
+                         "TH: кадра $SLSS не было — беру уставку из S2 кадра TH: "
+                         "set=%.2f start=%.2f МПа (src=UART $SLSC,TH)",
+                         applied_set / KPA_PER_MPA, applied_start / KPA_PER_MPA);
+            }
+        }
+
         send_ack("TH", ok);
         return ok;
     }
@@ -328,6 +363,7 @@ static void handle_command(char *str) {
 
     if (strstr(str, "start") || strstr(str, "START")) {
         compressor_cmd_start();
+        if (!compressor_has_panel_setpoint()) display_request_setpoint_now();
         respond(compressor_is_running() ? "\r\n>> RUNNING\r\n" : "\r\n>> [ERR] alarm active, do RESET first\r\n");
         return;
     }
@@ -374,7 +410,6 @@ static void handle_command(char *str) {
     if (ps != NULL) {
         float mpa = strtof(ps + 4, NULL);
         float applied = compressor_set_setpoint_kpa(mpa * KPA_PER_MPA);
-        settings_save_pressure_task();
         char msg[96];
         snprintf(msg, sizeof(msg), "\r\n>> P2 target set to %.2f MPa (restart %.2f MPa)\r\n",
                  applied / KPA_PER_MPA, p2_start_kPa / KPA_PER_MPA);
@@ -410,9 +445,22 @@ static void handle_command(char *str) {
 // Задача приёма с внешнего дисплея (UART2, RX=GPIO25): строки NMEA $SLSS/$SLSC
 // или текстовые команды. Строка между \r\n. Длина — как у панели (256 байт).
 // ==========================================================================
+// Готовность всей периферии (датчики, реле, автомат). До этого приём UART2
+// уже работает, но из кадров применяется только $SLSS — он безопасен.
+static volatile bool app_ready = false;
+
 static void display_rx_task(void *pvParameters) {
     char line[DISPLAY_RX_MAX];
     int  idx = 0;
+
+    uint32_t rx_bytes = 0, rx_frames = 0;
+    bool     rx_ever = false;    // был ли хоть один кадр с момента включения
+    uint32_t last_report = (uint32_t)(esp_timer_get_time() / 1000);
+
+    // Разбивка принятых строк по типам за окно 30 с — чтобы одним взглядом
+    // видеть, шлёт ли панель уставку или только PING.
+    uint32_t n_ping = 0, n_slss = 0, n_slsc = 0, n_other = 0;
+    uint32_t last_types = last_report;
 
     while (1) {
         uint8_t b;
@@ -420,27 +468,69 @@ static void display_rx_task(void *pvParameters) {
         if (n > 0) {
             // Отметка «панель жива» для флага NO_LINK в state кадра $SLSD
             panel_last_rx_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            rx_bytes++;
             if (b == '\n') {
                 if (idx > 0) {
                     // убрать возможный \r в конце
                     if (line[idx - 1] == '\r') line[idx - 1] = '\0';
                     else                       line[idx] = '\0';
                     idx = 0;
+                    rx_frames++;
+                    rx_ever = true;
+                    panel_rx_frames_total++;   // видно в STATE как rx=N
+
+                    // Тип кадра для сводки
+                    if (strncmp(line, "PING", 4) == 0)            n_ping++;
+                    else if (strncmp(line + 1, "SLSS", 4) == 0)    n_slss++;
+                    else if (strncmp(line + 1, "SLSC", 4) == 0)    n_slsc++;
+                    else                                          n_other++;
 
                     // Полный дамп принятой строки: видно, что реально шлёт панель
                     ESP_LOGI("PANEL", "RX: '%s'", line);
 
                     if (line[0] == '$') {
-                        parse_display_nmea(line);
+                        // До окончания инициализации применяем ТОЛЬКО уставку:
+                        // кадр $SLSS не трогает реле и датчики, поэтому его можно
+                        // принять даже во время стартовой паузы (панель отправляет
+                        // уставку при своём включении — раньше, чем мастер готов).
+                        bool is_setpoint = (strncmp(line + 1, "SLSS,", 5) == 0);
+                        if (app_ready || is_setpoint) {
+                            parse_display_nmea(line);
+                        } else {
+                            ESP_LOGW("PANEL",
+                                     "кадр до завершения инициализации пропущен: '%.40s'",
+                                     line);
+                        }
+                        // Пришёл любой $SLSC, а уставки всё ещё нет — сразу
+                        // просим её у панели (не ждём 2-секундного опроса).
+                        if (app_ready && !compressor_has_panel_setpoint() &&
+                            strncmp(line + 1, "SLSC,", 5) == 0) {
+                            display_request_setpoint_now();
+                        }
                     } else if (line[0] == '>') {
                         // эхо наших же ответов (">> ...") — командами не считаем
                         ESP_LOGD("PANEL", "echo ignored");
                     } else if (line[0] != '\0') {
-                        handle_command(line);
+                        if (app_ready) {
+                            handle_command(line);
+                        } else {
+                            ESP_LOGW("PANEL",
+                                     "команда до завершения инициализации пропущена: '%.40s'",
+                                     line);
+                        }
                     }
                 }
             } else if (b == '\r') {
                 // игнорируем, кадр заканчивается по \n
+            } else if (b == '$') {
+                // Ресинхронизация: кадр начинается с '$'. Если перед ним успел
+                // накопиться мусор (потерянный \n, помеха), выбрасываем его,
+                // иначе кадр уйдёт в handle_command() вместе с мусорным префиксом.
+                if (idx > 1) {
+                    ESP_LOGW("PANEL", "ресинхронизация: отброшено %d байт без конца строки", idx);
+                }
+                line[0] = '$';
+                idx = 1;
             } else if (idx < (int)sizeof(line) - 1) {
                 line[idx++] = (char)b;
             } else {
@@ -448,6 +538,54 @@ static void display_rx_task(void *pvParameters) {
                 ESP_LOGW("PANEL", "строка > %d символов без \\n — сброс", (int)sizeof(line) - 1);
                 idx = 0;
             }
+        }
+
+        // Диагностика линии RX раз в 5 секунд: приходят ли вообще байты от панели.
+        // 0 байт -> проблема с проводом/пином/скоростью; байты есть, строк нет —
+        // панель не завершает кадр '\n' или другая скорость.
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if ((uint32_t)(now - last_report) >= 5000u) {
+            if (rx_bytes == 0 && !rx_ever) {
+                // Ни одного байта с включения — это физика/передача панели.
+                ESP_LOGW("PANEL",
+                         "UART2 RX: с включения НИ ОДНОГО байта от панели. Проверьте TX панели -> GPIO%d, "
+                         "GND, 115200. Нажмите кнопку на панели и сравните rx= в строке STATE",
+                         PIN_DISP_RX);
+            } else if (rx_bytes == 0) {
+                // Панель событийная: молчит, когда нет действий. Это НЕ ошибка.
+                ESP_LOGI("PANEL",
+                         "RX тишина 5 с (панель шлёт только по действиям), всего принято %u кадров",
+                         (unsigned)panel_rx_frames_total);
+            } else if (rx_frames == 0) {
+                ESP_LOGW("PANEL",
+                         "UART2 RX: %u байт, но ни одной строки (нет '\\n'? другая скорость?)",
+                         (unsigned)rx_bytes);
+                // Hex-дамп накопленного: видно инверсию/скорость/мусор на линии
+                char hex[3 * 32 + 1];
+                int  lim = idx < 32 ? idx : 32;
+                int  p = 0;
+                hex[0] = '\0';
+                for (int i = 0; i < lim && p < (int)sizeof(hex) - 4; i++) {
+                    p += snprintf(hex + p, sizeof(hex) - (size_t)p, "%02X ", (unsigned)line[i] & 0xFFu);
+                }
+                ESP_LOGW("PANEL", "RX hex (%d байт): %s", lim, hex);
+            } else {
+                ESP_LOGI("PANEL", "UART2 RX: %u байт, %u строк за 5 с",
+                         (unsigned)rx_bytes, (unsigned)rx_frames);
+            }
+            rx_bytes = 0;
+            rx_frames = 0;
+            last_report = now;
+        }
+
+        // Сводка по типам кадров раз в 30 с: PING / SLSS / SLSC / прочее.
+        // Если PING растёт, а SLSS=0 — панель уставку не отправляет вообще.
+        if ((uint32_t)(now - last_types) >= 30000u) {
+            ESP_LOGI("PANEL", "RX 30 с по типам: PING=%u SLSS=%u SLSC=%u прочие=%u",
+                     (unsigned)n_ping, (unsigned)n_slss,
+                     (unsigned)n_slsc, (unsigned)n_other);
+            n_ping = n_slss = n_slsc = n_other = 0;
+            last_types = now;
         }
     }
     vTaskDelete(NULL);
@@ -480,29 +618,19 @@ static void console_cmd_task(void *pvParameters) {
 // ==========================================================================
 void app_main(void) {
 
-    // ==========================================================================
-    // Стартовая пауза: пока она идёт, прошивка НЕ трогает ни один вывод —
-    // UART2 (TX=GPIO33) в hi-Z, реле не сконфигурированы, LCD не инициализирован.
-    // Это даёт внешнему дисплею время включиться без мусора на его RX.
-    // Длительность — STARTUP_DELAY_MS в config.h.
-    // ==========================================================================
-#if STARTUP_DELAY_MS > 0
-    ESP_LOGW("INIT", "Стартовая пауза %d мс: выводы не трогаем (дисплей стартует)", STARTUP_DELAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(STARTUP_DELAY_MS));
-    ESP_LOGW("INIT", "Пауза окончена, начинаю инициализацию периферии");
-#endif
+    // NVS на этой плате НЕТ: уставку хранит дисплейный контроллер и присылает
+    // её кадром $SLSS. До первого кадра работаем на умолчаниях из config.c
+    // (4.00/3.60 МПа) — в логе будет WARN «уставка от панели не приходила».
+    ESP_LOGW("INIT", "NVS отключён: уставка только в RAM, источник — $SLSS от панели "
+             "(умолчания Set=%.2f Start=%.2f МПа)",
+             P2_SET_DEFAULT_KPA / 1000.0f, P2_START_DEFAULT_KPA / 1000.0f);
 
-    // Уставки из NVS (после перезагрузки мастер работает с последней уставкой,
-    // а не с 4,0 МПа по умолчанию). Если записи нет — значения по умолчанию.
-    settings_init();
-
-    // Локального экрана нет — только UART2 (TX33/RX25) к панели
+    // UART2 поднимаем СРАЗУ, до стартовой паузы: панель отправляет $SLSS при
+    // собственном включении (и при отпускании ручки), и если мастер ещё «спит»,
+    // кадр терялся — мастер потом работал на умолчаниях. Теперь драйвер копит
+    // байты в RX-буфере, а задача приёма применяет $SLSS даже во время паузы.
+    // Передача $SLSD на панель включается позже — pressure_display_link_start().
     pressure_display_uart_init();
-    pressure_sensor_init();         // общая шина UART1: датчики 0x01 и 0x02 по кругу
-
-    compressor_control_init();      // реле K1..K4 (GPIO2/17/21/22) — выключены
-    compressor_control_start();     // автомат двухступенчатой установки
-
 #if !SAFE_NO_PINS
     xTaskCreate(display_rx_task, "display_rx", 3072, NULL, 6, NULL);
 #else
@@ -510,6 +638,29 @@ void app_main(void) {
     (void)display_rx_task;
     ESP_LOGW("INIT", "SAFE: приём с внешнего дисплея (UART2 RX=GPIO%d) отключён", PIN_DISP_RX);
 #endif
+
+    // ==========================================================================
+    // Стартовая пауза: пока она идёт, прошивка НЕ трогает силовые выводы —
+    // реле не сконфигурированы, датчики не опрашиваются. UART2 при этом уже
+    // слушает панель (см. выше), но $SLSD на панель ещё не отправляется.
+    // Длительность — STARTUP_DELAY_MS в config.h.
+    // ==========================================================================
+#if STARTUP_DELAY_MS > 0
+    ESP_LOGW("INIT", "Стартовая пауза %d мс: силовые выводы не трогаем (дисплей стартует)",
+             STARTUP_DELAY_MS);
+    vTaskDelay(pdMS_TO_TICKS(STARTUP_DELAY_MS));
+    ESP_LOGW("INIT", "Пауза окончена, начинаю инициализацию периферии");
+#endif
+
+    // Локального экрана нет — только UART2 (TX33/RX25) к панели
+    pressure_sensor_init();         // общая шина UART1: датчики 0x01 и 0x02 по кругу
+
+    compressor_control_init();      // реле K1..K4 (GPIO2/17/21/22) — выключены
+    compressor_control_start();     // автомат двухступенчатой установки
+
+    // Теперь можно говорить панели состояние: $SLSD каждые 200 мс
+    pressure_display_link_start();
+    app_ready = true;
 
     // Ввод команд из монитора (UART0): DEMO запускает проверку реле
     xTaskCreate(console_cmd_task, "console_cmd", 3072, NULL, 4, NULL);
